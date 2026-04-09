@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { Client, type ConnectConfig } from "ssh2";
+import { Client, type ConnectConfig, type SFTPWrapper } from "ssh2";
 
 export interface SSHConfig {
   host: string;
@@ -33,7 +33,6 @@ function resolveConfig(config: SSHConfig): ConnectConfig {
   } else if (config.agent || process.env.SSH_AUTH_SOCK) {
     connectConfig.agent = config.agent || process.env.SSH_AUTH_SOCK;
   } else {
-    // Try default key paths
     const home = homedir();
     const defaultKeys = ["id_ed25519", "id_rsa", "id_ecdsa"];
     for (const keyName of defaultKeys) {
@@ -64,14 +63,23 @@ export function connect(config: SSHConfig): Promise<Client> {
 
 export function exec(client: Client, command: string, timeoutMs = 30000): Promise<ExecResult> {
   return new Promise((resolve, reject) => {
+    let settled = false;
+
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+    };
+
     const timer = setTimeout(() => {
-      reject(new Error(`Command timed out after ${timeoutMs}ms`));
+      settle(() => reject(new Error(`Command timed out after ${timeoutMs}ms`)));
     }, timeoutMs);
 
     client.exec(command, (err, stream) => {
       if (err) {
-        clearTimeout(timer);
-        return reject(err);
+        settle(() => reject(err));
+        return;
       }
 
       let stdout = "";
@@ -79,75 +87,101 @@ export function exec(client: Client, command: string, timeoutMs = 30000): Promis
 
       stream
         .on("close", (code: number) => {
-          clearTimeout(timer);
-          resolve({ stdout, stderr, code: code ?? 0 });
+          settle(() => resolve({ stdout, stderr, code: code ?? 0 }));
         })
         .on("data", (data: Buffer) => {
           stdout += data.toString();
         })
-        .stderr.on("data", (data: Buffer) => {
+        .on("error", (err: Error) => {
+          settle(() => reject(err));
+        });
+
+      stream.stderr
+        .on("data", (data: Buffer) => {
           stderr += data.toString();
+        })
+        .on("error", (err: Error) => {
+          settle(() => reject(err));
         });
     });
   });
 }
 
-export function readFile(client: Client, remotePath: string): Promise<string> {
+function getSftp(client: Client): Promise<SFTPWrapper> {
   return new Promise((resolve, reject) => {
     client.sftp((err, sftp) => {
       if (err) return reject(err);
+      resolve(sftp);
+    });
+  });
+}
+
+export async function readFile(client: Client, remotePath: string): Promise<string> {
+  const sftp = await getSftp(client);
+  try {
+    return await new Promise((resolve, reject) => {
       sftp.readFile(remotePath, (err, data) => {
         if (err) return reject(err);
         resolve(data.toString("utf8"));
       });
     });
-  });
+  } finally {
+    sftp.end();
+  }
 }
 
-export function writeFile(client: Client, remotePath: string, content: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    client.sftp((err, sftp) => {
-      if (err) return reject(err);
+export async function writeFile(client: Client, remotePath: string, content: string): Promise<void> {
+  const sftp = await getSftp(client);
+  try {
+    await new Promise<void>((resolve, reject) => {
       sftp.writeFile(remotePath, content, (err) => {
         if (err) return reject(err);
         resolve();
       });
     });
-  });
+  } finally {
+    sftp.end();
+  }
 }
 
-export function uploadFile(client: Client, localPath: string, remotePath: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    client.sftp((err, sftp) => {
-      if (err) return reject(err);
+export async function uploadFile(client: Client, localPath: string, remotePath: string): Promise<void> {
+  const sftp = await getSftp(client);
+  try {
+    await new Promise<void>((resolve, reject) => {
       sftp.fastPut(localPath, remotePath, (err) => {
         if (err) return reject(err);
         resolve();
       });
     });
-  });
+  } finally {
+    sftp.end();
+  }
 }
 
-export function downloadFile(client: Client, remotePath: string, localPath: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    client.sftp((err, sftp) => {
-      if (err) return reject(err);
+export async function downloadFile(client: Client, remotePath: string, localPath: string): Promise<void> {
+  const sftp = await getSftp(client);
+  try {
+    await new Promise<void>((resolve, reject) => {
       sftp.fastGet(remotePath, localPath, (err) => {
         if (err) return reject(err);
         resolve();
       });
     });
-  });
+  } finally {
+    sftp.end();
+  }
 }
 
-export function listDir(client: Client, remotePath: string): Promise<string[]> {
-  return new Promise((resolve, reject) => {
-    client.sftp((err, sftp) => {
-      if (err) return reject(err);
+export async function listDir(client: Client, remotePath: string): Promise<string[]> {
+  const sftp = await getSftp(client);
+  try {
+    return await new Promise((resolve, reject) => {
       sftp.readdir(remotePath, (err, list) => {
         if (err) return reject(err);
         resolve(list.map((item) => item.filename));
       });
     });
-  });
+  } finally {
+    sftp.end();
+  }
 }

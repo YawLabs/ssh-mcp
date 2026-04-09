@@ -1,5 +1,5 @@
-import { execSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { execFileSync, execSync } from "node:child_process";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -14,9 +14,14 @@ export interface DiagnosticReport {
   suggestions: string[];
 }
 
-function run(cmd: string): { stdout: string; ok: boolean } {
+// Validate hostname to prevent shell injection — only allow safe characters
+function isValidHostname(host: string): boolean {
+  return /^[a-zA-Z0-9._\-:[\]]+$/.test(host) && host.length <= 253;
+}
+
+function runArgs(cmd: string, args: string[]): { stdout: string; ok: boolean } {
   try {
-    const stdout = execSync(cmd, { encoding: "utf8", timeout: 10000, stdio: ["pipe", "pipe", "pipe"] });
+    const stdout = execFileSync(cmd, args, { encoding: "utf8", timeout: 10000, stdio: ["pipe", "pipe", "pipe"] });
     return { stdout: stdout.trim(), ok: true };
   } catch (e: any) {
     return { stdout: e.stdout?.toString().trim() || e.message || "", ok: false };
@@ -32,8 +37,7 @@ export function checkSshAgent(): DiagnosticResult {
     };
   }
 
-  // Check if the socket is actually reachable
-  const { stdout, ok } = run("ssh-add -l");
+  const { stdout, ok } = runArgs("ssh-add", ["-l"]);
   if (!ok && stdout.includes("Could not open a connection")) {
     return {
       status: "error",
@@ -69,12 +73,11 @@ export function checkSshKeys(): DiagnosticResult {
     }
   }
 
-  // Also check for any other key files
+  // Check for any other private key files
   try {
-    const { stdout } = run(`ls "${sshDir}"`);
-    const allFiles = stdout
-      .split("\n")
-      .filter((f) => !f.endsWith(".pub") && !["known_hosts", "config", "authorized_keys"].includes(f));
+    const allFiles = readdirSync(sshDir).filter(
+      (f) => !f.endsWith(".pub") && !["known_hosts", "known_hosts.old", "config", "authorized_keys"].includes(f),
+    );
     for (const f of allFiles) {
       if (!keyTypes.includes(f) && existsSync(join(sshDir, f))) {
         try {
@@ -88,7 +91,7 @@ export function checkSshKeys(): DiagnosticResult {
       }
     }
   } catch {
-    // ls failed, stick with default key check
+    // readdir failed, stick with default key check
   }
 
   if (found.length === 0) {
@@ -111,11 +114,15 @@ export function checkKnownHosts(host: string): DiagnosticResult {
     };
   }
 
-  const { stdout, ok } = run(`ssh-keygen -F "${host}"`);
+  if (!isValidHostname(host)) {
+    return { status: "error", message: `Invalid hostname: "${host}"` };
+  }
+
+  const { stdout, ok } = runArgs("ssh-keygen", ["-F", host]);
   if (!ok || !stdout.trim()) {
     return {
       status: "warning",
-      message: `Host "${host}" is not in known_hosts. First connection will prompt for host key verification. To add it: ssh-keyscan -H ${host} >> ~/.ssh/known_hosts`,
+      message: `Host "${host}" is not in known_hosts. First connection will prompt for host key verification. To add it: ssh-keyscan -H "${host}" >> ~/.ssh/known_hosts`,
     };
   }
 
@@ -123,16 +130,28 @@ export function checkKnownHosts(host: string): DiagnosticResult {
 }
 
 export function checkConnectivity(host: string, port = 22): DiagnosticResult {
-  // Try a TCP connection test
-  const { ok, stdout } = run(
-    `ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no -p ${port} ${host} echo SSH_OK 2>&1`,
-  );
+  if (!isValidHostname(host)) {
+    return { status: "error", message: `Invalid hostname: "${host}"` };
+  }
+
+  const { ok, stdout } = runArgs("ssh", [
+    "-o",
+    "ConnectTimeout=5",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "StrictHostKeyChecking=no",
+    "-p",
+    String(port),
+    host,
+    "echo",
+    "SSH_OK",
+  ]);
 
   if (ok && stdout.includes("SSH_OK")) {
     return { status: "ok", message: `SSH connection to ${host}:${port} succeeded` };
   }
 
-  // Parse common SSH errors
   if (stdout.includes("Permission denied")) {
     return {
       status: "error",
@@ -154,7 +173,7 @@ export function checkConnectivity(host: string, port = 22): DiagnosticResult {
   if (stdout.includes("Host key verification failed")) {
     return {
       status: "error",
-      message: `Host key verification failed for ${host}. The host key changed (instance recreated?). Fix: ssh-keygen -R ${host} && ssh-keyscan -H ${host} >> ~/.ssh/known_hosts`,
+      message: `Host key verification failed for ${host}. The host key changed (instance recreated?). Fix: ssh-keygen -R "${host}" && ssh-keyscan -H "${host}" >> ~/.ssh/known_hosts`,
     };
   }
   if (stdout.includes("Could not resolve hostname")) {
@@ -183,8 +202,20 @@ export function checkSshConfig(host: string): DiagnosticResult {
     for (const line of lines) {
       const trimmed = line.trim();
       if (/^Host\s+/i.test(trimmed)) {
-        const pattern = trimmed.replace(/^Host\s+/i, "").trim();
-        inHostBlock = pattern === host || pattern === "*";
+        const patterns = trimmed
+          .replace(/^Host\s+/i, "")
+          .trim()
+          .split(/\s+/);
+        inHostBlock = patterns.some((p) => {
+          if (p === "*") return true;
+          if (p === host) return true;
+          // Simple wildcard matching: *.example.com
+          if (p.includes("*")) {
+            const regex = new RegExp("^" + p.replace(/\./g, "\\.").replace(/\*/g, ".*") + "$");
+            return regex.test(host);
+          }
+          return false;
+        });
         if (inHostBlock) hostConfig.push(trimmed);
       } else if (inHostBlock && trimmed) {
         hostConfig.push(trimmed);
@@ -207,32 +238,35 @@ export function diagnose(host: string, port = 22): DiagnosticReport {
   const checks: Array<{ name: string } & DiagnosticResult> = [];
   const suggestions: string[] = [];
 
-  // 1. SSH agent
+  if (!isValidHostname(host)) {
+    return {
+      overall: "error",
+      checks: [{ name: "Input Validation", status: "error", message: `Invalid hostname: "${host}"` }],
+      suggestions: ["Provide a valid hostname (alphanumeric, dots, hyphens, colons, brackets only)"],
+    };
+  }
+
   const agent = checkSshAgent();
   checks.push({ name: "SSH Agent", ...agent });
   if (agent.status === "error") suggestions.push('Start ssh-agent: eval "$(ssh-agent -s)"');
   if (agent.status === "warning") suggestions.push("Load your key: ssh-add ~/.ssh/id_ed25519");
 
-  // 2. SSH keys
   const keys = checkSshKeys();
   checks.push({ name: "SSH Keys", ...keys });
   if (keys.status === "error") suggestions.push('Generate a key: ssh-keygen -t ed25519 -C "your@email.com"');
 
-  // 3. SSH config
   const config = checkSshConfig(host);
   checks.push({ name: "SSH Config", ...config });
 
-  // 4. Known hosts
   const known = checkKnownHosts(host);
   checks.push({ name: "Known Hosts", ...known });
-  if (known.status === "warning") suggestions.push(`Add host key: ssh-keyscan -H ${host} >> ~/.ssh/known_hosts`);
+  if (known.status === "warning") suggestions.push(`Add host key: ssh-keyscan -H "${host}" >> ~/.ssh/known_hosts`);
 
-  // 5. Connectivity
   const conn = checkConnectivity(host, port);
   checks.push({ name: "Connectivity", ...conn });
   if (conn.status === "error" && conn.message.includes("Host key verification")) {
-    suggestions.push(`Remove stale host key: ssh-keygen -R ${host}`);
-    suggestions.push(`Re-add host key: ssh-keyscan -H ${host} >> ~/.ssh/known_hosts`);
+    suggestions.push(`Remove stale host key: ssh-keygen -R "${host}"`);
+    suggestions.push(`Re-add host key: ssh-keyscan -H "${host}" >> ~/.ssh/known_hosts`);
   }
   if (conn.status === "error" && conn.message.includes("Permission denied")) {
     suggestions.push("Check loaded keys: ssh-add -l");
