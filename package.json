@@ -1,0 +1,60 @@
+{
+  "name": "@yawlabs/ssh-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for SSH operations with built-in diagnostics",
+  "type": "module",
+  "bin": {
+    "ssh-mcp": "dist/index.js"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/server.js",
+      "types": "./dist/server.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "lint": "biome check src/",
+    "lint:fix": "biome check --write src/",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:ci": "npm run build && npm test",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "ssh",
+    "remote",
+    "model-context-protocol",
+    "ai",
+    "devops"
+  ],
+  "author": "Yaw Labs <contact@yaw.sh>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YawLabs/ssh-mcp.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "ssh2": "^1.16.0",
+    "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@types/node": "^22.15.2",
+    "@types/ssh2": "^1.15.4",
+    "tsup": "^8.5.1",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}
