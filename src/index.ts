@@ -1,9 +1,19 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { ConnectionPool } from "./pool.js";
 import { createServer } from "./server.js";
 
 async function main() {
-  const server = createServer();
+  const pool = new ConnectionPool();
+  const server = createServer(pool);
   const transport = new StdioServerTransport();
+
+  const shutdown = () => {
+    pool.drain();
+    process.exit(0);
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+
   await server.connect(transport);
 }
 

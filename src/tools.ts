@@ -2,7 +2,8 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { diagnose } from "./diagnose.js";
 import { checkGitSsh, configLookup, ensureAgent, fixKnownHosts, listSshKeys, loadKey, testConnection } from "./env.js";
-import { connect, downloadFile, exec, listDir, readFile, uploadFile, writeFile } from "./ssh.js";
+import { ConnectionPool } from "./pool.js";
+import { downloadFile, exec, listDir, readFile, uploadFile, writeFile } from "./ssh.js";
 
 const HostSchema = z.string().describe("SSH hostname or IP address");
 const PortSchema = z.number().optional().describe("SSH port (default: 22)");
@@ -19,7 +20,9 @@ const connectionParams = {
   password: PasswordSchema,
 };
 
-export function registerTools(server: McpServer) {
+export function registerTools(server: McpServer, pool?: ConnectionPool) {
+  const connectionPool = pool ?? new ConnectionPool();
+
   server.tool(
     "ssh_exec",
     "Execute a command on a remote host via SSH. Returns stdout, stderr, and exit code.",
@@ -29,17 +32,14 @@ export function registerTools(server: McpServer) {
       timeout: TimeoutSchema,
     },
     async ({ host, port, username, privateKeyPath, password, command, timeout }) => {
-      const client = await connect({ host, port, username, privateKeyPath, password });
-      try {
+      return connectionPool.withConnection({ host, port, username, privateKeyPath, password }, async (client) => {
         const result = await exec(client, command, timeout || 30000);
         const parts: string[] = [];
         if (result.stdout) parts.push(result.stdout);
         if (result.stderr) parts.push(`[stderr]\n${result.stderr}`);
         parts.push(`[exit code: ${result.code}]`);
         return { content: [{ type: "text", text: parts.join("\n") }] };
-      } finally {
-        client.end();
-      }
+      });
     },
   );
 
@@ -51,13 +51,10 @@ export function registerTools(server: McpServer) {
       path: z.string().describe("Absolute path to the remote file"),
     },
     async ({ host, port, username, privateKeyPath, password, path }) => {
-      const client = await connect({ host, port, username, privateKeyPath, password });
-      try {
+      return connectionPool.withConnection({ host, port, username, privateKeyPath, password }, async (client) => {
         const content = await readFile(client, path);
         return { content: [{ type: "text", text: content }] };
-      } finally {
-        client.end();
-      }
+      });
     },
   );
 
@@ -70,13 +67,10 @@ export function registerTools(server: McpServer) {
       content: z.string().describe("File content to write"),
     },
     async ({ host, port, username, privateKeyPath, password, path, content }) => {
-      const client = await connect({ host, port, username, privateKeyPath, password });
-      try {
+      return connectionPool.withConnection({ host, port, username, privateKeyPath, password }, async (client) => {
         await writeFile(client, path, content);
         return { content: [{ type: "text", text: `Wrote ${content.length} bytes to ${path}` }] };
-      } finally {
-        client.end();
-      }
+      });
     },
   );
 
@@ -89,13 +83,10 @@ export function registerTools(server: McpServer) {
       remotePath: z.string().describe("Absolute path on the remote host"),
     },
     async ({ host, port, username, privateKeyPath, password, localPath, remotePath }) => {
-      const client = await connect({ host, port, username, privateKeyPath, password });
-      try {
+      return connectionPool.withConnection({ host, port, username, privateKeyPath, password }, async (client) => {
         await uploadFile(client, localPath, remotePath);
         return { content: [{ type: "text", text: `Uploaded ${localPath} → ${remotePath}` }] };
-      } finally {
-        client.end();
-      }
+      });
     },
   );
 
@@ -108,13 +99,10 @@ export function registerTools(server: McpServer) {
       localPath: z.string().describe("Local path to save the downloaded file"),
     },
     async ({ host, port, username, privateKeyPath, password, remotePath, localPath }) => {
-      const client = await connect({ host, port, username, privateKeyPath, password });
-      try {
+      return connectionPool.withConnection({ host, port, username, privateKeyPath, password }, async (client) => {
         await downloadFile(client, remotePath, localPath);
         return { content: [{ type: "text", text: `Downloaded ${remotePath} → ${localPath}` }] };
-      } finally {
-        client.end();
-      }
+      });
     },
   );
 
@@ -126,13 +114,10 @@ export function registerTools(server: McpServer) {
       path: z.string().describe("Absolute path to the remote directory"),
     },
     async ({ host, port, username, privateKeyPath, password, path }) => {
-      const client = await connect({ host, port, username, privateKeyPath, password });
-      try {
+      return connectionPool.withConnection({ host, port, username, privateKeyPath, password }, async (client) => {
         const files = await listDir(client, path);
         return { content: [{ type: "text", text: files.join("\n") }] };
-      } finally {
-        client.end();
-      }
+      });
     },
   );
 

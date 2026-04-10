@@ -1,13 +1,14 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ConnectionPool } from "./pool.js";
 import { registerTools } from "./tools.js";
 
-export function createServer(): McpServer {
+export function createServer(pool?: ConnectionPool): McpServer {
   const server = new McpServer({
     name: "ssh-mcp",
-    version: "0.3.0",
+    version: "0.4.0",
   });
 
-  registerTools(server);
+  registerTools(server, pool);
 
   return server;
 }
@@ -22,8 +23,20 @@ export {
   checkSshConfig,
 } from "./diagnose.js";
 export type { DiagnosticResult, DiagnosticReport } from "./diagnose.js";
-export { connect, exec, readFile, writeFile, uploadFile, downloadFile, listDir } from "./ssh.js";
+export {
+  connect,
+  connectRaw,
+  resolveConfig,
+  exec,
+  readFile,
+  writeFile,
+  uploadFile,
+  downloadFile,
+  listDir,
+} from "./ssh.js";
 export type { SSHConfig, ExecResult } from "./ssh.js";
+export { ConnectionPool } from "./pool.js";
+export type { PoolOptions } from "./pool.js";
 export {
   ensureAgent,
   listSshKeys,

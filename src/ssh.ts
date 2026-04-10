@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Client, type ConnectConfig, type SFTPWrapper } from "ssh2";
-import { checkKnownHosts, checkSshAgent, checkSshConfig, checkSshKeys } from "./diagnose.js";
+import { checkKnownHosts, checkSshAgent, checkSshConfig, checkSshKeys, runArgs } from "./diagnose.js";
 
 export interface SSHConfig {
   host: string;
@@ -19,25 +19,80 @@ export interface ExecResult {
   code: number;
 }
 
-function resolveConfig(config: SSHConfig): ConnectConfig {
+interface SshConfigResult {
+  hostname: string;
+  user: string;
+  port: string;
+  identityFiles: string[];
+}
+
+function resolveFromSshConfig(host: string): SshConfigResult | null {
+  try {
+    const { stdout, ok } = runArgs("ssh", ["-G", host]);
+    if (!ok) return null;
+
+    const config: Record<string, string> = {};
+    const identityFiles: string[] = [];
+
+    for (const line of stdout.split("\n")) {
+      const spaceIdx = line.indexOf(" ");
+      if (spaceIdx > 0) {
+        const key = line.substring(0, spaceIdx);
+        const value = line.substring(spaceIdx + 1);
+        if (key === "identityfile") {
+          identityFiles.push(value);
+        } else {
+          config[key] = value;
+        }
+      }
+    }
+
+    return {
+      hostname: config.hostname || host,
+      user: config.user || "",
+      port: config.port || "22",
+      identityFiles,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function resolveConfig(config: SSHConfig): ConnectConfig {
+  // Resolve SSH config for the host (hostname aliases, user, port, identity files)
+  const sshConfig = resolveFromSshConfig(config.host);
+
   const connectConfig: ConnectConfig = {
-    host: config.host,
-    port: config.port || 22,
-    username: config.username || process.env.USER || process.env.USERNAME || "root",
+    host: sshConfig?.hostname || config.host,
+    port: config.port || (sshConfig ? Number.parseInt(sshConfig.port, 10) : 22),
+    username: config.username || sshConfig?.user || process.env.USER || process.env.USERNAME || "root",
+    keepaliveInterval: 15_000,
+    keepaliveCountMax: 3,
   };
 
-  // Auth priority: explicit key > explicit password > agent > default key paths
+  // Always set agent if available
+  const agentSock = config.agent || process.env.SSH_AUTH_SOCK;
+  if (agentSock) {
+    connectConfig.agent = agentSock;
+  }
+
+  // Set password if provided
+  if (config.password) {
+    connectConfig.password = config.password;
+  }
+
+  // Try to load a private key: explicit > SSH config identity files > default paths
   if (config.privateKeyPath) {
     connectConfig.privateKey = readFileSync(config.privateKeyPath);
-  } else if (config.password) {
-    connectConfig.password = config.password;
-  } else if (config.agent || process.env.SSH_AUTH_SOCK) {
-    connectConfig.agent = config.agent || process.env.SSH_AUTH_SOCK;
-  } else {
+  } else if (!agentSock) {
+    // Only try key files if no agent — agent is the preferred auth method
     const home = homedir();
-    const defaultKeys = ["id_ed25519", "id_rsa", "id_ecdsa"];
-    for (const keyName of defaultKeys) {
-      const keyPath = join(home, ".ssh", keyName);
+    const keyPaths =
+      sshConfig && sshConfig.identityFiles.length > 0
+        ? sshConfig.identityFiles.map((p) => (p.startsWith("~") ? join(home, p.slice(1)) : p))
+        : [join(home, ".ssh", "id_ed25519"), join(home, ".ssh", "id_rsa"), join(home, ".ssh", "id_ecdsa")];
+
+    for (const keyPath of keyPaths) {
       try {
         connectConfig.privateKey = readFileSync(keyPath);
         break;
@@ -50,7 +105,7 @@ function resolveConfig(config: SSHConfig): ConnectConfig {
   return connectConfig;
 }
 
-function formatDiagnostics(host: string): string {
+export function formatDiagnostics(host: string): string {
   // Run fast local checks only — skip connectivity re-test to avoid adding seconds of delay
   try {
     const checks = [
@@ -89,25 +144,30 @@ function formatDiagnostics(host: string): string {
   }
 }
 
-export function connect(config: SSHConfig): Promise<Client> {
+export function connectRaw(connectConfig: ConnectConfig): Promise<Client> {
   return new Promise((resolve, reject) => {
     const client = new Client();
-    const connectConfig = resolveConfig(config);
-
     client
       .on("ready", () => resolve(client))
-      .on("error", (err) => {
-        const diag = formatDiagnostics(config.host);
-        if (diag) {
-          const enhanced = new Error(`${err.message}\n\nSSH Diagnostics:\n${diag}`);
-          enhanced.cause = err;
-          reject(enhanced);
-        } else {
-          reject(err);
-        }
-      })
+      .on("error", (err) => reject(err))
       .connect(connectConfig);
   });
+}
+
+export async function connect(config: SSHConfig): Promise<Client> {
+  const connectConfig = resolveConfig(config);
+  try {
+    return await connectRaw(connectConfig);
+  } catch (err: unknown) {
+    const diag = formatDiagnostics(config.host);
+    if (diag) {
+      const message = err instanceof Error ? err.message : String(err);
+      const enhanced = new Error(`${message}\n\nSSH Diagnostics:\n${diag}`);
+      enhanced.cause = err;
+      throw enhanced;
+    }
+    throw err;
+  }
 }
 
 export function exec(client: Client, command: string, timeoutMs = 30000): Promise<ExecResult> {

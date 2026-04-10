@@ -77,6 +77,14 @@ Tools that fix your local SSH setup so everything else — git, deploys, tunnels
 
 When any remote operation fails, ssh-mcp automatically runs diagnostics and includes the results in the error response. Your agent doesn't need to call `ssh_diagnose` separately — it gets told what's wrong and how to fix it right in the error message.
 
+### Connection pooling
+
+Remote operations reuse SSH connections automatically. When your agent makes multiple calls to the same host, the first call opens a connection and subsequent calls reuse it. Connections are kept alive for 60 seconds after the last use, then closed automatically.
+
+### SSH config support
+
+All connections respect your `~/.ssh/config`. Host aliases, custom ports, usernames, and identity files from your SSH config are used automatically. If you have `Host myserver` configured in your SSH config, just pass `host: "myserver"` — ssh-mcp resolves the real hostname, user, port, and identity file.
+
 ## Authentication
 
 All remote operations accept connection parameters:
@@ -84,12 +92,12 @@ All remote operations accept connection parameters:
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `host` | SSH hostname or IP (required) | — |
-| `port` | SSH port | `22` |
-| `username` | SSH username | Current user |
+| `port` | SSH port | From SSH config or `22` |
+| `username` | SSH username | From SSH config or current user |
 | `privateKeyPath` | Path to SSH private key | Auto-detect |
 | `password` | SSH password (prefer keys) | — |
 
-**Auth resolution order:** explicit key > explicit password > ssh-agent (`SSH_AUTH_SOCK`) > default key paths (`~/.ssh/id_ed25519`, `id_rsa`, `id_ecdsa`).
+**Auth resolution order:** explicit key > explicit password > ssh-agent (`SSH_AUTH_SOCK`) > SSH config identity files > default key paths (`~/.ssh/id_ed25519`, `id_rsa`, `id_ecdsa`).
 
 ## Example workflows
 
@@ -123,7 +131,7 @@ Agent reports: "SSH server isn't running on new-server or port 22 is blocked"
 ## Programmatic usage
 
 ```typescript
-import { connect, exec, diagnose, ensureAgent, listSshKeys, checkGitSsh } from '@yawlabs/ssh-mcp';
+import { connect, exec, diagnose, ensureAgent, listSshKeys, checkGitSsh, ConnectionPool } from '@yawlabs/ssh-mcp';
 
 // Fix SSH environment
 const agent = ensureAgent();
@@ -139,11 +147,24 @@ for (const key of keys) {
   console.log(`${key.name} (${key.type}) - ${key.loadedInAgent ? 'loaded' : 'not loaded'}`);
 }
 
-// Run a remote command
+// Run a remote command (one-off)
 const client = await connect({ host: 'my-server', username: 'deploy' });
 const result = await exec(client, 'uptime');
 console.log(result.stdout);
 client.end();
+
+// Run multiple commands with connection pooling
+const pool = new ConnectionPool();
+await pool.withConnection({ host: 'my-server' }, async (client) => {
+  const r1 = await exec(client, 'uptime');
+  console.log(r1.stdout);
+});
+// Connection stays open for 60s — next call reuses it
+await pool.withConnection({ host: 'my-server' }, async (client) => {
+  const r2 = await exec(client, 'df -h');
+  console.log(r2.stdout);
+});
+pool.drain(); // close all connections when done
 
 // Diagnose issues
 const report = diagnose('my-server');
