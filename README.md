@@ -3,15 +3,24 @@
 [![npm version](https://img.shields.io/npm/v/@yawlabs/ssh-mcp)](https://www.npmjs.com/package/@yawlabs/ssh-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-**SSH operations for AI agents.** MCP server with remote command execution, file transfer, and built-in SSH diagnostics that tell you exactly what's wrong and how to fix it.
+**Make SSH work for AI tools.** MCP server that manages your SSH environment, diagnoses what's broken, fixes it, and gives your agent remote access to anything.
 
 Built and maintained by [Yaw Labs](https://yaw.sh).
 
-## Why this tool?
+## The problem
 
-AI agents that SSH into remote servers hit the same problems over and over: dead ssh-agent, wrong key loaded, stale host keys from recreated instances, permission denied with no useful context. Most SSH MCP servers just wrap `ssh2` and let the agent figure out cryptic errors.
+AI CLI tools run in subprocesses where SSH is constantly broken. The agent tries to `git pull` and gets `Permission denied (publickey)`. It tries to SSH into a server and the agent socket is stale. It tries to deploy and the host key changed because the instance was recreated. Every time, the AI has no idea what's wrong and spirals.
 
-This one includes `ssh_diagnose` — a diagnostic tool that checks your entire SSH environment (agent, keys, config, known_hosts, connectivity) and returns actionable fix commands. Use it before connecting or after a failure.
+This happens across every situation that needs SSH keys:
+
+- **Git** — clone, pull, push, fetch, submodules, LFS
+- **Package managers** — `npm install`, `pip install`, `go get`, `cargo`, `composer` from private repos
+- **Server access** — SSH, SCP, SFTP, rsync
+- **Tunneling** — port forwarding to databases, SOCKS proxies
+- **Deployment** — Ansible, Terraform, Capistrano, deploy scripts
+- **Cloud** — AWS EC2, GCP, Azure, DigitalOcean, any VPS
+
+**ssh-mcp** fixes this. It manages the SSH agent, loads keys, diagnoses failures with actionable fix commands, and provides remote operations — all as MCP tools your AI agent can call.
 
 ## Quick start
 
@@ -33,7 +42,27 @@ Add to your MCP client config:
 
 ## Tools
 
-### Core operations
+### SSH environment management
+
+Tools that fix your local SSH setup so everything else — git, deploys, tunnels — stops breaking.
+
+| Tool | Description |
+|------|-------------|
+| `ssh_agent_ensure` | Ensure ssh-agent is running. Starts one if needed and sets env vars for the session. |
+| `ssh_key_list` | List all SSH keys in ~/.ssh/ with type, fingerprint, and agent status. |
+| `ssh_key_load` | Load a key into the running agent. Ensures the agent is started first. |
+| `ssh_config_lookup` | Resolve the effective SSH config for a host (hostname, user, port, proxy, identity files). |
+| `ssh_known_hosts_fix` | Remove a stale host key and re-scan. Fixes "host key verification failed" errors. |
+| `ssh_git_check` | Test Git-over-SSH auth to GitHub, GitLab, Bitbucket, etc. |
+| `ssh_test` | Quick connectivity test with timing and actionable error details. |
+
+### Diagnostics
+
+| Tool | Description |
+|------|-------------|
+| `ssh_diagnose` | Full SSH environment diagnostic. Checks agent, keys, config, known_hosts, and connectivity. Returns exact fix commands for every failure. |
+
+### Remote operations
 
 | Tool | Description |
 |------|-------------|
@@ -44,15 +73,13 @@ Add to your MCP client config:
 | `ssh_download` | Download a file from a remote host to local filesystem. |
 | `ssh_ls` | List files in a directory on a remote host. |
 
-### Diagnostics
+### Auto-diagnostics
 
-| Tool | Description |
-|------|-------------|
-| `ssh_diagnose` | Diagnose SSH connectivity issues. Checks agent, keys, known_hosts, SSH config, and live connectivity. Returns actionable fix commands. |
+When any remote operation fails, ssh-mcp automatically runs diagnostics and includes the results in the error response. Your agent doesn't need to call `ssh_diagnose` separately — it gets told what's wrong and how to fix it right in the error message.
 
 ## Authentication
 
-All tools accept connection parameters:
+All remote operations accept connection parameters:
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
@@ -64,58 +91,61 @@ All tools accept connection parameters:
 
 **Auth resolution order:** explicit key > explicit password > ssh-agent (`SSH_AUTH_SOCK`) > default key paths (`~/.ssh/id_ed25519`, `id_rsa`, `id_ecdsa`).
 
-## Diagnostics
+## Example workflows
 
-`ssh_diagnose` runs 5 checks and returns a structured report:
-
-1. **SSH Agent** — Is `ssh-agent` running? Are keys loaded?
-2. **SSH Keys** — Do private keys exist in `~/.ssh/`?
-3. **SSH Config** — Is there a config entry for this host? (supports wildcards)
-4. **Known Hosts** — Is the host key cached?
-5. **Connectivity** — Can we actually connect?
-
-Each failed check includes the exact command to fix it. Example output:
+### Agent can't git pull
 
 ```
-SSH Diagnostic Report for dev-server:22
-Overall: ERROR
+Agent calls ssh_git_check → "Permission denied. Your SSH key is not registered with github.com."
+Agent calls ssh_key_list → finds id_ed25519 exists but is not loaded
+Agent calls ssh_key_load("~/.ssh/id_ed25519") → "Key loaded"
+Agent calls ssh_git_check → "Git SSH authentication to github.com succeeded as username"
+Agent runs git pull → works
+```
 
-[PASS] SSH Agent
-  ssh-agent running with keys:
-  256 SHA256:abc... user@host (ED25519)
+### Host key changed after instance recreation
 
-[PASS] SSH Keys
-  Found SSH keys: id_ed25519, gh_woods
+```
+Agent calls ssh_exec on server → error: "Host key verification failed"
+  (auto-diagnostics included in error: "Fix with ssh_known_hosts_fix")
+Agent calls ssh_known_hosts_fix("my-server") → "Host key refreshed"
+Agent calls ssh_exec → works
+```
 
-[PASS] SSH Config
-  SSH config for "dev-server":
-  Host dev-server
-    HostName 10.0.1.50
-    User ec2-user
+### First-time connection to a new server
 
-[FAIL] Known Hosts
-  Host "dev-server" is not in known_hosts.
-
-[FAIL] Connectivity
-  Host key verification failed for dev-server. The host key changed (instance recreated?).
-
-Suggested fixes:
-  - Remove stale host key: ssh-keygen -R "dev-server"
-  - Re-add host key: ssh-keyscan -H "dev-server" >> ~/.ssh/known_hosts
+```
+Agent calls ssh_test("new-server") → "Connection refused at new-server:22"
+Agent calls ssh_diagnose("new-server") → full report showing agent running, keys loaded, but host unreachable
+Agent reports: "SSH server isn't running on new-server or port 22 is blocked"
 ```
 
 ## Programmatic usage
 
 ```typescript
-import { connect, exec, diagnose } from '@yawlabs/ssh-mcp';
+import { connect, exec, diagnose, ensureAgent, listSshKeys, checkGitSsh } from '@yawlabs/ssh-mcp';
 
-// Run a command
+// Fix SSH environment
+const agent = ensureAgent();
+console.log(agent.message);
+
+// Check git access
+const git = checkGitSsh('github.com');
+console.log(git.message);
+
+// List available keys
+const keys = listSshKeys();
+for (const key of keys) {
+  console.log(`${key.name} (${key.type}) - ${key.loadedInAgent ? 'loaded' : 'not loaded'}`);
+}
+
+// Run a remote command
 const client = await connect({ host: 'my-server', username: 'deploy' });
 const result = await exec(client, 'uptime');
 console.log(result.stdout);
 client.end();
 
-// Diagnose connectivity issues
+// Diagnose issues
 const report = diagnose('my-server');
 console.log(report.overall); // "ok" | "warning" | "error"
 for (const check of report.checks) {
@@ -126,7 +156,7 @@ for (const check of report.checks) {
 ## Requirements
 
 - Node.js 18+
-- SSH client installed (for diagnostics)
+- SSH client installed (for diagnostics and environment management)
 
 ## License
 

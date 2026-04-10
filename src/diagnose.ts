@@ -1,4 +1,4 @@
-import { execFileSync, execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -15,16 +15,20 @@ export interface DiagnosticReport {
 }
 
 // Validate hostname to prevent shell injection — only allow safe characters
-function isValidHostname(host: string): boolean {
+export function isValidHostname(host: string): boolean {
   return /^[a-zA-Z0-9._\-:[\]]+$/.test(host) && host.length <= 253;
 }
 
-function runArgs(cmd: string, args: string[]): { stdout: string; ok: boolean } {
+export function runArgs(cmd: string, args: string[]): { stdout: string; ok: boolean } {
   try {
     const stdout = execFileSync(cmd, args, { encoding: "utf8", timeout: 10000, stdio: ["pipe", "pipe", "pipe"] });
     return { stdout: stdout.trim(), ok: true };
   } catch (e: any) {
-    return { stdout: e.stdout?.toString().trim() || e.message || "", ok: false };
+    // Capture both stdout and stderr — many SSH commands (ssh -T, ssh-add) output to stderr
+    const stdout = e.stdout?.toString().trim() || "";
+    const stderr = e.stderr?.toString().trim() || "";
+    const output = [stdout, stderr].filter(Boolean).join("\n") || e.message || "";
+    return { stdout: output, ok: false };
   }
 }
 

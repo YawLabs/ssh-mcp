@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Client, type ConnectConfig, type SFTPWrapper } from "ssh2";
+import { checkKnownHosts, checkSshAgent, checkSshConfig, checkSshKeys } from "./diagnose.js";
 
 export interface SSHConfig {
   host: string;
@@ -49,6 +50,45 @@ function resolveConfig(config: SSHConfig): ConnectConfig {
   return connectConfig;
 }
 
+function formatDiagnostics(host: string): string {
+  // Run fast local checks only — skip connectivity re-test to avoid adding seconds of delay
+  try {
+    const checks = [
+      { name: "SSH Agent", ...checkSshAgent() },
+      { name: "SSH Keys", ...checkSshKeys() },
+      { name: "SSH Config", ...checkSshConfig(host) },
+      { name: "Known Hosts", ...checkKnownHosts(host) },
+    ];
+
+    const parts: string[] = [];
+    const suggestions: string[] = [];
+
+    for (const check of checks) {
+      if (check.status !== "ok") {
+        parts.push(`[${check.status.toUpperCase()}] ${check.name}: ${check.message}`);
+      }
+    }
+
+    const agent = checks[0];
+    if (agent.status === "error") suggestions.push('Start ssh-agent: eval "$(ssh-agent -s)"');
+    if (agent.status === "warning") suggestions.push("Load a key: ssh-add ~/.ssh/id_ed25519");
+
+    const keys = checks[1];
+    if (keys.status === "error") suggestions.push('Generate a key: ssh-keygen -t ed25519 -C "your@email.com"');
+
+    const known = checks[3];
+    if (known.status === "warning") suggestions.push(`Add host key: ssh-keyscan -H "${host}" >> ~/.ssh/known_hosts`);
+
+    if (suggestions.length > 0) {
+      parts.push(`Suggested fixes: ${suggestions.join(" | ")}`);
+    }
+
+    return parts.length > 0 ? parts.join("\n") : "";
+  } catch {
+    return "";
+  }
+}
+
 export function connect(config: SSHConfig): Promise<Client> {
   return new Promise((resolve, reject) => {
     const client = new Client();
@@ -56,7 +96,16 @@ export function connect(config: SSHConfig): Promise<Client> {
 
     client
       .on("ready", () => resolve(client))
-      .on("error", (err) => reject(err))
+      .on("error", (err) => {
+        const diag = formatDiagnostics(config.host);
+        if (diag) {
+          const enhanced = new Error(`${err.message}\n\nSSH Diagnostics:\n${diag}`);
+          enhanced.cause = err;
+          reject(enhanced);
+        } else {
+          reject(err);
+        }
+      })
       .connect(connectConfig);
   });
 }
