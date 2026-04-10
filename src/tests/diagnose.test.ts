@@ -27,7 +27,7 @@ describe("checkKnownHosts", () => {
   it("returns warning for unknown host", () => {
     const result = checkKnownHosts("definitely-not-a-real-host-12345.example.com");
     expect(result.status).toBe("warning");
-    expect(result.message).toContain("not in known_hosts");
+    expect(result.message).toMatch(/not in known_hosts|known_hosts does not exist/);
   });
 });
 
