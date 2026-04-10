@@ -1,5 +1,5 @@
 import type { Client } from "ssh2";
-import { type SSHConfig, connectRaw, formatDiagnostics, resolveConfig } from "./ssh.js";
+import { type SSHConfig, connectWithProxy, formatDiagnostics, resolveConfig } from "./ssh.js";
 
 interface PoolEntry {
   client: Client;
@@ -23,8 +23,9 @@ export class ConnectionPool {
   }
 
   async acquire(config: SSHConfig): Promise<Client> {
-    const connectConfig = resolveConfig(config);
-    const key = `${connectConfig.username}@${connectConfig.host}:${connectConfig.port}`;
+    const resolved = resolveConfig(config);
+    const cc = resolved.connectConfig;
+    const key = `${cc.username}@${cc.host}:${cc.port}`;
 
     const existing = this.entries.get(key);
     if (existing && !existing.dead) {
@@ -42,7 +43,7 @@ export class ConnectionPool {
     }
 
     try {
-      const client = await connectRaw(connectConfig);
+      const client = await connectWithProxy(resolved);
 
       const entry: PoolEntry = { client, key, refCount: 1, idleTimer: null, dead: false };
 

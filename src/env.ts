@@ -42,7 +42,27 @@ export function ensureAgent(): AgentResult {
     }
   }
 
-  // Try to start a new agent
+  // On Windows, try the OpenSSH agent service (uses named pipe, not SSH_AUTH_SOCK)
+  if (!sock && process.platform === "win32") {
+    const { stdout, ok } = runArgs("ssh-add", ["-l"]);
+    const noIdentities = stdout.includes("no identities") || stdout.includes("The agent has no identities");
+    if (ok || noIdentities) {
+      const keys = ok && !noIdentities ? stdout.split("\n").filter(Boolean) : [];
+      return {
+        running: true,
+        reachable: true,
+        socket: "\\\\.\\pipe\\openssh-ssh-agent",
+        keys,
+        started: false,
+        message:
+          keys.length > 0
+            ? `Windows OpenSSH agent running with ${keys.length} key(s) loaded`
+            : "Windows OpenSSH agent running but no keys loaded. Use ssh_key_load to add one.",
+      };
+    }
+  }
+
+  // Try to start a new agent (Unix)
   const { stdout, ok } = runArgs("ssh-agent", ["-s"]);
   if (ok) {
     const sockMatch = stdout.match(/SSH_AUTH_SOCK=([^;]+)/);
@@ -67,7 +87,10 @@ export function ensureAgent(): AgentResult {
     reachable: false,
     keys: [],
     started: false,
-    message: 'Could not start ssh-agent. Run manually: eval "$(ssh-agent -s)"',
+    message:
+      process.platform === "win32"
+        ? "Windows OpenSSH agent not running. Start it: Get-Service ssh-agent | Set-Service -StartupType Automatic; Start-Service ssh-agent"
+        : 'Could not start ssh-agent. Run manually: eval "$(ssh-agent -s)"',
   };
 }
 

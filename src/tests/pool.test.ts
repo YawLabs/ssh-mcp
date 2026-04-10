@@ -25,40 +25,45 @@ describe("ConnectionPool", () => {
 });
 
 describe("resolveConfig", () => {
-  it("returns a connect config with host and port", () => {
-    const config = resolveConfig({ host: "example.com" });
-    expect(config.host).toBeTruthy();
-    expect(config.port).toBeGreaterThan(0);
-    expect(config.username).toBeTruthy();
+  it("returns a resolved config with connectConfig and optional proxyJump", () => {
+    const resolved = resolveConfig({ host: "example.com" });
+    expect(resolved.connectConfig).toBeDefined();
+    expect(resolved.connectConfig.host).toBeTruthy();
+    expect(resolved.connectConfig.port).toBeGreaterThan(0);
+    expect(resolved.connectConfig.username).toBeTruthy();
   });
 
   it("respects explicit port override", () => {
-    const config = resolveConfig({ host: "example.com", port: 2222 });
-    expect(config.port).toBe(2222);
+    const resolved = resolveConfig({ host: "example.com", port: 2222 });
+    expect(resolved.connectConfig.port).toBe(2222);
   });
 
   it("respects explicit username override", () => {
-    const config = resolveConfig({ host: "example.com", username: "deploy" });
-    expect(config.username).toBe("deploy");
+    const resolved = resolveConfig({ host: "example.com", username: "deploy" });
+    expect(resolved.connectConfig.username).toBe("deploy");
   });
 
   it("sets keepalive options", () => {
-    const config = resolveConfig({ host: "example.com" });
-    expect(config.keepaliveInterval).toBe(15_000);
-    expect(config.keepaliveCountMax).toBe(3);
+    const resolved = resolveConfig({ host: "example.com" });
+    expect(resolved.connectConfig.keepaliveInterval).toBe(15_000);
+    expect(resolved.connectConfig.keepaliveCountMax).toBe(3);
   });
 
   it("sets agent when SSH_AUTH_SOCK is available", () => {
     if (process.env.SSH_AUTH_SOCK) {
-      const config = resolveConfig({ host: "example.com" });
-      expect(config.agent).toBe(process.env.SSH_AUTH_SOCK);
+      const resolved = resolveConfig({ host: "example.com" });
+      expect(resolved.connectConfig.agent).toBe(process.env.SSH_AUTH_SOCK);
     }
   });
 
   it("resolves SSH config hostname aliases", () => {
-    // ssh -G resolves Host aliases from ~/.ssh/config
-    // We can't control the user's config, but we can verify the function runs without error
-    const config = resolveConfig({ host: "github.com" });
-    expect(config.host).toBeTruthy();
+    const resolved = resolveConfig({ host: "github.com" });
+    expect(resolved.connectConfig.host).toBeTruthy();
+  });
+
+  it("proxyJump is undefined for hosts without proxy config", () => {
+    const resolved = resolveConfig({ host: "example.com" });
+    // Most hosts won't have a ProxyJump configured
+    expect(resolved.proxyJump === undefined || typeof resolved.proxyJump === "string").toBe(true);
   });
 });

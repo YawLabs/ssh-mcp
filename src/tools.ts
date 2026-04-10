@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { diagnose } from "./diagnose.js";
 import { checkGitSsh, configLookup, ensureAgent, fixKnownHosts, listSshKeys, loadKey, testConnection } from "./env.js";
+import { find, multiExec, serviceStatus, tail } from "./ops.js";
 import { ConnectionPool } from "./pool.js";
 import { downloadFile, exec, listDir, readFile, uploadFile, writeFile } from "./ssh.js";
 
@@ -290,6 +291,131 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
         lines.push(`Authenticated as: ${result.authenticatedAs}`);
       }
       return { content: [{ type: "text", text: lines.join("\n") }], isError: result.status === "error" };
+    },
+  );
+
+  // --- Higher-level operations ---
+
+  server.tool(
+    "ssh_multi_exec",
+    "Execute a command on multiple remote hosts in parallel. Returns results per host. Use this instead of calling ssh_exec multiple times — it's faster and shows results side by side.",
+    {
+      hosts: z.array(z.string()).describe("List of SSH hostnames or IPs"),
+      command: z.string().describe("Shell command to execute on all hosts"),
+      username: UsernameSchema,
+      privateKeyPath: KeyPathSchema,
+      password: PasswordSchema,
+      timeout: TimeoutSchema,
+    },
+    async ({ hosts, command, username, privateKeyPath, password, timeout }) => {
+      const hostConfigs = hosts.map((host) => ({ host, username, privateKeyPath, password }));
+      const results = await multiExec(connectionPool, hostConfigs, command, timeout || 30000);
+
+      const lines: string[] = [];
+      for (const r of results) {
+        lines.push(`--- ${r.host} ---`);
+        if (r.error) {
+          lines.push(`[ERROR] ${r.error}`);
+        } else {
+          if (r.stdout) lines.push(r.stdout);
+          if (r.stderr) lines.push(`[stderr] ${r.stderr}`);
+          lines.push(`[exit code: ${r.code}]`);
+        }
+        lines.push("");
+      }
+      const hasErrors = results.some((r) => r.error || r.code !== 0);
+      return { content: [{ type: "text", text: lines.join("\n") }], isError: hasErrors };
+    },
+  );
+
+  server.tool(
+    "ssh_find",
+    "Search for files on a remote host. Wraps the find command with structured parameters so you don't have to construct find syntax manually.",
+    {
+      ...connectionParams,
+      path: z.string().describe("Directory to search in (e.g. /var/log, /home/user)"),
+      name: z.string().optional().describe("Filename pattern with wildcards (e.g. '*.log', 'config.*')"),
+      type: z.enum(["f", "d", "l"]).optional().describe("File type: f=file, d=directory, l=symlink"),
+      maxdepth: z.number().optional().describe("Maximum directory depth to search"),
+      minsize: z.string().optional().describe("Minimum file size (e.g. '1M', '100k')"),
+      maxsize: z.string().optional().describe("Maximum file size (e.g. '10M', '500k')"),
+      timeout: TimeoutSchema,
+    },
+    async ({
+      host,
+      port,
+      username,
+      privateKeyPath,
+      password,
+      path,
+      name,
+      type,
+      maxdepth,
+      minsize,
+      maxsize,
+      timeout,
+    }) => {
+      return connectionPool.withConnection({ host, port, username, privateKeyPath, password }, async (client) => {
+        const files = await find(client, { path, name, type, maxdepth, minsize, maxsize }, timeout || 30000);
+        if (files.length === 0) {
+          return { content: [{ type: "text", text: "No files found." }] };
+        }
+        return { content: [{ type: "text", text: `Found ${files.length} result(s):\n${files.join("\n")}` }] };
+      });
+    },
+  );
+
+  server.tool(
+    "ssh_tail",
+    "Read the last N lines of a file on a remote host, optionally filtering by a grep pattern. Use this for reading log files instead of ssh_exec with manual tail/grep commands.",
+    {
+      ...connectionParams,
+      path: z.string().describe("Absolute path to the file to tail"),
+      lines: z.number().optional().describe("Number of lines to read from the end (default: 100)"),
+      grep: z.string().optional().describe("Case-insensitive pattern to filter lines"),
+      timeout: TimeoutSchema,
+    },
+    async ({ host, port, username, privateKeyPath, password, path, lines, grep, timeout }) => {
+      return connectionPool.withConnection({ host, port, username, privateKeyPath, password }, async (client) => {
+        const output = await tail(client, path, lines || 100, grep, timeout || 30000);
+        if (!output.trim()) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: grep
+                  ? `No lines matching "${grep}" in last ${lines || 100} lines.`
+                  : "File is empty or does not exist.",
+              },
+            ],
+          };
+        }
+        return { content: [{ type: "text", text: output }] };
+      });
+    },
+  );
+
+  server.tool(
+    "ssh_service_status",
+    "Check the status of a systemd service on a remote host. Returns whether it's active, its PID, uptime, and description. Use this instead of ssh_exec with systemctl.",
+    {
+      ...connectionParams,
+      service: z.string().describe("Systemd service name (e.g. nginx, sshd, docker)"),
+      timeout: TimeoutSchema,
+    },
+    async ({ host, port, username, privateKeyPath, password, service, timeout }) => {
+      return connectionPool.withConnection({ host, port, username, privateKeyPath, password }, async (client) => {
+        const status = await serviceStatus(client, service, timeout || 30000);
+        const lines: string[] = [];
+        lines.push(`Service: ${status.name}`);
+        lines.push(`Status: ${status.status}`);
+        if (status.description) lines.push(`Description: ${status.description}`);
+        if (status.pid) lines.push(`PID: ${status.pid}`);
+        if (status.since) lines.push(`Since: ${status.since}`);
+        lines.push("");
+        lines.push(status.raw);
+        return { content: [{ type: "text", text: lines.join("\n") }], isError: !status.active };
+      });
     },
   );
 }

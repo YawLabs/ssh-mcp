@@ -1,6 +1,6 @@
 {
   "name": "@yawlabs/ssh-mcp",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "MCP server for SSH operations with built-in diagnostics",
   "type": "module",
   "bin": {
@@ -24,6 +24,7 @@
     "lint:fix": "biome check --write src/",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:integration": "docker compose -f test/docker/docker-compose.yml up -d --build --wait && SSH_MCP_INTEGRATION=1 vitest run src/tests/integration.test.ts; docker compose -f test/docker/docker-compose.yml down",
     "test:ci": "npm run build && npm test",
     "prepublishOnly": "npm run build"
   },

@@ -5,7 +5,7 @@ import { registerTools } from "./tools.js";
 export function createServer(pool?: ConnectionPool): McpServer {
   const server = new McpServer({
     name: "ssh-mcp",
-    version: "0.4.0",
+    version: "0.5.0",
   });
 
   registerTools(server, pool);
@@ -26,7 +26,9 @@ export type { DiagnosticResult, DiagnosticReport } from "./diagnose.js";
 export {
   connect,
   connectRaw,
+  connectWithProxy,
   resolveConfig,
+  formatDiagnostics,
   exec,
   readFile,
   writeFile,
@@ -34,9 +36,11 @@ export {
   downloadFile,
   listDir,
 } from "./ssh.js";
-export type { SSHConfig, ExecResult } from "./ssh.js";
+export type { SSHConfig, ExecResult, ResolvedConfig } from "./ssh.js";
 export { ConnectionPool } from "./pool.js";
 export type { PoolOptions } from "./pool.js";
+export { multiExec, find, tail, serviceStatus } from "./ops.js";
+export type { MultiExecResult, MultiExecHost, FindOptions, ServiceStatus } from "./ops.js";
 export {
   ensureAgent,
   listSshKeys,

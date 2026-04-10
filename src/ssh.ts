@@ -24,6 +24,12 @@ interface SshConfigResult {
   user: string;
   port: string;
   identityFiles: string[];
+  proxyJump?: string;
+}
+
+export interface ResolvedConfig {
+  connectConfig: ConnectConfig;
+  proxyJump?: string;
 }
 
 function resolveFromSshConfig(host: string): SshConfigResult | null {
@@ -52,14 +58,15 @@ function resolveFromSshConfig(host: string): SshConfigResult | null {
       user: config.user || "",
       port: config.port || "22",
       identityFiles,
+      proxyJump: config.proxyjump && config.proxyjump !== "none" ? config.proxyjump : undefined,
     };
   } catch {
     return null;
   }
 }
 
-export function resolveConfig(config: SSHConfig): ConnectConfig {
-  // Resolve SSH config for the host (hostname aliases, user, port, identity files)
+export function resolveConfig(config: SSHConfig): ResolvedConfig {
+  // Resolve SSH config for the host (hostname aliases, user, port, identity files, proxy)
   const sshConfig = resolveFromSshConfig(config.host);
 
   const connectConfig: ConnectConfig = {
@@ -70,8 +77,11 @@ export function resolveConfig(config: SSHConfig): ConnectConfig {
     keepaliveCountMax: 3,
   };
 
-  // Always set agent if available
-  const agentSock = config.agent || process.env.SSH_AUTH_SOCK;
+  // Always set agent if available (including Windows named pipe)
+  const agentSock =
+    config.agent ||
+    process.env.SSH_AUTH_SOCK ||
+    (process.platform === "win32" ? "\\\\.\\pipe\\openssh-ssh-agent" : undefined);
   if (agentSock) {
     connectConfig.agent = agentSock;
   }
@@ -102,7 +112,7 @@ export function resolveConfig(config: SSHConfig): ConnectConfig {
     }
   }
 
-  return connectConfig;
+  return { connectConfig, proxyJump: sshConfig?.proxyJump };
 }
 
 export function formatDiagnostics(host: string): string {
@@ -154,10 +164,49 @@ export function connectRaw(connectConfig: ConnectConfig): Promise<Client> {
   });
 }
 
+export async function connectWithProxy(resolved: ResolvedConfig): Promise<Client> {
+  if (!resolved.proxyJump) {
+    return connectRaw(resolved.connectConfig);
+  }
+
+  // Connect to the jump host
+  const jumpResolved = resolveConfig({ host: resolved.proxyJump });
+  const jumpClient = await connectWithProxy(jumpResolved); // recursive for chained proxies
+
+  // Create tunnel from jump host to target
+  const targetHost = resolved.connectConfig.host as string;
+  const targetPort = resolved.connectConfig.port as number;
+
+  const stream = await new Promise<any>((resolve, reject) => {
+    jumpClient.forwardOut("127.0.0.1", 0, targetHost, targetPort, (err, stream) => {
+      if (err) {
+        jumpClient.end();
+        return reject(err);
+      }
+      resolve(stream);
+    });
+  });
+
+  // Connect through the tunnel
+  return new Promise((resolve, reject) => {
+    const client = new Client();
+    client
+      .on("ready", () => resolve(client))
+      .on("error", (err) => {
+        jumpClient.end();
+        reject(err);
+      })
+      .on("close", () => {
+        jumpClient.end();
+      })
+      .connect({ ...resolved.connectConfig, sock: stream });
+  });
+}
+
 export async function connect(config: SSHConfig): Promise<Client> {
-  const connectConfig = resolveConfig(config);
+  const resolved = resolveConfig(config);
   try {
-    return await connectRaw(connectConfig);
+    return await connectWithProxy(resolved);
   } catch (err: unknown) {
     const diag = formatDiagnostics(config.host);
     if (diag) {

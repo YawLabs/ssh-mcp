@@ -1,0 +1,7 @@
+services:
+  sshd:
+    build: .
+    ports:
+      - "2222:22"
+    volumes:
+      - ./test_key.pub:/root/.ssh/authorized_keys:ro

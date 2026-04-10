@@ -73,6 +73,17 @@ Tools that fix your local SSH setup so everything else — git, deploys, tunnels
 | `ssh_download` | Download a file from a remote host to local filesystem. |
 | `ssh_ls` | List files in a directory on a remote host. |
 
+### Higher-level operations
+
+Tools that wrap common patterns agents build with ssh_exec — faster and less error-prone.
+
+| Tool | Description |
+|------|-------------|
+| `ssh_multi_exec` | Run a command on multiple hosts in parallel. Returns results per host. |
+| `ssh_find` | Search for files remotely with structured parameters (name, type, size, depth). |
+| `ssh_tail` | Read the last N lines of a file, optionally filtered by a grep pattern. |
+| `ssh_service_status` | Check systemd service status (active, PID, uptime, description). |
+
 ### Auto-diagnostics
 
 When any remote operation fails, ssh-mcp automatically runs diagnostics and includes the results in the error response. Your agent doesn't need to call `ssh_diagnose` separately — it gets told what's wrong and how to fix it right in the error message.
@@ -83,7 +94,13 @@ Remote operations reuse SSH connections automatically. When your agent makes mul
 
 ### SSH config support
 
-All connections respect your `~/.ssh/config`. Host aliases, custom ports, usernames, and identity files from your SSH config are used automatically. If you have `Host myserver` configured in your SSH config, just pass `host: "myserver"` — ssh-mcp resolves the real hostname, user, port, and identity file.
+All connections respect your `~/.ssh/config`. Host aliases, custom ports, usernames, identity files, and ProxyJump settings are used automatically. If you have `Host myserver` configured in your SSH config, just pass `host: "myserver"` — ssh-mcp resolves everything.
+
+**ProxyJump / bastion hosts** are supported automatically. If your SSH config has `ProxyJump bastion` for a host, ssh-mcp connects through the bastion transparently. Chained proxies work too.
+
+### Windows support
+
+On Windows, ssh-mcp detects the OpenSSH Authentication Agent service automatically (via the `\\.\pipe\openssh-ssh-agent` named pipe). No `SSH_AUTH_SOCK` needed — just make sure the OpenSSH agent service is running.
 
 ## Authentication
 

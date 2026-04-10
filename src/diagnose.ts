@@ -34,6 +34,29 @@ export function runArgs(cmd: string, args: string[]): { stdout: string; ok: bool
 
 export function checkSshAgent(): DiagnosticResult {
   const sock = process.env.SSH_AUTH_SOCK;
+
+  // On Windows without SSH_AUTH_SOCK, try the OpenSSH agent service directly
+  if (!sock && process.platform === "win32") {
+    const { stdout, ok } = runArgs("ssh-add", ["-l"]);
+    if (ok) {
+      return { status: "ok", message: `Windows OpenSSH agent running with keys:\n${stdout}` };
+    }
+    if (stdout.includes("no identities") || stdout.includes("The agent has no identities")) {
+      return {
+        status: "warning",
+        message: "Windows OpenSSH agent is running but has no keys loaded. Run: ssh-add <key-path>",
+      };
+    }
+    // If ssh-add works at all, the Windows agent service is running
+    if (!stdout.includes("Error connecting") && !stdout.includes("unable to")) {
+      return {
+        status: "warning",
+        message:
+          "Windows OpenSSH Authentication Agent may not be running. Start it: Get-Service ssh-agent | Set-Service -StartupType Automatic; Start-Service ssh-agent",
+      };
+    }
+  }
+
   if (!sock) {
     return {
       status: "error",
