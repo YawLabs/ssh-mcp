@@ -274,9 +274,22 @@ function getSftp(client: Client): Promise<SFTPWrapper> {
   });
 }
 
-export async function readFile(client: Client, remotePath: string): Promise<string> {
+const DEFAULT_MAX_READ_BYTES = 10 * 1024 * 1024; // 10 MB
+
+export async function readFile(client: Client, remotePath: string, maxBytes = DEFAULT_MAX_READ_BYTES): Promise<string> {
   const sftp = await getSftp(client);
   try {
+    const stats = await new Promise<{ size: number }>((resolve, reject) => {
+      sftp.stat(remotePath, (err, stats) => {
+        if (err) return reject(err);
+        resolve(stats);
+      });
+    });
+    if (stats.size > maxBytes) {
+      throw new Error(
+        `File is ${(stats.size / 1024 / 1024).toFixed(1)} MB, exceeds ${(maxBytes / 1024 / 1024).toFixed(0)} MB limit. Use ssh_exec with head/tail to read a portion.`,
+      );
+    }
     return await new Promise((resolve, reject) => {
       sftp.readFile(remotePath, (err, data) => {
         if (err) return reject(err);

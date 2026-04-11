@@ -40,6 +40,26 @@ describe("configLookup", () => {
     const result = configLookup("host; rm -rf /");
     expect("error" in result).toBe(true);
   });
+
+  it("rejects command substitution in hostname", () => {
+    const result = configLookup("host$(whoami)");
+    expect("error" in result).toBe(true);
+  });
+
+  it("rejects backtick injection in hostname", () => {
+    const result = configLookup("host`id`");
+    expect("error" in result).toBe(true);
+  });
+
+  it("rejects pipe injection in hostname", () => {
+    const result = configLookup("host | cat /etc/passwd");
+    expect("error" in result).toBe(true);
+  });
+
+  it("rejects empty hostname", () => {
+    const result = configLookup("");
+    expect("error" in result).toBe(true);
+  });
 });
 
 describe("testConnection", () => {
@@ -48,6 +68,12 @@ describe("testConnection", () => {
     expect(result.status).toBe("error");
     expect(result.message).toBeTruthy();
   });
+
+  it("rejects invalid hostname", () => {
+    const result = testConnection("host; rm -rf /");
+    expect(result.status).toBe("error");
+    expect(result.message).toMatch(/Invalid hostname/);
+  });
 });
 
 describe("checkGitSsh", () => {
@@ -55,5 +81,11 @@ describe("checkGitSsh", () => {
     const result = checkGitSsh("github.com");
     expect(result.status).toMatch(/^(ok|error)$/);
     expect(result.message).toBeTruthy();
+  });
+
+  it("rejects invalid hostname", () => {
+    const result = checkGitSsh("host; rm -rf /");
+    expect(result.status).toBe("error");
+    expect(result.message).toMatch(/Invalid hostname/);
   });
 });

@@ -12,14 +12,18 @@ interface PoolEntry {
 export interface PoolOptions {
   /** Milliseconds before an idle connection is closed. Default: 60000 (60s) */
   idleTtlMs?: number;
+  /** Maximum number of connections in the pool. Default: 100 */
+  maxPoolSize?: number;
 }
 
 export class ConnectionPool {
   private entries = new Map<string, PoolEntry>();
   private idleTtlMs: number;
+  private maxPoolSize: number;
 
   constructor(options?: PoolOptions) {
     this.idleTtlMs = options?.idleTtlMs ?? 60_000;
+    this.maxPoolSize = options?.maxPoolSize ?? 100;
   }
 
   async acquire(config: SSHConfig): Promise<Client> {
@@ -40,6 +44,27 @@ export class ConnectionPool {
     // Remove dead entry if present
     if (existing?.dead) {
       this.entries.delete(key);
+    }
+
+    // Evict idle connections if at capacity
+    if (this.entries.size >= this.maxPoolSize) {
+      let evicted = false;
+      for (const [k, e] of this.entries) {
+        if (e.refCount === 0) {
+          if (e.idleTimer) clearTimeout(e.idleTimer);
+          try {
+            e.client.end();
+          } catch {
+            /* already closed */
+          }
+          this.entries.delete(k);
+          evicted = true;
+          break;
+        }
+      }
+      if (!evicted) {
+        throw new Error(`Connection pool is full (${this.maxPoolSize} active connections)`);
+      }
     }
 
     try {

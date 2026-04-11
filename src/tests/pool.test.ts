@@ -16,11 +16,43 @@ describe("ConnectionPool", () => {
     pool.drain();
   });
 
+  it("creates a pool with custom maxPoolSize", () => {
+    const pool = new ConnectionPool({ maxPoolSize: 50 });
+    expect(pool.size).toBe(0);
+    pool.drain();
+  });
+
   it("drain on empty pool is safe", () => {
     const pool = new ConnectionPool();
     pool.drain();
     pool.drain(); // double drain is safe
     expect(pool.size).toBe(0);
+  });
+
+  it("release of unknown client closes it", () => {
+    const pool = new ConnectionPool();
+    // Create a mock client-like object
+    let endCalled = false;
+    const fakeClient = {
+      end: () => {
+        endCalled = true;
+      },
+    } as any;
+    pool.release(fakeClient);
+    expect(endCalled).toBe(true);
+    pool.drain();
+  });
+
+  it("release of already-closed unknown client is safe", () => {
+    const pool = new ConnectionPool();
+    const fakeClient = {
+      end: () => {
+        throw new Error("already closed");
+      },
+    } as any;
+    // Should not throw
+    expect(() => pool.release(fakeClient)).not.toThrow();
+    pool.drain();
   });
 });
 

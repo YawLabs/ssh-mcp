@@ -16,18 +16,25 @@ export interface DiagnosticReport {
 
 // Validate hostname to prevent shell injection — only allow safe characters
 export function isValidHostname(host: string): boolean {
-  return /^[a-zA-Z0-9._\-:[\]]+$/.test(host) && host.length <= 253;
+  if (host.length === 0 || host.length > 253) return false;
+  // IPv6 in brackets: [::1], [2001:db8::1]
+  if (host.startsWith("[")) {
+    return /^\[[0-9a-fA-F:]+\]$/.test(host);
+  }
+  // Standard hostname, IPv4, or SSH config alias (alphanumeric, dots, hyphens, underscores)
+  return /^[a-zA-Z0-9._\-]+$/.test(host);
 }
 
 export function runArgs(cmd: string, args: string[]): { stdout: string; ok: boolean } {
   try {
     const stdout = execFileSync(cmd, args, { encoding: "utf8", timeout: 10000, stdio: ["pipe", "pipe", "pipe"] });
     return { stdout: stdout.trim(), ok: true };
-  } catch (e: any) {
+  } catch (e: unknown) {
     // Capture both stdout and stderr — many SSH commands (ssh -T, ssh-add) output to stderr
-    const stdout = e.stdout?.toString().trim() || "";
-    const stderr = e.stderr?.toString().trim() || "";
-    const output = [stdout, stderr].filter(Boolean).join("\n") || e.message || "";
+    const err = e as { stdout?: Buffer; stderr?: Buffer; message?: string };
+    const stdout = err.stdout?.toString().trim() || "";
+    const stderr = err.stderr?.toString().trim() || "";
+    const output = [stdout, stderr].filter(Boolean).join("\n") || err.message || "";
     return { stdout: output, ok: false };
   }
 }
@@ -47,14 +54,12 @@ export function checkSshAgent(): DiagnosticResult {
         message: "Windows OpenSSH agent is running but has no keys loaded. Run: ssh-add <key-path>",
       };
     }
-    // If ssh-add works at all, the Windows agent service is running
-    if (!stdout.includes("Error connecting") && !stdout.includes("unable to")) {
-      return {
-        status: "warning",
-        message:
-          "Windows OpenSSH Authentication Agent may not be running. Start it: Get-Service ssh-agent | Set-Service -StartupType Automatic; Start-Service ssh-agent",
-      };
-    }
+    // ssh-add failed and no identities message — agent is not reachable
+    return {
+      status: "error",
+      message:
+        "Windows OpenSSH Authentication Agent is not running. Start it: Get-Service ssh-agent | Set-Service -StartupType Automatic; Start-Service ssh-agent",
+    };
   }
 
   if (!sock) {

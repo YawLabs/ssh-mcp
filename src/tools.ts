@@ -7,11 +7,16 @@ import { ConnectionPool } from "./pool.js";
 import { downloadFile, exec, listDir, readFile, uploadFile, writeFile } from "./ssh.js";
 
 const HostSchema = z.string().describe("SSH hostname or IP address");
-const PortSchema = z.number().optional().describe("SSH port (default: 22)");
+const PortSchema = z.number().int().min(1).max(65535).optional().describe("SSH port (default: 22)");
 const UsernameSchema = z.string().optional().describe("SSH username (default: current user)");
 const KeyPathSchema = z.string().optional().describe("Path to SSH private key");
 const PasswordSchema = z.string().optional().describe("SSH password (prefer keys)");
-const TimeoutSchema = z.number().optional().describe("Command timeout in milliseconds (default: 30000)");
+const TimeoutSchema = z
+  .number()
+  .int()
+  .positive()
+  .optional()
+  .describe("Command timeout in milliseconds (default: 30000)");
 
 const connectionParams = {
   host: HostSchema,
@@ -151,7 +156,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
         }
       }
 
-      return { content: [{ type: "text", text: lines.join("\n") }] };
+      return { content: [{ type: "text", text: lines.join("\n") }], isError: report.overall === "error" };
     },
   );
 
@@ -302,13 +307,14 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
     {
       hosts: z.array(z.string()).describe("List of SSH hostnames or IPs"),
       command: z.string().describe("Shell command to execute on all hosts"),
+      port: PortSchema,
       username: UsernameSchema,
       privateKeyPath: KeyPathSchema,
       password: PasswordSchema,
       timeout: TimeoutSchema,
     },
-    async ({ hosts, command, username, privateKeyPath, password, timeout }) => {
-      const hostConfigs = hosts.map((host) => ({ host, username, privateKeyPath, password }));
+    async ({ hosts, command, port, username, privateKeyPath, password, timeout }) => {
+      const hostConfigs = hosts.map((host) => ({ host, port, username, privateKeyPath, password }));
       const results = await multiExec(connectionPool, hostConfigs, command, timeout || 30000);
 
       const lines: string[] = [];

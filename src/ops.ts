@@ -65,7 +65,20 @@ export interface FindOptions {
   newer?: string;
 }
 
+const VALID_FIND_SIZE = /^\d+[kMGTP]?$/;
+
 export async function find(client: Client, options: FindOptions, timeoutMs = 30000): Promise<string[]> {
+  if (options.minsize && !VALID_FIND_SIZE.test(options.minsize)) {
+    throw new Error(
+      `Invalid minsize format: "${options.minsize}". Expected: digits followed by optional k/M/G/T/P (e.g. "1M", "100k")`,
+    );
+  }
+  if (options.maxsize && !VALID_FIND_SIZE.test(options.maxsize)) {
+    throw new Error(
+      `Invalid maxsize format: "${options.maxsize}". Expected: digits followed by optional k/M/G/T/P (e.g. "10M", "500k")`,
+    );
+  }
+
   const args: string[] = [shellQuote(options.path)];
 
   if (options.maxdepth !== undefined) args.push("-maxdepth", String(options.maxdepth));
