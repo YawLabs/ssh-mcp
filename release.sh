@@ -3,17 +3,15 @@
 # Release Script — Test, bump, tag, publish to npm, create GitHub release
 # =============================================================================
 # Usage:
-#   ./release.sh <new-version>
-#   ./release.sh 0.2.0
+#   Local:  ./release.sh <new-version>    e.g. ./release.sh 0.6.0
+#   CI:     bash release.sh               (version derived from git tag)
 #
 # If interrupted, just re-run with the same version — each step is idempotent.
 #
 # Prerequisites:
 #   - gh CLI authenticated (or GITHUB_TOKEN set)
-#   - npm authenticated (or NPM_TOKEN set)
+#   - npm authenticated (or NPM_TOKEN set via NODE_AUTH_TOKEN)
 #   - Node.js + npm installed
-#
-# In CI, set the CI environment variable to skip the confirmation prompt.
 # =============================================================================
 
 set -euo pipefail
@@ -32,13 +30,16 @@ fail() { echo -e "${RED}  ✗ $1${NC}"; exit 1; }
 
 TOTAL_STEPS=7
 
-if [ $# -ne 1 ]; then
+# Derive version: argument > git tag (CI) > fail
+if [ $# -ge 1 ]; then
+  VERSION="$1"
+elif [ -n "${GITHUB_REF_NAME:-}" ]; then
+  VERSION="${GITHUB_REF_NAME#v}"
+else
   echo "Usage: ./release.sh <version>"
-  echo "  e.g. ./release.sh 0.2.0"
+  echo "  e.g. ./release.sh 0.6.0"
   exit 1
 fi
-
-VERSION="$1"
 
 if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   fail "Invalid version format: $VERSION (expected X.Y.Z)"
@@ -55,9 +56,6 @@ CURRENT_VERSION=$(node -p "require('./package.json').version")
 if [ "$CURRENT_VERSION" = "$VERSION" ]; then
   info "Resuming release v${VERSION}"
 else
-  if [ -n "$(git status --porcelain)" ]; then
-    fail "Working directory not clean. Commit or stash changes first."
-  fi
   info "Current version: $CURRENT_VERSION → $VERSION"
 fi
 
@@ -100,26 +98,34 @@ fi
 # Step 3: Commit and tag
 step 3 "Commit and tag"
 
-if [ -n "$(git status --porcelain package.json package-lock.json 2>/dev/null)" ]; then
-  git add package.json package-lock.json
-  git commit -m "v${VERSION}"
-  info "Committed version bump"
+if [ -n "${CI:-}" ]; then
+  info "CI mode — tag already exists, skipping commit/tag/push"
 else
-  info "Already committed — skipping"
-fi
+  if [ -n "$(git status --porcelain package.json package-lock.json 2>/dev/null)" ]; then
+    git add package.json package-lock.json
+    git commit -m "v${VERSION}"
+    info "Committed version bump"
+  else
+    info "Already committed — skipping"
+  fi
 
-if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
-  info "Tag v${VERSION} already exists — skipping"
-else
-  git tag "v${VERSION}"
-  info "Tag v${VERSION} created"
+  if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
+    info "Tag v${VERSION} already exists — skipping"
+  else
+    git tag "v${VERSION}"
+    info "Tag v${VERSION} created"
+  fi
 fi
 
 # Step 4: Push
 step 4 "Push to origin"
 
-git push origin main --tags
-info "Pushed commit and tag"
+if [ -n "${CI:-}" ]; then
+  info "CI mode — already pushed, skipping"
+else
+  git push origin main --tags
+  info "Pushed commit and tag"
+fi
 
 # Step 5: Publish to npm
 step 5 "Publish to npm"
@@ -128,7 +134,11 @@ NPM_VERSION=$(npm view @yawlabs/ssh-mcp version 2>/dev/null || echo "")
 if [ "$NPM_VERSION" = "$VERSION" ]; then
   info "Already published to npm — skipping"
 else
-  npm publish --access public
+  if [ -n "${CI:-}" ]; then
+    npm publish --access public --provenance
+  else
+    npm publish --access public
+  fi
   info "Published @yawlabs/ssh-mcp@${VERSION} to npm"
 fi
 

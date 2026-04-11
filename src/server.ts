@@ -5,7 +5,7 @@ import { registerTools } from "./tools.js";
 export function createServer(pool?: ConnectionPool): McpServer {
   const server = new McpServer({
     name: "ssh-mcp",
-    version: "0.5.0",
+    version: "0.6.0",
   });
 
   registerTools(server, pool);
