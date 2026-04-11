@@ -137,6 +137,10 @@ export function checkSshKeys(): DiagnosticResult {
 }
 
 export function checkKnownHosts(host: string): DiagnosticResult {
+  if (!isValidHostname(host)) {
+    return { status: "error", message: `Invalid hostname: "${host}"` };
+  }
+
   const knownHostsPath = join(homedir(), ".ssh", "known_hosts");
 
   if (!existsSync(knownHostsPath)) {
@@ -144,10 +148,6 @@ export function checkKnownHosts(host: string): DiagnosticResult {
       status: "warning",
       message: "~/.ssh/known_hosts does not exist. First connection to any host will prompt for verification.",
     };
-  }
-
-  if (!isValidHostname(host)) {
-    return { status: "error", message: `Invalid hostname: "${host}"` };
   }
 
   const { stdout, ok } = runArgs("ssh-keygen", ["-F", host]);
