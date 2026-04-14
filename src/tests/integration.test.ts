@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { find, multiExec, tail } from "../ops.js";
 import { ConnectionPool } from "../pool.js";
-import { connect, exec, listDir, readFile, writeFile } from "../ssh.js";
+import { type ResolvedConfig, connect, connectWithProxy, exec, listDir, readFile, writeFile } from "../ssh.js";
 
 const INTEGRATION = process.env.SSH_MCP_INTEGRATION === "1";
 const TEST_HOST = "127.0.0.1";
@@ -145,3 +145,85 @@ describe.skipIf(!INTEGRATION)("integration: higher-level ops", () => {
     }
   });
 });
+
+describe.skipIf(!INTEGRATION)("integration: pool under concurrency", () => {
+  it("reuses a single connection under a 50-way concurrent burst", async () => {
+    const pool = new ConnectionPool();
+    try {
+      const tasks = Array.from({ length: 50 }, (_, i) =>
+        pool.withConnection(connConfig, async (client) => {
+          const r = await exec(client, `echo ${i}`);
+          return r.stdout.trim();
+        }),
+      );
+      const results = await Promise.all(tasks);
+      expect(results).toHaveLength(50);
+      expect(new Set(results).size).toBe(50);
+      // Single host/user/port → single pool entry even under concurrency.
+      expect(pool.size).toBe(1);
+      expect(pool.stats.active).toBe(0);
+      expect(pool.stats.idle).toBe(1);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("release decrements refcount to zero after concurrent work completes", async () => {
+    const pool = new ConnectionPool();
+    try {
+      await Promise.all(Array.from({ length: 10 }, () => pool.withConnection(connConfig, async () => "done")));
+      expect(pool.stats.active).toBe(0);
+      expect(pool.stats.idle).toBe(1);
+    } finally {
+      pool.drain();
+    }
+  });
+});
+
+describe.skipIf(!INTEGRATION)("integration: ProxyJump failure", () => {
+  it("rejects and cleans up when the jump host is unreachable", async () => {
+    // Construct a ResolvedConfig that points at a definitely-unreachable jump host.
+    // connectWithProxy should recurse into the jump, fail, and not leak connections.
+    const resolved: ResolvedConfig = {
+      connectConfig: { host: TEST_HOST, port: TEST_PORT, username: TEST_USER },
+      proxyJump: "ssh-mcp-nonexistent-jump.invalid",
+    };
+    await expect(connectWithProxy(resolved)).rejects.toThrow();
+  });
+});
+
+describe.skipIf(!INTEGRATION)("integration: SFTP error paths", () => {
+  it("rejects reading a path that does not exist", async () => {
+    const client = await connect(connConfig);
+    try {
+      await expect(readFile(client, "/nonexistent/path/xyz.txt")).rejects.toThrow();
+    } finally {
+      client.end();
+    }
+  });
+
+  it("rejects writing to a directory without permission", async () => {
+    const client = await connect(connConfig);
+    try {
+      // /proc is read-only on Linux; writing under it should fail.
+      await expect(writeFile(client, "/proc/ssh-mcp-denied.txt", "x")).rejects.toThrow();
+    } finally {
+      client.end();
+    }
+  });
+
+  it("rejects listing a directory that does not exist", async () => {
+    const client = await connect(connConfig);
+    try {
+      await expect(listDir(client, "/nonexistent/dir/xyz")).rejects.toThrow();
+    } finally {
+      client.end();
+    }
+  });
+});
+
+// NOTE: maxPoolSize eviction cannot be exercised end-to-end with the current Docker
+// setup (single sshd container, single port). The pool key is username@host:port, so
+// two distinct entries require two distinct endpoints. When the test fixture grows to
+// multiple containers, add: acquire N+1 entries with maxPoolSize=N, verify the oldest
+// idle entry is evicted and the new one succeeds.

@@ -5,7 +5,7 @@ import { registerTools } from "./tools.js";
 export function createServer(pool?: ConnectionPool): McpServer {
   const server = new McpServer({
     name: "ssh-mcp",
-    version: "0.6.0",
+    version: "0.7.0",
   });
 
   registerTools(server, pool);
@@ -28,6 +28,7 @@ export {
   connectRaw,
   connectWithProxy,
   resolveConfig,
+  readKnownHostsKeys,
   formatDiagnostics,
   exec,
   readFile,

@@ -98,6 +98,18 @@ All connections respect your `~/.ssh/config`. Host aliases, custom ports, userna
 
 **ProxyJump / bastion hosts** are supported automatically. If your SSH config has `ProxyJump bastion` for a host, ssh-mcp connects through the bastion transparently. Chained proxies work too.
 
+### Host key verification
+
+All remote operations verify the server's host key against `~/.ssh/known_hosts`:
+
+- **Known host, key matches** — accept.
+- **Known host, key changed** — reject (MITM protection).
+- **Unknown host** — accept on first connection (TOFU). Use `ssh_known_hosts_fix` to pin the key for future mismatch detection.
+
+For stricter environments, set `SSH_MCP_STRICT_HOST_KEY=1` to reject unknown hosts. Add them explicitly with `ssh_known_hosts_fix` first.
+
+The diagnostic tools (`ssh_test`, `ssh_diagnose`) use `StrictHostKeyChecking=no` for their probe commands. Those probes only run `echo SSH_OK` — no credentials or data pass through — so the relaxed setting is safe for connectivity testing. Real operations always go through the `hostVerifier`.
+
 ### Windows support
 
 On Windows, ssh-mcp detects the OpenSSH Authentication Agent service automatically (via the `\\.\pipe\openssh-ssh-agent` named pipe). No `SSH_AUTH_SOCK` needed — just make sure the OpenSSH agent service is running.

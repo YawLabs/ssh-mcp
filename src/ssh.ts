@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Client, type ConnectConfig, type SFTPWrapper } from "ssh2";
-import { checkKnownHosts, checkSshAgent, checkSshConfig, checkSshKeys, runArgs } from "./diagnose.js";
+import { checkKnownHosts, checkSshAgent, checkSshConfig, checkSshKeys, isValidHostname, runArgs } from "./diagnose.js";
 
 export interface SSHConfig {
   host: string;
@@ -65,16 +65,65 @@ function resolveFromSshConfig(host: string): SshConfigResult | null {
   }
 }
 
+// Looks up entries via `ssh-keygen -F` so hashed known_hosts lines (|1|...) resolve
+// transparently without us reimplementing HMAC.
+export function readKnownHostsKeys(host: string, port?: number): Buffer[] {
+  if (!isValidHostname(host)) return [];
+  const targets = port && port !== 22 ? [`[${host}]:${port}`, host] : [host];
+  const keys: Buffer[] = [];
+  for (const target of targets) {
+    const { stdout, ok } = runArgs("ssh-keygen", ["-F", target]);
+    if (!ok || !stdout.trim()) continue;
+    for (const line of stdout.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      // Format: <host-or-hash> <keytype> <base64> [comment]
+      const parts = trimmed.split(/\s+/);
+      if (parts.length < 3) continue;
+      try {
+        keys.push(Buffer.from(parts[2], "base64"));
+      } catch {
+        // Skip malformed entry
+      }
+    }
+  }
+  return keys;
+}
+
+// Build a hostVerifier that compares the server's key against ~/.ssh/known_hosts.
+// - Known host, key matches: accept.
+// - Known host, key mismatch: reject (MITM protection).
+// - Unknown host: accept (TOFU) unless SSH_MCP_STRICT_HOST_KEY=1, then reject.
+//
+// Checks known_hosts under both the user-supplied host (e.g. a ssh_config alias) and
+// the resolved hostname, matching OpenSSH's CheckHostIP behavior.
+function buildHostVerifier(hosts: ReadonlyArray<string>, port: number | undefined): (key: Buffer) => boolean {
+  const strict = process.env.SSH_MCP_STRICT_HOST_KEY === "1";
+  return (key: Buffer) => {
+    const known = hosts.flatMap((h) => readKnownHostsKeys(h, port));
+    if (known.length === 0) {
+      return !strict;
+    }
+    return known.some((k) => k.equals(key));
+  };
+}
+
 export function resolveConfig(config: SSHConfig): ResolvedConfig {
   // Resolve SSH config for the host (hostname aliases, user, port, identity files, proxy)
   const sshConfig = resolveFromSshConfig(config.host);
 
+  const port = config.port || (sshConfig ? Number.parseInt(sshConfig.port, 10) : 22);
+  const verifierHosts = [config.host];
+  if (sshConfig?.hostname && sshConfig.hostname !== config.host) {
+    verifierHosts.push(sshConfig.hostname);
+  }
   const connectConfig: ConnectConfig = {
     host: sshConfig?.hostname || config.host,
-    port: config.port || (sshConfig ? Number.parseInt(sshConfig.port, 10) : 22),
+    port,
     username: config.username || sshConfig?.user || process.env.USER || process.env.USERNAME || "root",
     keepaliveInterval: 15_000,
     keepaliveCountMax: 3,
+    hostVerifier: buildHostVerifier(verifierHosts, port),
   };
 
   // Always set agent if available (including Windows named pipe)
@@ -154,6 +203,8 @@ export function formatDiagnostics(host: string): string {
   }
 }
 
+// Connects with the exact ConnectConfig as given — no hostVerifier is applied unless the
+// caller supplied one. Use connect() for known_hosts-verified connections.
 export function connectRaw(connectConfig: ConnectConfig): Promise<Client> {
   return new Promise((resolve, reject) => {
     const client = new Client();
@@ -219,6 +270,10 @@ export async function connect(config: SSHConfig): Promise<Client> {
   }
 }
 
+// ssh2's client.exec() runs the command through the remote user's login shell, so shell
+// metacharacters (|, &&, >, globs, etc.) are interpreted. This is intentional — callers
+// pass shell command strings. Higher-level helpers in ops.ts use shellQuote() when
+// interpolating user-supplied values into command templates.
 export function exec(client: Client, command: string, timeoutMs = 30000): Promise<ExecResult> {
   return new Promise((resolve, reject) => {
     let settled = false;

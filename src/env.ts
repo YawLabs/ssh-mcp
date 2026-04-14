@@ -356,6 +356,9 @@ export function testConnection(host: string, port = 22): { status: "ok" | "warni
   }
 
   const start = Date.now();
+  // StrictHostKeyChecking=no is safe here: this is a read-only probe that only echoes
+  // "SSH_OK". For actual operations, hostVerifier in resolveConfig (src/ssh.ts)
+  // enforces known_hosts matching.
   const { ok, stdout } = runArgs("ssh", [
     "-o",
     "ConnectTimeout=5",

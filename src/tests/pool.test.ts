@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConnectionPool } from "../pool.js";
-import { resolveConfig } from "../ssh.js";
+import { readKnownHostsKeys, resolveConfig } from "../ssh.js";
 
 describe("ConnectionPool", () => {
   it("creates a pool with default options", () => {
@@ -97,5 +97,58 @@ describe("resolveConfig", () => {
     const resolved = resolveConfig({ host: "example.com" });
     // Most hosts won't have a ProxyJump configured
     expect(resolved.proxyJump === undefined || typeof resolved.proxyJump === "string").toBe(true);
+  });
+
+  it("sets a hostVerifier on connectConfig", () => {
+    const resolved = resolveConfig({ host: "example.com" });
+    expect(typeof resolved.connectConfig.hostVerifier).toBe("function");
+  });
+});
+
+describe("hostVerifier (via resolveConfig)", () => {
+  const UNKNOWN = "ssh-mcp-nonexistent-host-xyz.invalid";
+
+  beforeEach(() => {
+    vi.stubEnv("SSH_MCP_STRICT_HOST_KEY", "");
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("accepts unknown hosts by default (TOFU)", () => {
+    const resolved = resolveConfig({ host: UNKNOWN });
+    const verify = resolved.connectConfig.hostVerifier as (key: Buffer) => boolean;
+    expect(verify(Buffer.from("fake-key-bytes"))).toBe(true);
+  });
+
+  it("rejects unknown hosts when SSH_MCP_STRICT_HOST_KEY=1", () => {
+    vi.stubEnv("SSH_MCP_STRICT_HOST_KEY", "1");
+    const resolved = resolveConfig({ host: UNKNOWN });
+    const verify = resolved.connectConfig.hostVerifier as (key: Buffer) => boolean;
+    expect(verify(Buffer.from("fake-key-bytes"))).toBe(false);
+  });
+
+  it("strict mode is captured at resolveConfig time, not verify time", () => {
+    // Verifier built with strict=false should keep accepting even if env flips later.
+    const resolved = resolveConfig({ host: UNKNOWN });
+    vi.stubEnv("SSH_MCP_STRICT_HOST_KEY", "1");
+    const verify = resolved.connectConfig.hostVerifier as (key: Buffer) => boolean;
+    expect(verify(Buffer.from("x"))).toBe(true);
+  });
+});
+
+describe("readKnownHostsKeys", () => {
+  it("returns [] for an invalid hostname", () => {
+    expect(readKnownHostsKeys("host; rm -rf /")).toEqual([]);
+  });
+
+  it("returns [] for a host not in known_hosts", () => {
+    expect(readKnownHostsKeys("ssh-mcp-nonexistent-host-xyz.invalid")).toEqual([]);
+  });
+
+  it("returns Buffer[] when ssh-keygen is available (may be empty)", () => {
+    const result = readKnownHostsKeys("example.com");
+    expect(Array.isArray(result)).toBe(true);
+    for (const buf of result) expect(Buffer.isBuffer(buf)).toBe(true);
   });
 });

@@ -31,10 +31,12 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_exec",
-    "Execute a command on a remote host via SSH. Returns stdout, stderr, and exit code.",
+    "Execute a command on a remote host via SSH. The command is interpreted by the remote login shell — pipes, redirects, globs, and other shell metacharacters work as expected. Returns stdout, stderr, and exit code.",
     {
       ...connectionParams,
-      command: z.string().describe("Shell command to execute on the remote host"),
+      command: z
+        .string()
+        .describe("Shell command to execute on the remote host (interpreted by the remote login shell)"),
       timeout: TimeoutSchema,
     },
     async ({ host, port, username, privateKeyPath, password, command, timeout }) => {
