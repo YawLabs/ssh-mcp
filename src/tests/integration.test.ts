@@ -1,4 +1,5 @@
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { find, multiExec, tail } from "../ops.js";
 import { ConnectionPool } from "../pool.js";
@@ -8,6 +9,8 @@ const INTEGRATION = process.env.SSH_MCP_INTEGRATION === "1";
 const TEST_HOST = "127.0.0.1";
 const TEST_PORT = 2222;
 const TEST_USER = "root";
+// ESM-safe __dirname replacement — `__dirname` is not defined in ESM modules.
+const __dirname = dirname(fileURLToPath(import.meta.url));
 const TEST_KEY = join(__dirname, "../../test/docker/test_key");
 
 const connConfig = {
@@ -163,6 +166,10 @@ describe.skipIf(!INTEGRATION)("integration: pool under concurrency", () => {
       expect(pool.size).toBe(1);
       expect(pool.stats.active).toBe(0);
       expect(pool.stats.idle).toBe(1);
+      // Critically, exactly ONE actual connect happened — no leaked orphans
+      // from racing acquires. pool.size only counts entries in the map, so
+      // this assertion is what guards against the concurrency bug.
+      expect(pool.connectCount).toBe(1);
     } finally {
       pool.drain();
     }

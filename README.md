@@ -126,7 +126,13 @@ All remote operations accept connection parameters:
 | `privateKeyPath` | Path to SSH private key | Auto-detect |
 | `password` | SSH password (prefer keys) | — |
 
-**Auth resolution order:** explicit key > explicit password > ssh-agent (`SSH_AUTH_SOCK`) > SSH config identity files > default key paths (`~/.ssh/id_ed25519`, `id_rsa`, `id_ecdsa`).
+**Auth resolution order:** ssh-mcp picks the first match from this list and does not fall through to later entries — this makes the auth method deterministic and predictable.
+
+1. Explicit `privateKeyPath`
+2. Explicit `password`
+3. ssh-agent (`SSH_AUTH_SOCK` on Unix, `\\.\pipe\openssh-ssh-agent` on Windows)
+4. Identity files from `~/.ssh/config` for the host
+5. Default key paths (`~/.ssh/id_ed25519`, `id_rsa`, `id_ecdsa`)
 
 ## Example workflows
 

@@ -2,7 +2,15 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Client, type ConnectConfig, type SFTPWrapper } from "ssh2";
-import { checkKnownHosts, checkSshAgent, checkSshConfig, checkSshKeys, isValidHostname, runArgs } from "./diagnose.js";
+import {
+  type DiagnosticResult,
+  checkKnownHosts,
+  checkSshAgent,
+  checkSshConfig,
+  checkSshKeys,
+  isValidHostname,
+  runArgs,
+} from "./diagnose.js";
 
 export interface SSHConfig {
   host: string;
@@ -126,37 +134,36 @@ export function resolveConfig(config: SSHConfig): ResolvedConfig {
     hostVerifier: buildHostVerifier(verifierHosts, port),
   };
 
-  // Always set agent if available (including Windows named pipe)
-  const agentSock =
-    config.agent ||
-    process.env.SSH_AUTH_SOCK ||
-    (process.platform === "win32" ? "\\\\.\\pipe\\openssh-ssh-agent" : undefined);
-  if (agentSock) {
-    connectConfig.agent = agentSock;
-  }
-
-  // Set password if provided
-  if (config.password) {
-    connectConfig.password = config.password;
-  }
-
-  // Try to load a private key: explicit > SSH config identity files > default paths
+  // Auth resolution, in order of precedence — the first match wins and others
+  // are not set. This matches what the README promises and gives users a
+  // predictable way to force a specific auth method.
+  //
+  //   explicit key > explicit password > agent > SSH config identity > default key paths
   if (config.privateKeyPath) {
     connectConfig.privateKey = readFileSync(config.privateKeyPath);
-  } else if (!agentSock) {
-    // Only try key files if no agent — agent is the preferred auth method
-    const home = homedir();
-    const keyPaths =
-      sshConfig && sshConfig.identityFiles.length > 0
-        ? sshConfig.identityFiles.map((p) => (p.startsWith("~") ? join(home, p.slice(1)) : p))
-        : [join(home, ".ssh", "id_ed25519"), join(home, ".ssh", "id_rsa"), join(home, ".ssh", "id_ecdsa")];
+  } else if (config.password) {
+    connectConfig.password = config.password;
+  } else {
+    const agentSock =
+      config.agent ||
+      process.env.SSH_AUTH_SOCK ||
+      (process.platform === "win32" ? "\\\\.\\pipe\\openssh-ssh-agent" : undefined);
+    if (agentSock) {
+      connectConfig.agent = agentSock;
+    } else {
+      const home = homedir();
+      const keyPaths =
+        sshConfig && sshConfig.identityFiles.length > 0
+          ? sshConfig.identityFiles.map((p) => (p.startsWith("~") ? join(home, p.slice(1)) : p))
+          : [join(home, ".ssh", "id_ed25519"), join(home, ".ssh", "id_rsa"), join(home, ".ssh", "id_ecdsa")];
 
-    for (const keyPath of keyPaths) {
-      try {
-        connectConfig.privateKey = readFileSync(keyPath);
-        break;
-      } catch {
-        // Key doesn't exist, try next
+      for (const keyPath of keyPaths) {
+        try {
+          connectConfig.privateKey = readFileSync(keyPath);
+          break;
+        } catch {
+          // Key doesn't exist, try next
+        }
       }
     }
   }
@@ -164,12 +171,41 @@ export function resolveConfig(config: SSHConfig): ResolvedConfig {
   return { connectConfig, proxyJump: sshConfig?.proxyJump };
 }
 
+// Short TTL cache for the non-host-specific diagnostic checks. Under a burst of
+// concurrent failures (say, 20 parallel tool calls when the agent is down) these
+// checks spawn processes repeatedly — `ssh-add -l`, filesystem scans — even though
+// the answer hasn't changed. Host-specific checks (`checkSshConfig`, `checkKnownHosts`)
+// still run every time because they can legitimately differ per host.
+const DIAG_CACHE_TTL_MS = 2000;
+let diagAgentCache: { at: number; result: DiagnosticResult } | null = null;
+let diagKeysCache: { at: number; result: DiagnosticResult } | null = null;
+
+function cachedAgentCheck(): DiagnosticResult {
+  const now = Date.now();
+  if (diagAgentCache && now - diagAgentCache.at < DIAG_CACHE_TTL_MS) {
+    return diagAgentCache.result;
+  }
+  const result = checkSshAgent();
+  diagAgentCache = { at: now, result };
+  return result;
+}
+
+function cachedKeysCheck(): DiagnosticResult {
+  const now = Date.now();
+  if (diagKeysCache && now - diagKeysCache.at < DIAG_CACHE_TTL_MS) {
+    return diagKeysCache.result;
+  }
+  const result = checkSshKeys();
+  diagKeysCache = { at: now, result };
+  return result;
+}
+
 export function formatDiagnostics(host: string): string {
   // Run fast local checks only — skip connectivity re-test to avoid adding seconds of delay
   try {
     const checks = [
-      { name: "SSH Agent", ...checkSshAgent() },
-      { name: "SSH Keys", ...checkSshKeys() },
+      { name: "SSH Agent", ...cachedAgentCheck() },
+      { name: "SSH Keys", ...cachedKeysCheck() },
       { name: "SSH Config", ...checkSshConfig(host) },
       { name: "Known Hosts", ...checkKnownHosts(host) },
     ];
@@ -274,7 +310,18 @@ export async function connect(config: SSHConfig): Promise<Client> {
 // metacharacters (|, &&, >, globs, etc.) are interpreted. This is intentional — callers
 // pass shell command strings. Higher-level helpers in ops.ts use shellQuote() when
 // interpolating user-supplied values into command templates.
-export function exec(client: Client, command: string, timeoutMs = 30000): Promise<ExecResult> {
+//
+// stdout and stderr are each capped at maxBytes to prevent a chatty or misbehaving
+// remote command from exhausting process memory. When the cap is hit, further data is
+// dropped and a truncation marker is appended to the captured output.
+export const DEFAULT_MAX_EXEC_BYTES = 10 * 1024 * 1024; // 10 MB per stream
+
+export function exec(
+  client: Client,
+  command: string,
+  timeoutMs = 30000,
+  maxBytes: number = DEFAULT_MAX_EXEC_BYTES,
+): Promise<ExecResult> {
   return new Promise((resolve, reject) => {
     let settled = false;
 
@@ -295,27 +342,58 @@ export function exec(client: Client, command: string, timeoutMs = 30000): Promis
         return;
       }
 
-      let stdout = "";
-      let stderr = "";
+      const stdoutChunks: Buffer[] = [];
+      const stderrChunks: Buffer[] = [];
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+      let stdoutTruncated = false;
+      let stderrTruncated = false;
+
+      const appendStdout = (data: Buffer) => {
+        if (stdoutTruncated) return;
+        const remaining = maxBytes - stdoutBytes;
+        if (data.length <= remaining) {
+          stdoutChunks.push(data);
+          stdoutBytes += data.length;
+        } else {
+          if (remaining > 0) {
+            stdoutChunks.push(data.subarray(0, remaining));
+            stdoutBytes += remaining;
+          }
+          stdoutTruncated = true;
+        }
+      };
+      const appendStderr = (data: Buffer) => {
+        if (stderrTruncated) return;
+        const remaining = maxBytes - stderrBytes;
+        if (data.length <= remaining) {
+          stderrChunks.push(data);
+          stderrBytes += data.length;
+        } else {
+          if (remaining > 0) {
+            stderrChunks.push(data.subarray(0, remaining));
+            stderrBytes += remaining;
+          }
+          stderrTruncated = true;
+        }
+      };
 
       stream
         .on("close", (code: number) => {
+          let stdout = Buffer.concat(stdoutChunks).toString("utf8");
+          let stderr = Buffer.concat(stderrChunks).toString("utf8");
+          if (stdoutTruncated) stdout += `\n[output truncated at ${maxBytes} bytes]`;
+          if (stderrTruncated) stderr += `\n[stderr truncated at ${maxBytes} bytes]`;
           settle(() => resolve({ stdout, stderr, code: code ?? 0 }));
         })
-        .on("data", (data: Buffer) => {
-          stdout += data.toString();
-        })
+        .on("data", appendStdout)
         .on("error", (err: Error) => {
           settle(() => reject(err));
         });
 
-      stream.stderr
-        .on("data", (data: Buffer) => {
-          stderr += data.toString();
-        })
-        .on("error", (err: Error) => {
-          settle(() => reject(err));
-        });
+      stream.stderr.on("data", appendStderr).on("error", (err: Error) => {
+        settle(() => reject(err));
+      });
     });
   });
 }

@@ -88,8 +88,16 @@ export async function find(client: Client, options: FindOptions, timeoutMs = 300
   if (options.maxsize) args.push("-size", `-${options.maxsize}`);
   if (options.newer) args.push("-newer", shellQuote(options.newer));
 
-  const command = `find ${args.join(" ")} 2>/dev/null`;
+  const command = `find ${args.join(" ")}`;
   const result = await exec(client, command, timeoutMs);
+
+  // If find produced no usable output and only errors, surface the error so the
+  // caller can tell "empty directory" from "path doesn't exist" or "permission
+  // denied". Partial errors (some subtrees denied, others readable) still return
+  // the readable results — stderr is dropped in that case.
+  if (!result.stdout.trim() && result.stderr.trim()) {
+    throw new Error(result.stderr.trim());
+  }
 
   return result.stdout.split("\n").filter(Boolean);
 }
@@ -109,7 +117,10 @@ export async function tail(
   }
 
   const result = await exec(client, command, timeoutMs);
-  if (result.code !== 0 && result.stderr && !grep) {
+  // Surface real errors from tail (file missing, permission denied, etc.).
+  // grep returning no matches exits with code 1 but writes nothing to stderr —
+  // that's not an error and we pass through the empty output.
+  if (result.stderr.trim()) {
     throw new Error(result.stderr.trim());
   }
   return result.stdout;

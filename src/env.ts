@@ -21,45 +21,40 @@ export interface AgentResult {
   message: string;
 }
 
+// Runs `ssh-add -l` and shapes the result into an AgentResult if the agent was
+// reachable. Returns null if ssh-add couldn't talk to any agent on this channel
+// (so the caller can try the next fallback). `socket` is used verbatim in the
+// result — the Windows named pipe and a Unix $SSH_AUTH_SOCK path both flow
+// through here identically.
+function probeAgent(socket: string, agentLabel: string): AgentResult | null {
+  const { stdout, ok } = runArgs("ssh-add", ["-l"]);
+  const noIdentities = stdout.includes("no identities") || stdout.includes("The agent has no identities");
+  if (!ok && !noIdentities) return null;
+  const keys = ok && !noIdentities ? stdout.split("\n").filter(Boolean) : [];
+  return {
+    running: true,
+    reachable: true,
+    socket,
+    keys,
+    started: false,
+    message:
+      keys.length > 0
+        ? `${agentLabel} running with ${keys.length} key(s) loaded`
+        : `${agentLabel} running but no keys loaded. Use ssh_key_load to add one.`,
+  };
+}
+
 export function ensureAgent(): AgentResult {
   const sock = process.env.SSH_AUTH_SOCK;
   if (sock) {
-    const { stdout, ok } = runArgs("ssh-add", ["-l"]);
-    const noIdentities = stdout.includes("no identities") || stdout.includes("The agent has no identities");
-    if (ok || noIdentities) {
-      const keys = ok && !noIdentities ? stdout.split("\n").filter(Boolean) : [];
-      return {
-        running: true,
-        reachable: true,
-        socket: sock,
-        keys,
-        started: false,
-        message:
-          keys.length > 0
-            ? `ssh-agent running with ${keys.length} key(s) loaded`
-            : "ssh-agent running but no keys loaded. Use ssh_key_load to add one.",
-      };
-    }
+    const result = probeAgent(sock, "ssh-agent");
+    if (result) return result;
   }
 
   // On Windows, try the OpenSSH agent service (uses named pipe, not SSH_AUTH_SOCK)
   if (!sock && process.platform === "win32") {
-    const { stdout, ok } = runArgs("ssh-add", ["-l"]);
-    const noIdentities = stdout.includes("no identities") || stdout.includes("The agent has no identities");
-    if (ok || noIdentities) {
-      const keys = ok && !noIdentities ? stdout.split("\n").filter(Boolean) : [];
-      return {
-        running: true,
-        reachable: true,
-        socket: "\\\\.\\pipe\\openssh-ssh-agent",
-        keys,
-        started: false,
-        message:
-          keys.length > 0
-            ? `Windows OpenSSH agent running with ${keys.length} key(s) loaded`
-            : "Windows OpenSSH agent running but no keys loaded. Use ssh_key_load to add one.",
-      };
-    }
+    const result = probeAgent("\\\\.\\pipe\\openssh-ssh-agent", "Windows OpenSSH agent");
+    if (result) return result;
   }
 
   // Try to start a new agent (Unix)
@@ -77,7 +72,11 @@ export function ensureAgent(): AgentResult {
         keys: [],
         started: true,
         env: { SSH_AUTH_SOCK: sockMatch[1], SSH_AGENT_PID: pidMatch?.[1] },
-        message: "Started new ssh-agent. No keys loaded yet — use ssh_key_load to add one.",
+        message:
+          "Started new ssh-agent scoped to the ssh-mcp server process. " +
+          "Your shell's environment is NOT modified — this agent is only visible " +
+          "to this MCP server and will terminate when the server exits. " +
+          "No keys loaded yet — use ssh_key_load to add one.",
       };
     }
   }
@@ -256,8 +255,8 @@ export function configLookup(host: string): ConfigLookupResult | { error: string
     user: all.user || "",
     port: all.port || "22",
     identityFile: identityFiles,
-    proxyJump: all.proxyjump !== "none" ? all.proxyjump : undefined,
-    proxyCommand: all.proxycommand !== "none" ? all.proxycommand : undefined,
+    proxyJump: all.proxyjump && all.proxyjump !== "none" ? all.proxyjump : undefined,
+    proxyCommand: all.proxycommand && all.proxycommand !== "none" ? all.proxycommand : undefined,
     all,
     raw: stdout,
   };
@@ -322,7 +321,7 @@ export function checkGitSsh(
     text.includes("Welcome to GitLab") ||
     text.includes("logged in as")
   ) {
-    const userMatch = text.match(/Hi (\S+?)!/) || text.match(/@(\S+?)!/) || text.match(/logged in as (\S+)/);
+    const userMatch = text.match(/Hi (\S+)!/) || text.match(/@(\S+)!/) || text.match(/logged in as (\S+)/);
     return {
       status: "ok",
       message: `Git SSH authentication to ${host} succeeded${userMatch ? ` as ${userMatch[1]}` : ""}`,
