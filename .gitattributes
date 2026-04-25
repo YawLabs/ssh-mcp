@@ -1,0 +1,8 @@
+# Enforce LF line endings for all text files. Without this, Windows clones
+# with autocrlf=true rewrite source files to CRLF on checkout, which biome v2
+# rejects (it checks formatter rules against the working tree, not the index).
+* text=auto eol=lf
+
+# Native Windows scripts must keep CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
