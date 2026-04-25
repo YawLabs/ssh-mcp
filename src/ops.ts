@@ -79,7 +79,10 @@ export async function find(client: Client, options: FindOptions, timeoutMs = 300
     );
   }
 
-  const args: string[] = [shellQuote(options.path)];
+  // `--` separates the path from any options that follow, so a path that starts with `-`
+  // isn't reparsed as a find option. shellQuote alone only blocks shell-level injection;
+  // find's own argument parser still treats a leading `-` on a bare path as a flag.
+  const args: string[] = ["--", shellQuote(options.path)];
 
   if (options.maxdepth !== undefined) args.push("-maxdepth", String(options.maxdepth));
   if (options.type) args.push("-type", options.type);
@@ -111,9 +114,11 @@ export async function tail(
   grep?: string,
   timeoutMs = 30000,
 ): Promise<string> {
-  let command = `tail -n ${lines} ${shellQuote(path)}`;
+  // `--` so a path starting with `-` isn't parsed as a tail flag.
+  let command = `tail -n ${lines} -- ${shellQuote(path)}`;
   if (grep) {
-    command += ` | grep -i ${shellQuote(grep)}`;
+    // `-e PATTERN` so a grep pattern starting with `-` isn't parsed as a flag.
+    command += ` | grep -i -e ${shellQuote(grep)}`;
   }
 
   const result = await exec(client, command, timeoutMs);
@@ -139,7 +144,8 @@ export interface ServiceStatus {
 }
 
 export async function serviceStatus(client: Client, serviceName: string, timeoutMs = 30000): Promise<ServiceStatus> {
-  const result = await exec(client, `systemctl status ${shellQuote(serviceName)} 2>&1`, timeoutMs);
+  // `--` so a service name starting with `-` isn't parsed as a systemctl flag.
+  const result = await exec(client, `systemctl status -- ${shellQuote(serviceName)} 2>&1`, timeoutMs);
   const raw = result.stdout;
 
   const activeMatch = raw.match(/Active:\s+(\S+)\s+\(([^)]+)\)/);
@@ -147,10 +153,15 @@ export async function serviceStatus(client: Client, serviceName: string, timeout
   const pidMatch = raw.match(/Main PID:\s+(\d+)/);
   const sinceMatch = raw.match(/since\s+(.+?);/);
 
+  // No `Active:` line on a non-zero exit usually means the unit doesn't exist or is
+  // inactive. "unknown" was misleading -- callers couldn't distinguish "down" from
+  // "we couldn't tell." Prefer "inactive" since that's what the exit code maps to.
+  const fallbackStatus = result.code === 0 ? "active" : "inactive";
+
   return {
     name: serviceName,
     active: activeMatch?.[1] === "active",
-    status: activeMatch ? `${activeMatch[1]} (${activeMatch[2]})` : result.code === 0 ? "active" : "unknown",
+    status: activeMatch ? `${activeMatch[1]} (${activeMatch[2]})` : fallbackStatus,
     description: descMatch?.[1]?.trim(),
     since: sinceMatch?.[1]?.trim(),
     pid: pidMatch ? Number.parseInt(pidMatch[1], 10) : undefined,

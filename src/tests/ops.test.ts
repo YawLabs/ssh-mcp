@@ -2,6 +2,28 @@ import { EventEmitter } from "node:events";
 import { describe, expect, it } from "vitest";
 import { find, tail } from "../ops.js";
 
+// Capture the command string passed to client.exec so tests can assert on it.
+function capturingClient(opts: { stdout?: string; stderr?: string; code?: number }): {
+  client: any;
+  lastCommand: () => string | undefined;
+} {
+  let last: string | undefined;
+  const client = {
+    exec: (command: string, cb: (err: Error | null, stream: any) => void) => {
+      last = command;
+      const stream: any = new EventEmitter();
+      stream.stderr = new EventEmitter();
+      cb(null, stream);
+      queueMicrotask(() => {
+        if (opts.stdout) stream.emit("data", Buffer.from(opts.stdout));
+        if (opts.stderr) stream.stderr.emit("data", Buffer.from(opts.stderr));
+        stream.emit("close", opts.code ?? 0);
+      });
+    },
+  };
+  return { client, lastCommand: () => last };
+}
+
 // Build a fake ssh2 Client whose exec() emits a configurable stdout/stderr/exit.
 // This lets us test ops.ts error-surfacing without a real SSH connection.
 function fakeClient(opts: { stdout?: string; stderr?: string; code?: number }): any {
@@ -101,5 +123,28 @@ describe("tail error surfacing", () => {
     const client = fakeClient({ stdout: "line1\nline2\n", code: 0 });
     const out = await tail(client, "/var/log/app.log");
     expect(out).toContain("line1");
+  });
+});
+
+describe("argument flag-injection hardening", () => {
+  it("find separates path with `--` so leading-dash paths aren't parsed as flags", async () => {
+    const cap = capturingClient({ stdout: "", code: 0 });
+    await find(cap.client, { path: "-rf" });
+    const cmd = cap.lastCommand();
+    expect(cmd).toMatch(/^find -- '-rf'/);
+  });
+
+  it("tail separates path with `--`", async () => {
+    const cap = capturingClient({ stdout: "", code: 0 });
+    await tail(cap.client, "-foo.log", 50);
+    const cmd = cap.lastCommand();
+    expect(cmd).toContain("tail -n 50 -- '-foo.log'");
+  });
+
+  it("tail with grep uses `-e` so leading-dash patterns aren't parsed as flags", async () => {
+    const cap = capturingClient({ stdout: "", code: 1 });
+    await tail(cap.client, "/var/log/app.log", 100, "-v");
+    const cmd = cap.lastCommand();
+    expect(cmd).toContain("grep -i -e '-v'");
   });
 });
