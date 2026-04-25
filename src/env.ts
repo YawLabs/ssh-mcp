@@ -44,6 +44,20 @@ function probeAgent(socket: string, agentLabel: string): AgentResult | null {
   };
 }
 
+// PID of an ssh-agent we spawned ourselves, so shutdown can reap it. Without this
+// every ssh-mcp run that spawned its own agent would leave a daemon behind.
+let startedAgentPid: number | null = null;
+
+export function killStartedAgent(): void {
+  if (startedAgentPid === null) return;
+  try {
+    process.kill(startedAgentPid);
+  } catch {
+    // Already gone
+  }
+  startedAgentPid = null;
+}
+
 export function ensureAgent(): AgentResult {
   const sock = process.env.SSH_AUTH_SOCK;
   if (sock) {
@@ -64,7 +78,10 @@ export function ensureAgent(): AgentResult {
     const pidMatch = stdout.match(/SSH_AGENT_PID=([^;]+)/);
     if (sockMatch) {
       process.env.SSH_AUTH_SOCK = sockMatch[1];
-      if (pidMatch) process.env.SSH_AGENT_PID = pidMatch[1];
+      if (pidMatch) {
+        process.env.SSH_AGENT_PID = pidMatch[1];
+        startedAgentPid = Number.parseInt(pidMatch[1], 10);
+      }
       return {
         running: true,
         reachable: true,

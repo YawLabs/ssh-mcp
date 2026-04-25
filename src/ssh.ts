@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { Client, type ConnectConfig, type SFTPWrapper } from "ssh2";
+import { Client, type ClientChannel, type ConnectConfig, type SFTPWrapper } from "ssh2";
 import {
   checkKnownHosts,
   checkSshAgent,
@@ -324,6 +324,9 @@ export function exec(
 ): Promise<ExecResult> {
   return new Promise((resolve, reject) => {
     let settled = false;
+    // Tracked so the timeout handler can tear down the remote channel — without
+    // this, a timed-out command keeps running on the server and leaks a channel.
+    let activeStream: ClientChannel | null = null;
 
     const settle = (fn: () => void) => {
       if (settled) return;
@@ -333,6 +336,21 @@ export function exec(
     };
 
     const timer = setTimeout(() => {
+      if (activeStream) {
+        // signal() asks sshd to forward SIGTERM (often disabled server-side);
+        // close() tears the channel down regardless. Try both, ignore failures —
+        // the only goal is "stop the remote work, don't leak the channel".
+        try {
+          activeStream.signal("TERM");
+        } catch {
+          /* ignore */
+        }
+        try {
+          activeStream.close();
+        } catch {
+          /* ignore */
+        }
+      }
       settle(() => reject(new Error(`Command timed out after ${timeoutMs}ms`)));
     }, timeoutMs);
 
@@ -341,6 +359,7 @@ export function exec(
         settle(() => reject(err));
         return;
       }
+      activeStream = stream;
 
       const stdoutChunks: Buffer[] = [];
       const stderrChunks: Buffer[] = [];

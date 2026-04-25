@@ -1,4 +1,5 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { killStartedAgent } from "./env.js";
 import { ConnectionPool } from "./pool.js";
 import { createServer } from "./server.js";
 
@@ -9,6 +10,7 @@ async function main() {
 
   const shutdown = () => {
     pool.drain();
+    killStartedAgent();
     process.exit(0);
   };
   process.on("SIGINT", shutdown);
