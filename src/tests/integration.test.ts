@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { find, multiExec, tail } from "../ops.js";
 import { ConnectionPool } from "../pool.js";
-import { type ResolvedConfig, connect, connectWithProxy, exec, listDir, readFile, writeFile } from "../ssh.js";
+import { connect, connectWithProxy, exec, listDir, type ResolvedConfig, readFile, writeFile } from "../ssh.js";
 
 const INTEGRATION = process.env.SSH_MCP_INTEGRATION === "1";
 const TEST_HOST = "127.0.0.1";

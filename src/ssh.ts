@@ -3,11 +3,11 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { Client, type ConnectConfig, type SFTPWrapper } from "ssh2";
 import {
-  type DiagnosticResult,
   checkKnownHosts,
   checkSshAgent,
   checkSshConfig,
   checkSshKeys,
+  type DiagnosticResult,
   isValidHostname,
   runArgs,
 } from "./diagnose.js";
