@@ -88,4 +88,28 @@ describe("exec output cap", () => {
     const client = fakeClient({ execError: new Error("exec failed") });
     await expect(exec(client, "cmd")).rejects.toThrow("exec failed");
   });
+
+  it("tears down the remote channel on timeout", async () => {
+    let signalCalledWith: string | undefined;
+    let closeCalled = false;
+    const stream: any = new EventEmitter();
+    stream.stderr = new EventEmitter();
+    stream.signal = (sig: string) => {
+      signalCalledWith = sig;
+    };
+    stream.close = () => {
+      closeCalled = true;
+    };
+
+    const client = {
+      exec: (_command: string, cb: (err: Error | null, stream: any) => void) => {
+        cb(null, stream);
+        // Never emit close — the command is "still running" on the remote side.
+      },
+    } as any;
+
+    await expect(exec(client, "sleep 60", 50)).rejects.toThrow(/timed out/);
+    expect(signalCalledWith).toBe("TERM");
+    expect(closeCalled).toBe(true);
+  });
 });
