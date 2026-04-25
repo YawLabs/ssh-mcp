@@ -13,42 +13,42 @@ export function createServer(pool?: ConnectionPool): McpServer {
   return server;
 }
 
-export { registerTools } from "./tools.js";
+export type { DiagnosticReport, DiagnosticResult } from "./diagnose.js";
 export {
-  diagnose,
-  checkSshAgent,
-  checkSshKeys,
-  checkKnownHosts,
   checkConnectivity,
+  checkKnownHosts,
+  checkSshAgent,
   checkSshConfig,
+  checkSshKeys,
+  diagnose,
 } from "./diagnose.js";
-export type { DiagnosticResult, DiagnosticReport } from "./diagnose.js";
+export type { AgentResult, ConfigLookupResult, KeyInfo } from "./env.js";
+export {
+  checkGitSsh,
+  configLookup,
+  ensureAgent,
+  fixKnownHosts,
+  listSshKeys,
+  loadKey,
+  testConnection,
+} from "./env.js";
+export type { FindOptions, MultiExecHost, MultiExecResult, ServiceStatus } from "./ops.js";
+export { find, multiExec, serviceStatus, tail } from "./ops.js";
+export type { PoolOptions } from "./pool.js";
+export { ConnectionPool } from "./pool.js";
+export type { ExecResult, ResolvedConfig, SSHConfig } from "./ssh.js";
 export {
   connect,
   connectRaw,
   connectWithProxy,
-  resolveConfig,
-  readKnownHostsKeys,
-  formatDiagnostics,
-  exec,
-  readFile,
-  writeFile,
-  uploadFile,
   downloadFile,
+  exec,
+  formatDiagnostics,
   listDir,
+  readFile,
+  readKnownHostsKeys,
+  resolveConfig,
+  uploadFile,
+  writeFile,
 } from "./ssh.js";
-export type { SSHConfig, ExecResult, ResolvedConfig } from "./ssh.js";
-export { ConnectionPool } from "./pool.js";
-export type { PoolOptions } from "./pool.js";
-export { multiExec, find, tail, serviceStatus } from "./ops.js";
-export type { MultiExecResult, MultiExecHost, FindOptions, ServiceStatus } from "./ops.js";
-export {
-  ensureAgent,
-  listSshKeys,
-  loadKey,
-  configLookup,
-  fixKnownHosts,
-  checkGitSsh,
-  testConnection,
-} from "./env.js";
-export type { KeyInfo, AgentResult, ConfigLookupResult } from "./env.js";
+export { registerTools } from "./tools.js";

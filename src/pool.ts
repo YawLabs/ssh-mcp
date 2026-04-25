@@ -1,5 +1,5 @@
 import type { Client } from "ssh2";
-import { type SSHConfig, connectWithProxy, formatDiagnostics, resolveConfig } from "./ssh.js";
+import { connectWithProxy, formatDiagnostics, resolveConfig, type SSHConfig } from "./ssh.js";
 
 interface PoolEntry {
   client: Client;

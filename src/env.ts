@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { appendFileSync, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isValidHostname, runArgs } from "./diagnose.js";

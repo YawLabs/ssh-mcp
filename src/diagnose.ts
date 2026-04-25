@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -22,7 +22,7 @@ export function isValidHostname(host: string): boolean {
     return /^\[[0-9a-fA-F:]+\]$/.test(host);
   }
   // Standard hostname, IPv4, or SSH config alias (alphanumeric, dots, hyphens, underscores)
-  return /^[a-zA-Z0-9._\-]+$/.test(host);
+  return /^[a-zA-Z0-9._-]+$/.test(host);
 }
 
 export function runArgs(cmd: string, args: string[]): { stdout: string; ok: boolean } {

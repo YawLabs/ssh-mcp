@@ -5,12 +5,7 @@ import { exec } from "../ssh.js";
 // Build a fake ssh2 Client whose exec() streams a configurable number of
 // stdout/stderr bytes, then closes. This lets us exercise the output cap
 // without needing a real SSH connection.
-function fakeClient(opts: {
-  stdoutChunks?: Buffer[];
-  stderrChunks?: Buffer[];
-  code?: number;
-  execError?: Error;
-}): any {
+function fakeClient(opts: { stdoutChunks?: Buffer[]; stderrChunks?: Buffer[]; code?: number; execError?: Error }): any {
   return {
     exec: (_command: string, cb: (err: Error | null, stream: any) => void) => {
       if (opts.execError) {
