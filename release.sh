@@ -3,15 +3,20 @@
 # Release Script -- Test, bump, tag, publish to npm, create GitHub release
 # =============================================================================
 # Usage:
-#   ./release.sh <new-version>    e.g. ./release.sh 0.9.0
+#   ./release.sh <new-version>    -- local mode, e.g. ./release.sh 0.9.1
+#   ./release.sh                  -- CI mode (version derived from git tag)
 #
-# Local-only: this repo does not run CI. Run from your workstation.
+# Local mode: runs from your workstation, bumps + commits + tags + pushes.
+# CI mode: invoked by .github/workflows/release.yml on tag push, skips the
+# bump/commit/tag/push steps (already done) and publishes with --provenance
+# using NODE_AUTH_TOKEN from GitHub Actions secrets.
 # If interrupted, just re-run with the same version -- each step is idempotent.
 #
-# Prerequisites:
+# Prerequisites (local):
 #   - gh CLI authenticated
 #   - npm authenticated (`npm login --auth-type=web` in your terminal first)
 #   - clean git working tree on main, up to date with origin/main
+# Prerequisites (CI): NODE_AUTH_TOKEN env, GITHUB_TOKEN env, CI=true.
 # =============================================================================
 
 set -euo pipefail
@@ -30,12 +35,19 @@ fail() { echo -e "${RED}  x $1${NC}"; exit 1; }
 
 TOTAL_STEPS=7
 
-if [ $# -lt 1 ]; then
-  echo "Usage: ./release.sh <version>"
-  echo "  e.g. ./release.sh 0.9.0"
-  exit 1
+IS_CI="${CI:-false}"
+VERSION="${1:-}"
+
+if [ -z "$VERSION" ]; then
+  if [ "$IS_CI" = "true" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
+    VERSION="${GITHUB_REF_NAME#v}"
+    info "CI mode -- version $VERSION from tag $GITHUB_REF_NAME"
+  else
+    echo "Usage: ./release.sh <version>"
+    echo "  e.g. ./release.sh 0.9.1"
+    exit 1
+  fi
 fi
-VERSION="$1"
 
 if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   fail "Invalid version format: $VERSION (expected X.Y.Z)"
@@ -43,13 +55,19 @@ fi
 
 echo -e "${CYAN}Pre-flight checks...${NC}"
 
-command -v gh >/dev/null   || fail "gh CLI not installed"
 command -v node >/dev/null || fail "node not installed"
 command -v npm >/dev/null  || fail "npm not installed"
+# gh is only required in local mode -- CI uses GITHUB_TOKEN with the gh action.
+if [ "$IS_CI" != "true" ]; then
+  command -v gh >/dev/null || fail "gh CLI not installed"
+fi
 
-CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-if [ "$CURRENT_BRANCH" != "main" ]; then
-  fail "Must be on main (currently on '$CURRENT_BRANCH')"
+# Branch check: in CI we are on a detached HEAD at the tag commit, which is fine.
+if [ "$IS_CI" != "true" ]; then
+  CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+  if [ "$CURRENT_BRANCH" != "main" ]; then
+    fail "Must be on main (currently on '$CURRENT_BRANCH')"
+  fi
 fi
 
 CURRENT_VERSION=$(node -p "require('./package.json').version")
@@ -60,7 +78,7 @@ else
   info "Current version: $CURRENT_VERSION -> $VERSION"
 fi
 
-if [ "$CURRENT_VERSION" != "$VERSION" ]; then
+if [ "$IS_CI" != "true" ] && [ "$CURRENT_VERSION" != "$VERSION" ]; then
   echo ""
   echo -e "${YELLOW}About to release v${VERSION}. This will:${NC}"
   echo "  1. Run lint, typecheck, build, tests"
@@ -99,47 +117,57 @@ fi
 # Step 3: Commit and tag
 step 3 "Commit and tag"
 
-if [ -n "$(git status --porcelain package.json package-lock.json 2>/dev/null)" ]; then
-  git add package.json package-lock.json
-  git commit -m "v${VERSION}"
-  info "Committed version bump"
+if [ "$IS_CI" = "true" ]; then
+  info "CI mode -- skipping commit/tag/push (already tagged)"
 else
-  info "Already committed -- skipping"
+  if [ -n "$(git status --porcelain package.json package-lock.json 2>/dev/null)" ]; then
+    git add package.json package-lock.json
+    git commit -m "v${VERSION}"
+    info "Committed version bump"
+  else
+    info "Already committed -- skipping"
+  fi
+
+  if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
+    info "Tag v${VERSION} already exists -- skipping"
+  else
+    git tag "v${VERSION}"
+    info "Tag v${VERSION} created"
+  fi
+
+  # Step 4: Push
+  step 4 "Push to origin"
+
+  git push origin main --tags
+  info "Pushed commit and tag"
 fi
 
-if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
-  info "Tag v${VERSION} already exists -- skipping"
-else
-  git tag "v${VERSION}"
-  info "Tag v${VERSION} created"
-fi
-
-# Step 4: Push
-step 4 "Push to origin"
-
-git push origin main --tags
-info "Pushed commit and tag"
-
-# Step 5: Publish to npm (with EOTP retry for fresh WebAuthn sessions)
+# Step 5: Publish to npm
+# Local: WebAuthn session in ~/.npmrc, retry 3x for EOTP propagation after fresh login.
+# CI:    NODE_AUTH_TOKEN automation token, no OTP, publish with --provenance for sigstore attestation.
 step 5 "Publish to npm"
 
 NPM_VERSION=$(npm view @yawlabs/ssh-mcp version 2>/dev/null || echo "")
 if [ "$NPM_VERSION" = "$VERSION" ]; then
   info "Already published to npm -- skipping"
 else
-  PUBLISHED=0
-  for attempt in 1 2 3; do
-    if npm publish --access public; then
-      PUBLISHED=1
-      break
+  if [ "$IS_CI" = "true" ]; then
+    npm publish --access public --provenance
+  else
+    PUBLISHED=0
+    for attempt in 1 2 3; do
+      if npm publish --access public; then
+        PUBLISHED=1
+        break
+      fi
+      if [ $attempt -lt 3 ]; then
+        warn "Publish attempt $attempt failed (often EOTP from a fresh npm login). Retrying in 30s..."
+        sleep 30
+      fi
+    done
+    if [ $PUBLISHED -ne 1 ]; then
+      fail "npm publish failed after 3 attempts"
     fi
-    if [ $attempt -lt 3 ]; then
-      warn "Publish attempt $attempt failed (often EOTP from a fresh npm login). Retrying in 30s..."
-      sleep 30
-    fi
-  done
-  if [ $PUBLISHED -ne 1 ]; then
-    fail "npm publish failed after 3 attempts"
   fi
   info "Published @yawlabs/ssh-mcp@${VERSION} to npm"
 fi
@@ -180,6 +208,18 @@ if [ "$GH_TAG" = "v${VERSION}" ]; then
   info "GitHub release: ${GH_TAG}"
 else
   warn "GitHub release: not found"
+fi
+
+# Provenance attestation -- npm attaches sigstore attestations when
+# `npm publish --provenance` runs inside GitHub Actions (the CI path).
+# Missing attestation in CI means something regressed; in local mode it is expected.
+if [ "$IS_CI" = "true" ]; then
+  ATTEST=$(npm view "@yawlabs/ssh-mcp@${VERSION}" dist.attestations.provenance.predicateType 2>/dev/null || echo "")
+  if [ -n "$ATTEST" ]; then
+    info "provenance attestation: $ATTEST"
+  else
+    warn "no provenance attestation found on v${VERSION} (expected in CI publish)"
+  fi
 fi
 
 echo ""
