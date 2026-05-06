@@ -24,5 +24,9 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
+      # `npm test` is `vitest run`, which executes from source -- it does
+      # NOT exercise tsup. The explicit build step exists to fail-fast on
+      # tsup config / output errors at PR time rather than discovering
+      # them at release time. Worth the ~5-10s.
       - run: npm run build
       - run: npm test

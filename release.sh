@@ -131,14 +131,20 @@ else
   if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
     info "Tag v${VERSION} already exists -- skipping"
   else
-    git tag "v${VERSION}"
+    # Annotated (-a) so `git push --follow-tags` below picks it up;
+    # lightweight tags are ignored by --follow-tags and would silently
+    # fail to publish (release commit lands but tag-push is a no-op).
+    git tag -a "v${VERSION}" -m "v${VERSION}"
     info "Tag v${VERSION} created"
   fi
 
   # Step 4: Push
   step 4 "Push to origin"
 
-  git push origin main --tags
+  # --follow-tags pushes only annotated tags reachable from the pushed
+  # commits, not every local tag. Avoids accidentally publishing dangling
+  # experimental tags that happen to be lying around.
+  git push origin main --follow-tags
   info "Pushed commit and tag"
 fi
 
@@ -147,7 +153,7 @@ fi
 # CI:    NODE_AUTH_TOKEN automation token, no OTP, publish with --provenance for sigstore attestation.
 step 5 "Publish to npm"
 
-NPM_VERSION=$(npm view @yawlabs/ssh-mcp version 2>/dev/null || echo "")
+NPM_VERSION=$(npm view "@yawlabs/ssh-mcp@${VERSION}" version 2>/dev/null || echo "")
 if [ "$NPM_VERSION" = "$VERSION" ]; then
   info "Already published to npm -- skipping"
 else
@@ -196,7 +202,7 @@ step 7 "Verify"
 
 sleep 3
 
-LIVE_VERSION=$(npm view @yawlabs/ssh-mcp version 2>/dev/null || echo "")
+LIVE_VERSION=$(npm view "@yawlabs/ssh-mcp@${VERSION}" version 2>/dev/null || echo "")
 if [ "$LIVE_VERSION" = "$VERSION" ]; then
   info "npm: @yawlabs/ssh-mcp@${LIVE_VERSION}"
 else
