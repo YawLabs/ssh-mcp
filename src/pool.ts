@@ -26,6 +26,10 @@ export class ConnectionPool {
   // Total number of successful connects ever made by this pool. Useful for
   // introspection and for tests that want to prove connection reuse.
   private _connectCount = 0;
+  // Once drained, the pool stays drained — new acquires reject and any in-flight
+  // factory closes the freshly-connected client instead of registering it.
+  // Consumers must construct a new pool to use again.
+  private drained = false;
 
   constructor(options?: PoolOptions) {
     this.idleTtlMs = options?.idleTtlMs ?? 60_000;
@@ -45,6 +49,10 @@ export class ConnectionPool {
     const MAX_ACQUIRE_ATTEMPTS = 3;
     let lastErr: unknown;
     for (let attempt = 0; attempt < MAX_ACQUIRE_ATTEMPTS; attempt++) {
+      // Drain wins over any in-flight or queued acquire — pool is one-way.
+      if (this.drained) {
+        throw new Error("ConnectionPool was drained");
+      }
       // Fast path: live entry — bump refcount and return.
       const existing = this.entries.get(key);
       if (existing && !existing.dead) {
@@ -86,6 +94,20 @@ export class ConnectionPool {
         pending = (async () => {
           try {
             const client = await connectWithProxy(resolved);
+            // If drain() ran while we were dialing, do not register this client
+            // into the just-cleared map — close it and propagate a rejection so
+            // the awaiting acquire() bails out instead of holding a phantom ref.
+            // Invariant: the block from `if (this.drained)` through `this.entries.set(key, entry)`
+            // MUST remain synchronous. Inserting an `await` between the drained check and the
+            // entries.set would re-open the drain race this guard closes.
+            if (this.drained) {
+              try {
+                client.end();
+              } catch {
+                // already closed
+              }
+              throw new Error("ConnectionPool was drained while connecting");
+            }
             this._connectCount++;
             const entry: PoolEntry = { client, key, refCount: 0, idleTimer: null, dead: false };
 
@@ -187,6 +209,9 @@ export class ConnectionPool {
   }
 
   drain(): void {
+    // Set drained first so any in-flight factory checks it AFTER its connect
+    // resolves and discards the client instead of registering into the cleared map.
+    this.drained = true;
     for (const entry of this.entries.values()) {
       if (entry.idleTimer) {
         clearTimeout(entry.idleTimer);
@@ -198,6 +223,7 @@ export class ConnectionPool {
       }
     }
     this.entries.clear();
+    this.pending.clear();
   }
 
   get size(): number {

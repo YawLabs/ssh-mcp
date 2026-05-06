@@ -1,7 +1,9 @@
+import { execFileSync } from "node:child_process";
 import { appendFileSync, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isValidHostname, runArgs } from "./diagnose.js";
+import { parseSshConfigOutput } from "./ssh-config.js";
 
 export interface KeyInfo {
   name: string;
@@ -21,13 +23,61 @@ export interface AgentResult {
   message: string;
 }
 
-// Runs `ssh-add -l` and shapes the result into an AgentResult if the agent was
-// reachable. Returns null if ssh-add couldn't talk to any agent on this channel
-// (so the caller can try the next fallback). `socket` is used verbatim in the
-// result — the Windows named pipe and a Unix $SSH_AUTH_SOCK path both flow
-// through here identically.
+// Runs a command with extra env vars merged on top of process.env. Pass `undefined`
+// for a key to UNSET it from the child env (delete-from-copy semantics). Mirrors
+// runArgs but returns the same {stdout, ok} shape so callers don't branch.
+function runArgsWithEnv(
+  cmd: string,
+  args: string[],
+  extraEnv: Record<string, string | undefined>,
+): { stdout: string; ok: boolean } {
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (typeof v === "string") env[k] = v;
+  }
+  for (const [k, v] of Object.entries(extraEnv)) {
+    if (v === undefined) {
+      delete env[k];
+    } else {
+      env[k] = v;
+    }
+  }
+  try {
+    const stdout = execFileSync(cmd, args, {
+      env,
+      encoding: "utf8",
+      timeout: 10000,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    return { stdout: stdout.trim(), ok: true };
+  } catch (e: unknown) {
+    const err = e as { stdout?: Buffer; stderr?: Buffer; message?: string };
+    const so = err.stdout?.toString().trim() || "";
+    const se = err.stderr?.toString().trim() || "";
+    const output = [so, se].filter(Boolean).join("\n") || err.message || "";
+    return { stdout: output, ok: false };
+  }
+}
+
+// Runs `ssh-add -l` against a specific agent channel and shapes the result into
+// an AgentResult if the agent was reachable. Returns null if ssh-add couldn't
+// talk to any agent on this channel (so the caller can try the next fallback).
+//
+// Channel selection:
+//   - Unix path: pass the socket via SSH_AUTH_SOCK in the child env so ssh-add
+//     hits the agent the caller actually asked about (not whatever happens to
+//     be in process.env).
+//   - Windows named pipe: leave SSH_AUTH_SOCK UNSET in the child env -- Windows
+//     ssh-add reaches the OpenSSH agent via the default named pipe when no
+//     SSH_AUTH_SOCK is present. Explicitly unsetting (rather than just not
+//     passing one) prevents a stale Unix-style SSH_AUTH_SOCK in the parent env
+//     from redirecting ssh-add away from the named pipe.
 function probeAgent(socket: string, agentLabel: string): AgentResult | null {
-  const { stdout, ok } = runArgs("ssh-add", ["-l"]);
+  const isWindowsNamedPipe = socket.startsWith("\\\\.\\pipe\\");
+  const extraEnv: Record<string, string | undefined> = isWindowsNamedPipe
+    ? { SSH_AUTH_SOCK: undefined }
+    : { SSH_AUTH_SOCK: socket };
+  const { stdout, ok } = runArgsWithEnv("ssh-add", ["-l"], extraEnv);
   const noIdentities = stdout.includes("no identities") || stdout.includes("The agent has no identities");
   if (!ok && !noIdentities) return null;
   const keys = ok && !noIdentities ? stdout.split("\n").filter(Boolean) : [];
@@ -137,6 +187,20 @@ function detectKeyType(filePath: string, fileName: string): string {
     if (content.includes("RSA PRIVATE KEY")) return "rsa";
     if (content.includes("EC PRIVATE KEY")) return "ecdsa";
     if (content.includes("DSA PRIVATE KEY")) return "dsa";
+
+    // Modern OpenSSH wraps every type (including ed25519) in `OPENSSH PRIVATE KEY`,
+    // so the type-specific PEM banners above miss ed25519 entirely. Fall back to
+    // ssh-keygen -l, which prints `<bits> SHA256:... comment (TYPE)` -- parse the
+    // trailing parenthesized type. -l reads only the unencrypted public-key
+    // portion of the OpenSSH file, so no passphrase prompt occurs even for
+    // passphrased keys; no -P flag needed.
+    if (content.includes("OPENSSH PRIVATE KEY")) {
+      const { stdout, ok } = runArgs("ssh-keygen", ["-l", "-f", filePath]);
+      if (ok) {
+        const match = stdout.match(/\(([^)]+)\)\s*$/);
+        if (match) return match[1].toLowerCase();
+      }
+    }
   } catch {
     // fall through
   }
@@ -251,21 +315,7 @@ export function configLookup(host: string): ConfigLookupResult | { error: string
     return { error: `Failed to resolve SSH config for ${host}: ${stdout}` };
   }
 
-  const all: Record<string, string> = {};
-  const identityFiles: string[] = [];
-
-  for (const line of stdout.split("\n")) {
-    const spaceIdx = line.indexOf(" ");
-    if (spaceIdx > 0) {
-      const key = line.substring(0, spaceIdx);
-      const value = line.substring(spaceIdx + 1);
-      if (key === "identityfile") {
-        identityFiles.push(value);
-      } else {
-        all[key] = value;
-      }
-    }
-  }
+  const { all, identityFiles } = parseSshConfigOutput(stdout);
 
   return {
     hostname: all.hostname || host,
@@ -372,9 +422,13 @@ export function testConnection(host: string, port = 22): { status: "ok" | "warni
   }
 
   const start = Date.now();
-  // StrictHostKeyChecking=no is safe here: this is a read-only probe that only echoes
-  // "SSH_OK". For actual operations, hostVerifier in resolveConfig (src/ssh.ts)
-  // enforces known_hosts matching.
+  // StrictHostKeyChecking=no on a read-only "echo SSH_OK" probe. No passwords or
+  // private-key material transit -- BatchMode=yes suppresses password prompts and ssh
+  // never sends private keys over the wire. But the SSH client WILL attempt pubkey auth
+  // against the (possibly-MitM'd) endpoint, so the public-key fingerprints of any
+  // identities loaded in the agent are observable to whatever answers on this port.
+  // For real connections, hostVerifier in resolveConfig (src/ssh.ts) enforces
+  // known_hosts matching and prevents this exposure.
   const { ok, stdout } = runArgs("ssh", [
     "-o",
     "ConnectTimeout=5",

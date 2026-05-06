@@ -19,8 +19,10 @@ const mockedConnect = vi.mocked(connectWithProxy);
 
 function makeFakeClient() {
   const client = new EventEmitter() as any;
+  client.endCalls = 0;
   // end() triggers a deferred 'close' so the pool can mark dead correctly.
   client.end = () => {
+    client.endCalls++;
     queueMicrotask(() => client.emit("close"));
   };
   return client;
@@ -139,6 +141,88 @@ describe("ConnectionPool — concurrent acquire dedup", () => {
       expect(mockedConnect).toHaveBeenCalledTimes(2);
       expect(pool.connectCount).toBe(2);
 
+      pool.release(c2);
+    } finally {
+      pool.drain();
+    }
+  });
+});
+
+describe("ConnectionPool — drain race", () => {
+  beforeEach(() => {
+    mockedConnect.mockReset();
+  });
+
+  it("rejects in-flight acquire and closes the connecting client when drain() runs mid-connect", async () => {
+    const fakeClient = makeFakeClient();
+    let resolveConnect!: (c: any) => void;
+    const deferred = new Promise<any>((resolve) => {
+      resolveConnect = resolve;
+    });
+    mockedConnect.mockImplementation(() => deferred);
+
+    const pool = new ConnectionPool();
+    const acquirePromise = pool.acquire({ host: "drain-race.example.com" });
+    // Yield once so the factory has actually started awaiting connectWithProxy.
+    await Promise.resolve();
+
+    pool.drain();
+    // Now let the connect resolve; the factory should see drained=true and
+    // close the client instead of registering it.
+    resolveConnect(fakeClient);
+
+    await expect(acquirePromise).rejects.toThrow(/drained/);
+    expect(fakeClient.endCalls).toBeGreaterThanOrEqual(1);
+    expect(pool.size).toBe(0);
+  });
+
+  it("rejects new acquires after drain() with /drained/", async () => {
+    mockedConnect.mockImplementation(async () => makeFakeClient());
+    const pool = new ConnectionPool();
+    pool.drain();
+    await expect(pool.acquire({ host: "post-drain.example.com" })).rejects.toThrow(/drained/);
+    expect(mockedConnect).not.toHaveBeenCalled();
+  });
+});
+
+describe("ConnectionPool — maxPoolSize eviction", () => {
+  beforeEach(() => {
+    mockedConnect.mockReset();
+    mockedConnect.mockImplementation(async () => makeFakeClient());
+  });
+
+  it("evicts an idle entry to make room for a new host when at capacity", async () => {
+    const pool = new ConnectionPool({ maxPoolSize: 2 });
+    try {
+      const c1 = await pool.acquire({ host: "evict-1.example.com" });
+      const c2 = await pool.acquire({ host: "evict-2.example.com" });
+      // Release both so they're idle and eligible for eviction.
+      pool.release(c1);
+      pool.release(c2);
+      expect(pool.size).toBe(2);
+
+      const c3 = await pool.acquire({ host: "evict-3.example.com" });
+      expect(c3).toBeDefined();
+      expect(pool.size).toBe(2);
+      // Exactly one of c1 / c2 should have been evicted (end() called on it).
+      const evictedCount = ((c1 as any).endCalls > 0 ? 1 : 0) + ((c2 as any).endCalls > 0 ? 1 : 0);
+      expect(evictedCount).toBe(1);
+
+      pool.release(c3);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("rejects with /Connection pool is full/ when all entries are active", async () => {
+    const pool = new ConnectionPool({ maxPoolSize: 2 });
+    try {
+      const c1 = await pool.acquire({ host: "full-1.example.com" });
+      const c2 = await pool.acquire({ host: "full-2.example.com" });
+      // Hold both refs — no eviction candidate available.
+      await expect(pool.acquire({ host: "full-3.example.com" })).rejects.toThrow(/Connection pool is full/);
+
+      pool.release(c1);
       pool.release(c2);
     } finally {
       pool.drain();

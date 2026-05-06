@@ -11,6 +11,7 @@ import {
   isValidHostname,
   runArgs,
 } from "./diagnose.js";
+import { parseSshConfigOutput } from "./ssh-config.js";
 
 export interface SSHConfig {
   host: string;
@@ -45,28 +46,14 @@ function resolveFromSshConfig(host: string): SshConfigResult | null {
     const { stdout, ok } = runArgs("ssh", ["-G", host]);
     if (!ok) return null;
 
-    const config: Record<string, string> = {};
-    const identityFiles: string[] = [];
-
-    for (const line of stdout.split("\n")) {
-      const spaceIdx = line.indexOf(" ");
-      if (spaceIdx > 0) {
-        const key = line.substring(0, spaceIdx);
-        const value = line.substring(spaceIdx + 1);
-        if (key === "identityfile") {
-          identityFiles.push(value);
-        } else {
-          config[key] = value;
-        }
-      }
-    }
+    const { all, identityFiles } = parseSshConfigOutput(stdout);
 
     return {
-      hostname: config.hostname || host,
-      user: config.user || "",
-      port: config.port || "22",
+      hostname: all.hostname || host,
+      user: all.user || "",
+      port: all.port || "22",
       identityFiles,
-      proxyJump: config.proxyjump && config.proxyjump !== "none" ? config.proxyjump : undefined,
+      proxyJump: all.proxyjump && all.proxyjump !== "none" ? all.proxyjump : undefined,
     };
   } catch {
     return null;

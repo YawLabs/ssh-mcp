@@ -166,9 +166,13 @@ export function checkConnectivity(host: string, port = 22): DiagnosticResult {
     return { status: "error", message: `Invalid hostname: "${host}"` };
   }
 
-  // StrictHostKeyChecking=no is safe here: this is a read-only probe that only echoes
-  // "SSH_OK". No credentials or data transit. For actual operations, hostVerifier in
-  // resolveConfig (src/ssh.ts) enforces known_hosts matching.
+  // StrictHostKeyChecking=no on a read-only "echo SSH_OK" probe. No passwords or
+  // private-key material transit -- BatchMode=yes suppresses password prompts and ssh
+  // never sends private keys over the wire. But the SSH client WILL attempt pubkey auth
+  // against the (possibly-MitM'd) endpoint, so the public-key fingerprints of any
+  // identities loaded in the agent are observable to whatever answers on this port.
+  // For real connections, hostVerifier in resolveConfig (src/ssh.ts) enforces
+  // known_hosts matching and prevents this exposure.
   const { ok, stdout } = runArgs("ssh", [
     "-o",
     "ConnectTimeout=5",
