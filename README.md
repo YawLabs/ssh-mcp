@@ -66,7 +66,7 @@ Tools that fix your local SSH setup so everything else — git, deploys, tunnels
 
 | Tool | Description |
 |------|-------------|
-| `ssh_exec` | Execute a command on a remote host. Returns stdout, stderr, and exit code. |
+| `ssh_exec` | Execute a command on a remote host. Returns stdout, stderr, and exit code (or `[signal: NAME]` and `code: -1` when the channel closed signal-only). |
 | `ssh_read_file` | Read a file from a remote host via SFTP. |
 | `ssh_write_file` | Write content to a file on a remote host via SFTP. |
 | `ssh_upload` | Upload a local file to a remote host via SFTP. |
@@ -80,9 +80,9 @@ Tools that wrap common patterns agents build with ssh_exec — faster and less e
 | Tool | Description |
 |------|-------------|
 | `ssh_multi_exec` | Run a command on multiple hosts in parallel. Returns results per host. |
-| `ssh_find` | Search for files remotely with structured parameters (name, type, size, depth). |
+| `ssh_find` | Search for files remotely with structured parameters (`name`, `type`, `size`, `depth`, `newer` — match files modified more recently than a reference path). |
 | `ssh_tail` | Read the last N lines of a file, optionally filtered by a grep pattern. |
-| `ssh_service_status` | Check systemd service status (active, PID, uptime, description). |
+| `ssh_service_status` | Check systemd service status (active, PID, uptime, description). Flags `isError` only when the unit could not be found / queried, not when an existing unit is intentionally stopped. |
 
 ### Auto-diagnostics
 
@@ -91,6 +91,8 @@ When any remote operation fails, ssh-mcp automatically runs diagnostics and incl
 ### Connection pooling
 
 Remote operations reuse SSH connections automatically. When your agent makes multiple calls to the same host, the first call opens a connection and subsequent calls reuse it. Connections are kept alive for 60 seconds after the last use, then closed automatically.
+
+The pool caps at 100 active connections by default. Set `SSH_MCP_MAX_POOL_SIZE=<n>` to raise it for fan-out workloads against many distinct hosts (e.g. `ssh_multi_exec` across a large fleet). When the cap is reached, the pool evicts an idle entry to make room; if every entry is in use it rejects with `Connection pool is full`.
 
 ### SSH config support
 
