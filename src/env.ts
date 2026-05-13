@@ -124,6 +124,18 @@ export function ensureAgent(): AgentResult {
   if (process.platform === "win32") {
     const result = probeAgent("\\\\.\\pipe\\openssh-ssh-agent", "Windows OpenSSH agent");
     if (result) return result;
+    // Skip the `ssh-agent -s` spawn below: on win32 it either errors (no Bourne-shell
+    // output) or, in Git Bash with a Unix-ish ssh-agent.exe, spawns an agent whose
+    // socket the rest of the stack can't reach. Return the Windows-specific error
+    // directly so we don't orphan a process.
+    return {
+      running: false,
+      reachable: false,
+      keys: [],
+      started: false,
+      message:
+        "Windows OpenSSH agent not running. Start it: Get-Service ssh-agent | Set-Service -StartupType Automatic; Start-Service ssh-agent",
+    };
   }
 
   // Try to start a new agent (Unix)
@@ -153,15 +165,13 @@ export function ensureAgent(): AgentResult {
     }
   }
 
+  // Unix-only path: Windows returns from the named-pipe block above before reaching here.
   return {
     running: false,
     reachable: false,
     keys: [],
     started: false,
-    message:
-      process.platform === "win32"
-        ? "Windows OpenSSH agent not running. Start it: Get-Service ssh-agent | Set-Service -StartupType Automatic; Start-Service ssh-agent"
-        : 'Could not start ssh-agent. Run manually: eval "$(ssh-agent -s)"',
+    message: 'Could not start ssh-agent. Run manually: eval "$(ssh-agent -s)"',
   };
 }
 

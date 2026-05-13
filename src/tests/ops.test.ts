@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it } from "vitest";
-import { find, tail } from "../ops.js";
+import { find, serviceStatus, tail } from "../ops.js";
 
 // Capture the command string passed to client.exec so tests can assert on it.
 function capturingClient(opts: { stdout?: string; stderr?: string; code?: number }): {
@@ -123,6 +123,51 @@ describe("tail error surfacing", () => {
     const client = fakeClient({ stdout: "line1\nline2\n", code: 0 });
     const out = await tail(client, "/var/log/app.log");
     expect(out).toContain("line1");
+  });
+});
+
+describe("serviceStatus unknown vs inactive", () => {
+  it("marks unknown=true when systemctl could not find the unit", async () => {
+    // Real-world output: `systemctl status nope` -> non-zero exit, no Active: line.
+    const client = fakeClient({
+      stdout: "Unit nope.service could not be found.\n",
+      code: 4,
+    });
+    const status = await serviceStatus(client, "nope");
+    expect(status.unknown).toBe(true);
+    expect(status.active).toBe(false);
+  });
+
+  it("marks unknown=false for a stopped-but-present service", async () => {
+    // Real-world output: stopped nginx has an Active: line and exit code 3.
+    const client = fakeClient({
+      stdout: [
+        "* nginx.service - A high performance web server",
+        "     Loaded: loaded (/lib/systemd/system/nginx.service; enabled; preset: enabled)",
+        "     Active: inactive (dead) since Mon 2025-01-01 12:00:00 UTC; 1h ago",
+      ].join("\n"),
+      code: 3,
+    });
+    const status = await serviceStatus(client, "nginx");
+    expect(status.unknown).toBe(false);
+    expect(status.active).toBe(false);
+    expect(status.status).toContain("inactive");
+  });
+
+  it("marks unknown=false for an active service", async () => {
+    const client = fakeClient({
+      stdout: [
+        "* nginx.service - A high performance web server",
+        "     Loaded: loaded (/lib/systemd/system/nginx.service; enabled; preset: enabled)",
+        "     Active: active (running) since Mon 2025-01-01 12:00:00 UTC; 1h ago",
+        "   Main PID: 1234 (nginx)",
+      ].join("\n"),
+      code: 0,
+    });
+    const status = await serviceStatus(client, "nginx");
+    expect(status.unknown).toBe(false);
+    expect(status.active).toBe(true);
+    expect(status.pid).toBe(1234);
   });
 });
 

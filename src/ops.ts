@@ -141,6 +141,13 @@ export interface ServiceStatus {
   since?: string;
   pid?: number;
   raw: string;
+  /**
+   * True when systemctl could not report on the unit at all: no `Active:` line
+   * parseable AND non-zero exit. Typical causes: typo'd unit name, unit file
+   * doesn't exist, systemd unreachable. Distinct from "service exists but is
+   * stopped" (active=false but unknown=false).
+   */
+  unknown: boolean;
 }
 
 export async function serviceStatus(client: Client, serviceName: string, timeoutMs = 30000): Promise<ServiceStatus> {
@@ -153,9 +160,11 @@ export async function serviceStatus(client: Client, serviceName: string, timeout
   const pidMatch = raw.match(/Main PID:\s+(\d+)/);
   const sinceMatch = raw.match(/since\s+(.+?);/);
 
-  // No `Active:` line on a non-zero exit usually means the unit doesn't exist or is
-  // inactive. "unknown" was misleading -- callers couldn't distinguish "down" from
-  // "we couldn't tell." Prefer "inactive" since that's what the exit code maps to.
+  // No `Active:` line + non-zero exit means systemctl could not answer (unit missing,
+  // systemd not running, permission denied). That's an error case agents need to
+  // distinguish from "service exists but is stopped" -- the latter still has a parseable
+  // `Active: inactive (dead)` line and a zero or one exit code depending on systemd version.
+  const unknown = !activeMatch && result.code !== 0;
   const fallbackStatus = result.code === 0 ? "active" : "inactive";
 
   return {
@@ -166,5 +175,6 @@ export async function serviceStatus(client: Client, serviceName: string, timeout
     since: sinceMatch?.[1]?.trim(),
     pid: pidMatch ? Number.parseInt(pidMatch[1], 10) : undefined,
     raw,
+    unknown,
   };
 }

@@ -50,6 +50,9 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
         const parts: string[] = [];
         if (result.stdout) parts.push(result.stdout);
         if (result.stderr) parts.push(`[stderr]\n${result.stderr}`);
+        // Surface signal when the channel closed signal-only -- otherwise `code: -1`
+        // looks like a generic failure with no hint that the remote was killed.
+        if (result.signal) parts.push(`[signal: ${result.signal}]`);
         parts.push(`[exit code: ${result.code}]`);
         return { content: [{ type: "text", text: parts.join("\n") }] };
       });
@@ -423,11 +426,11 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
         if (status.since) lines.push(`Since: ${status.since}`);
         lines.push("");
         lines.push(status.raw);
-        // Don't flag isError on an inactive service -- that's a legitimate state
-        // answer to "is this service running?", not an infrastructure failure.
-        // Callers gating on success vs. failure should read status.active in the
-        // typed ServiceStatus return; the MCP text response is informational.
-        return { content: [{ type: "text", text: lines.join("\n") }] };
+        // isError only when systemctl could not report on the unit at all (typo'd name,
+        // missing unit file, systemd unreachable). "Service exists but is stopped" is a
+        // legitimate state answer to "is this running?", not a failure -- callers gating
+        // on running vs. stopped should read status.active.
+        return { content: [{ type: "text", text: lines.join("\n") }], isError: status.unknown };
       });
     },
   );
