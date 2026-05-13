@@ -115,8 +115,13 @@ export function ensureAgent(): AgentResult {
     if (result) return result;
   }
 
-  // On Windows, try the OpenSSH agent service (uses named pipe, not SSH_AUTH_SOCK)
-  if (!sock && process.platform === "win32") {
+  // On Windows, try the OpenSSH agent service (uses named pipe, not SSH_AUTH_SOCK).
+  // We attempt this whenever the SSH_AUTH_SOCK path didn't yield a reachable agent --
+  // including the case where SSH_AUTH_SOCK is set but stale (e.g. a leftover Unix-style
+  // path from WSL or a prior session). Without this fall-through, a Windows user with a
+  // stale SSH_AUTH_SOCK never reaches the named-pipe attempt and ensureAgent returns
+  // "not running" while the actual OpenSSH agent service is up.
+  if (process.platform === "win32") {
     const result = probeAgent("\\\\.\\pipe\\openssh-ssh-agent", "Windows OpenSSH agent");
     if (result) return result;
   }
@@ -284,10 +289,15 @@ export function loadKey(keyPath: string): { status: "ok" | "error"; message: str
     return { status: "ok", message: `Key loaded: ${resolved}` };
   }
 
-  if (stdout.includes("passphrase") || stdout.includes("incorrect") || stdout.includes("bad permissions")) {
-    if (stdout.includes("UNPROTECTED PRIVATE KEY")) {
-      return { status: "error", message: `Key ${resolved} has too-open permissions. Fix: chmod 600 ${resolved}` };
-    }
+  // Permissions check first: ssh-add prints "Permissions ... are too open" /
+  // "UNPROTECTED PRIVATE KEY" / "This private key will be ignored" -- none of
+  // which contain "passphrase". Match on those phrases directly so a too-open
+  // key surfaces a chmod hint instead of the generic "Failed to load key".
+  if (stdout.includes("UNPROTECTED PRIVATE KEY") || stdout.includes("too open") || stdout.includes("bad permissions")) {
+    return { status: "error", message: `Key ${resolved} has too-open permissions. Fix: chmod 600 ${resolved}` };
+  }
+
+  if (stdout.includes("passphrase") || stdout.includes("incorrect")) {
     return { status: "error", message: `Key ${resolved} requires a passphrase. Add it manually: ssh-add ${resolved}` };
   }
 

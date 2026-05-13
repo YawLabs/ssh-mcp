@@ -26,6 +26,12 @@ export interface ExecResult {
   stdout: string;
   stderr: string;
   code: number;
+  /** True when stdout was truncated at the byte cap. */
+  stdoutTruncated?: boolean;
+  /** True when stderr was truncated at the byte cap. */
+  stderrTruncated?: boolean;
+  /** Signal name (e.g. "TERM") if the remote channel closed via signal instead of exit. */
+  signal?: string;
 }
 
 interface SshConfigResult {
@@ -112,6 +118,11 @@ export function resolveConfig(config: SSHConfig): ResolvedConfig {
   if (sshConfig?.hostname && sshConfig.hostname !== config.host) {
     verifierHosts.push(sshConfig.hostname);
   }
+  // Username fallback chain: explicit > ssh_config User > $USER/$USERNAME > "root".
+  // The trailing "root" is a last-ditch default for env-stripped contexts (containers
+  // without USER/USERNAME and without ssh installed for `ssh -G` to provide a user).
+  // In those cases the SSH server's "Permission denied" is the source of truth -- we
+  // don't try to second-guess it client-side.
   const connectConfig: ConnectConfig = {
     host: sshConfig?.hostname || config.host,
     port,
@@ -251,10 +262,21 @@ export async function connectWithProxy(resolved: ResolvedConfig): Promise<Client
   const targetHost = resolved.connectConfig.host as string;
   const targetPort = resolved.connectConfig.port as number;
 
+  // Centralize jump-client teardown so the error and close paths can't double-throw on a
+  // second end() call. ssh2's Client.end() is normally idempotent, but every other
+  // end-call site in this module wraps in try/catch -- these two were the outliers.
+  const endJump = () => {
+    try {
+      jumpClient.end();
+    } catch {
+      // already ended
+    }
+  };
+
   const stream = await new Promise<any>((resolve, reject) => {
     jumpClient.forwardOut("127.0.0.1", 0, targetHost, targetPort, (err, stream) => {
       if (err) {
-        jumpClient.end();
+        endJump();
         return reject(err);
       }
       resolve(stream);
@@ -267,11 +289,11 @@ export async function connectWithProxy(resolved: ResolvedConfig): Promise<Client
     client
       .on("ready", () => resolve(client))
       .on("error", (err) => {
-        jumpClient.end();
+        endJump();
         reject(err);
       })
       .on("close", () => {
-        jumpClient.end();
+        endJump();
       })
       .connect({ ...resolved.connectConfig, sock: stream });
   });
@@ -385,12 +407,21 @@ export function exec(
       };
 
       stream
-        .on("close", (code: number) => {
+        .on("close", (code: number | null, signal?: string) => {
           let stdout = Buffer.concat(stdoutChunks).toString("utf8");
           let stderr = Buffer.concat(stderrChunks).toString("utf8");
           if (stdoutTruncated) stdout += `\n[output truncated at ${maxBytes} bytes]`;
           if (stderrTruncated) stderr += `\n[stderr truncated at ${maxBytes} bytes]`;
-          settle(() => resolve({ stdout, stderr, code: code ?? 0 }));
+          // ssh2 emits close(code, signal). When the remote channel closes signal-only
+          // (server-side kill), code is null/undefined. -1 is a clearer "no exit code"
+          // sentinel than the previous 0, which conflated "signaled" with "success."
+          // The signal name (if present) is also surfaced so callers can distinguish.
+          const exitCode = typeof code === "number" ? code : -1;
+          const result: ExecResult = { stdout, stderr, code: exitCode };
+          if (stdoutTruncated) result.stdoutTruncated = true;
+          if (stderrTruncated) result.stderrTruncated = true;
+          if (signal) result.signal = signal;
+          settle(() => resolve(result));
         })
         .on("data", appendStdout)
         .on("error", (err: Error) => {

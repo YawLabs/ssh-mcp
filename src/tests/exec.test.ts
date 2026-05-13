@@ -84,6 +84,58 @@ describe("exec output cap", () => {
     await expect(exec(client, "cmd")).rejects.toThrow("exec failed");
   });
 
+  it("exposes stdoutTruncated when the cap is hit", async () => {
+    const chunk = Buffer.alloc(2048, 0x61);
+    const client = fakeClient({ stdoutChunks: [chunk], code: 0 });
+    const result = await exec(client, "cmd", 30000, 1024);
+    expect(result.stdoutTruncated).toBe(true);
+    expect(result.stderrTruncated).toBeUndefined();
+  });
+
+  it("exposes stderrTruncated independently of stdout", async () => {
+    const client = fakeClient({
+      stdoutChunks: [Buffer.from("ok")],
+      stderrChunks: [Buffer.alloc(2048, 0x65)],
+      code: 0,
+    });
+    const result = await exec(client, "cmd", 30000, 512);
+    expect(result.stdoutTruncated).toBeUndefined();
+    expect(result.stderrTruncated).toBe(true);
+  });
+
+  it("does not set truncated flags when output fits", async () => {
+    const client = fakeClient({ stdoutChunks: [Buffer.from("hi")], code: 0 });
+    const result = await exec(client, "cmd", 30000, 1024);
+    expect(result.stdoutTruncated).toBeUndefined();
+    expect(result.stderrTruncated).toBeUndefined();
+  });
+
+  it("captures signal name and returns code=-1 when the channel closes signal-only", async () => {
+    const client: any = {
+      exec: (_command: string, cb: (err: Error | null, stream: any) => void) => {
+        const stream: any = new EventEmitter();
+        stream.stderr = new EventEmitter();
+        cb(null, stream);
+        queueMicrotask(() => {
+          // ssh2 emits close(code, signal). Signal-only close has code=null.
+          stream.emit("close", null, "TERM");
+        });
+      },
+    };
+    const result = await exec(client, "killed-cmd");
+    expect(result.code).toBe(-1);
+    expect(result.signal).toBe("TERM");
+  });
+
+  it("uses code=0 (not -1) when the channel closes with a real zero exit", async () => {
+    // Regression guard: previously `code ?? 0` masked signal-only closes as success.
+    // The new logic only falls to -1 when `code` is non-numeric.
+    const client = fakeClient({ stdoutChunks: [Buffer.from("ok")], code: 0 });
+    const result = await exec(client, "cmd");
+    expect(result.code).toBe(0);
+    expect(result.signal).toBeUndefined();
+  });
+
   it("tears down the remote channel on timeout", async () => {
     let signalCalledWith: string | undefined;
     let closeCalled = false;

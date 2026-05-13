@@ -352,11 +352,15 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       maxdepth: z.number().optional().describe("Maximum directory depth to search"),
       minsize: z.string().optional().describe("Minimum file size (e.g. '1M', '100k')"),
       maxsize: z.string().optional().describe("Maximum file size (e.g. '10M', '500k')"),
+      newer: z
+        .string()
+        .optional()
+        .describe("Reference file path -- find matches files modified more recently than this file"),
       timeout: TimeoutSchema,
     },
-    async ({ path, name, type, maxdepth, minsize, maxsize, timeout, ...conn }) => {
+    async ({ path, name, type, maxdepth, minsize, maxsize, newer, timeout, ...conn }) => {
       return connectionPool.withConnection(conn, async (client) => {
-        const files = await find(client, { path, name, type, maxdepth, minsize, maxsize }, timeout || 30000);
+        const files = await find(client, { path, name, type, maxdepth, minsize, maxsize, newer }, timeout || 30000);
         if (files.length === 0) {
           return { content: [{ type: "text", text: "No files found." }] };
         }
@@ -371,7 +375,12 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
     {
       ...connectionParams,
       path: z.string().describe("Absolute path to the file to tail"),
-      lines: z.number().optional().describe("Number of lines to read from the end (default: 100)"),
+      lines: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Number of lines to read from the end (default: 100). Must be a positive integer."),
       grep: z.string().optional().describe("Case-insensitive pattern to filter lines"),
       timeout: TimeoutSchema,
     },
@@ -414,7 +423,11 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
         if (status.since) lines.push(`Since: ${status.since}`);
         lines.push("");
         lines.push(status.raw);
-        return { content: [{ type: "text", text: lines.join("\n") }], isError: !status.active };
+        // Don't flag isError on an inactive service -- that's a legitimate state
+        // answer to "is this service running?", not an infrastructure failure.
+        // Callers gating on success vs. failure should read status.active in the
+        // typed ServiceStatus return; the MCP text response is informational.
+        return { content: [{ type: "text", text: lines.join("\n") }] };
       });
     },
   );

@@ -248,9 +248,14 @@ export function checkSshConfig(host: string): DiagnosticResult {
         inHostBlock = patterns.some((p) => {
           if (p === "*") return true;
           if (p === host) return true;
-          // Simple wildcard matching: *.example.com
-          if (p.includes("*")) {
-            const regex = new RegExp("^" + p.replace(/\./g, "\\.").replace(/\*/g, ".*") + "$");
+          // SSH config supports `*` (any chars) and `?` (single char) as wildcards.
+          // Escape every regex meta first, then translate the wildcards. Without
+          // escaping `?`, `[`, `+`, `(`, etc., a literal pattern like `?prod` or
+          // `srv[12].example.com` would be misinterpreted as regex syntax and
+          // match unintended hosts.
+          if (p.includes("*") || p.includes("?")) {
+            const escaped = p.replace(/[\\^$.|+()[\]{}]/g, "\\$&");
+            const regex = new RegExp("^" + escaped.replace(/\*/g, ".*").replace(/\?/g, ".") + "$");
             return regex.test(host);
           }
           return false;

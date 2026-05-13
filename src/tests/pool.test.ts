@@ -22,6 +22,21 @@ describe("ConnectionPool", () => {
     pool.drain();
   });
 
+  it("accepts SSH_MCP_MAX_POOL_SIZE without crashing on valid and invalid values", async () => {
+    // Behavioral enforcement is covered in pool-concurrency.test.ts (which already
+    // mocks connectWithProxy). Here we just smoke-test the read path: valid number,
+    // invalid string, and unset all yield a constructible pool.
+    for (const value of ["7", "not-a-number", ""]) {
+      vi.stubEnv("SSH_MCP_MAX_POOL_SIZE", value);
+      vi.resetModules();
+      const fresh = await import("../pool.js");
+      const pool = new fresh.ConnectionPool();
+      expect(pool.size).toBe(0);
+      pool.drain();
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("drain on empty pool is safe", () => {
     const pool = new ConnectionPool();
     pool.drain();

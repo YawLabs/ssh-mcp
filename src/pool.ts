@@ -12,8 +12,21 @@ interface PoolEntry {
 export interface PoolOptions {
   /** Milliseconds before an idle connection is closed. Default: 60000 (60s) */
   idleTtlMs?: number;
-  /** Maximum number of connections in the pool. Default: 100 */
+  /**
+   * Maximum number of connections in the pool. Default: 100, overridable via the
+   * `SSH_MCP_MAX_POOL_SIZE` env var. When at capacity, the pool first tries to evict
+   * an idle entry; if every entry is in use, `acquire()` rejects with
+   * "Connection pool is full". Bump this for fan-out workloads against many distinct
+   * hosts (e.g. `ssh_multi_exec` across a large fleet).
+   */
   maxPoolSize?: number;
+}
+
+function defaultMaxPoolSize(): number {
+  const raw = process.env.SSH_MCP_MAX_POOL_SIZE;
+  if (!raw) return 100;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 100;
 }
 
 export class ConnectionPool {
@@ -33,7 +46,7 @@ export class ConnectionPool {
 
   constructor(options?: PoolOptions) {
     this.idleTtlMs = options?.idleTtlMs ?? 60_000;
-    this.maxPoolSize = options?.maxPoolSize ?? 100;
+    this.maxPoolSize = options?.maxPoolSize ?? defaultMaxPoolSize();
   }
 
   async acquire(config: SSHConfig): Promise<Client> {
