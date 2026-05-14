@@ -138,6 +138,29 @@ Blocked commands surface as a clear error mentioning which pattern (or which env
 
 The structured higher-level tools (`ssh_find`, `ssh_tail`, `ssh_service_status`, SFTP ops) are exempt from policy. They build commands from typed parameters, so a tight `^ls` whitelist would otherwise force you to allow `^find `, `^tail `, `^systemctl ` just to keep those tools working — defeating the point of a tight whitelist.
 
+#### Policy interaction with `ssh_exec`'s `env` parameter
+
+When `ssh_exec` is called with `env: { KEY: "value" }`, the values are injected as a `KEY='value' ...` shell prefix before the command (see the `ssh_exec` description). **Policy is checked against the full prefixed command**, not the bare `command` argument. That's the safer ordering at the protocol layer — but it means whitelist patterns need to anticipate the prefix and must be **anchored**, not substring matches:
+
+```bash
+# WRONG -- blocks any ssh_exec call that uses `env`, because the final command
+# starts with `KEY='value' ` and never matches `^ls`.
+SSH_MCP_COMMAND_WHITELIST="^ls "
+
+# RIGHT -- allow zero or more `KEY='value' ` prefixes before the real command.
+SSH_MCP_COMMAND_WHITELIST="^([A-Za-z_][A-Za-z0-9_]*='[^']*' )*ls( |$)"
+```
+
+**Avoid substring-match patterns** like ` ls ` if you're worried about a hostile agent. An agent could pass `env: { ATTACK: " ls " }` to make the final command `ATTACK=' ls ' rm -rf /`, which matches a substring ` ls ` and bypasses the whitelist. Anchored patterns of the form above don't have this weakness because they require the real command name to follow the env-prefix block, not appear inside a quoted env value.
+
+Blacklists need the same care. `^rm ` blocks a bare `rm` call, but doesn't block `FOO='bar' rm`. Use the same env-prefix-tolerant anchor:
+
+```bash
+SSH_MCP_COMMAND_BLACKLIST="^([A-Za-z_][A-Za-z0-9_]*='[^']*' )*rm( |$)"
+```
+
+If you don't trust the agent's `env` values at all, the simplest mitigation is to leave `env` unused in your client config and pass everything through the `command` string yourself.
+
 ### Windows support
 
 On Windows, ssh-mcp detects the OpenSSH Authentication Agent service automatically (via the `\\.\pipe\openssh-ssh-agent` named pipe). No `SSH_AUTH_SOCK` needed — just make sure the OpenSSH agent service is running.
