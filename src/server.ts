@@ -43,6 +43,7 @@ export {
 } from "./env.js";
 export type { FindOptions, MultiExecHost, MultiExecResult, ServiceStatus } from "./ops.js";
 export { find, multiExec, serviceStatus, tail } from "./ops.js";
+export { enforcePolicy, isPolicyConfigured } from "./policy.js";
 export type { PoolOptions } from "./pool.js";
 export { ConnectionPool } from "./pool.js";
 export type { ExecResult, ResolvedConfig, SSHConfig } from "./ssh.js";

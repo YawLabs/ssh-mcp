@@ -66,7 +66,7 @@ Tools that fix your local SSH setup so everything else — git, deploys, tunnels
 
 | Tool | Description |
 |------|-------------|
-| `ssh_exec` | Execute a command on a remote host. Returns stdout, stderr, and exit code (or `[signal: NAME]` and `code: -1` when the channel closed signal-only). |
+| `ssh_exec` | Execute a command on a remote host. Returns stdout, stderr, and exit code (or `[signal: NAME]` and `code: -1` when the channel closed signal-only). Subject to [command policy](#command-policy) if configured. |
 | `ssh_read_file` | Read a file from a remote host via SFTP. |
 | `ssh_write_file` | Write content to a file on a remote host via SFTP. |
 | `ssh_upload` | Upload a local file to a remote host via SFTP. |
@@ -79,7 +79,7 @@ Tools that wrap common patterns agents build with ssh_exec — faster and less e
 
 | Tool | Description |
 |------|-------------|
-| `ssh_multi_exec` | Run a command on multiple hosts in parallel. Returns results per host. |
+| `ssh_multi_exec` | Run a command on multiple hosts in parallel. Returns results per host. Subject to [command policy](#command-policy) if configured (policy is checked once before fan-out). |
 | `ssh_find` | Search for files remotely with structured parameters (`name`, `type`, `size`, `depth`, `newer` — match files modified more recently than a reference path). |
 | `ssh_tail` | Read the last N lines of a file, optionally filtered by a grep pattern. |
 | `ssh_service_status` | Check systemd service status (active, PID, uptime, description). Flags `isError` only when the unit could not be found / queried, not when an existing unit is intentionally stopped. |
@@ -111,6 +111,29 @@ All remote operations verify the server's host key against `~/.ssh/known_hosts`:
 For stricter environments, set `SSH_MCP_STRICT_HOST_KEY=1` to reject unknown hosts. Add them explicitly with `ssh_known_hosts_fix` first.
 
 The diagnostic tools (`ssh_test`, `ssh_diagnose`) use `StrictHostKeyChecking=no` for their probe commands. Those probes only run `echo SSH_OK` — no credentials or data pass through — so the relaxed setting is safe for connectivity testing. Real operations always go through the `hostVerifier`.
+
+### Command policy
+
+`ssh_exec` and `ssh_multi_exec` accept free-form shell commands from the agent. For security-conscious deployments, you can restrict which commands run via two env vars, each accepting a comma-separated list of regex patterns:
+
+- `SSH_MCP_COMMAND_WHITELIST` — if set, the command **must** match at least one pattern, else it's blocked.
+- `SSH_MCP_COMMAND_BLACKLIST` — if set, the command **must not** match any pattern, else it's blocked.
+
+When both are set, the command must pass both checks (whitelist first, then blacklist). When neither is set (the default), all commands are allowed.
+
+Patterns are JavaScript regexes. Use `^` and `$` for anchored matches; otherwise patterns are treated as substring matches. Commas are the delimiter, so a literal comma in a pattern needs to be expressed as `\x2c` or via a character class.
+
+```bash
+# Read-only allowlist: only ls / df / cat / find / tail
+SSH_MCP_COMMAND_WHITELIST="^ls( .*)?,^df( .*)?,^cat ,^find ,^tail "
+
+# Block destructive ops even if your agent goes off-script
+SSH_MCP_COMMAND_BLACKLIST="^rm ,^shutdown,^reboot,^mkfs,^dd if=,>\s*/dev/"
+```
+
+Blocked commands surface as a clear error mentioning which pattern (or which env var) rejected the call, so the agent can adapt rather than guess. Policy is enforced before the SSH connection opens — no remote process is started for a blocked command.
+
+The structured higher-level tools (`ssh_find`, `ssh_tail`, `ssh_service_status`, SFTP ops) are exempt from policy. They build commands from typed parameters, so a tight `^ls` whitelist would otherwise force you to allow `^find `, `^tail `, `^systemctl ` just to keep those tools working — defeating the point of a tight whitelist.
 
 ### Windows support
 

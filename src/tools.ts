@@ -3,6 +3,7 @@ import { z } from "zod";
 import { diagnose } from "./diagnose.js";
 import { checkGitSsh, configLookup, ensureAgent, fixKnownHosts, listSshKeys, loadKey, testConnection } from "./env.js";
 import { find, multiExec, serviceStatus, tail } from "./ops.js";
+import { enforcePolicy } from "./policy.js";
 import { ConnectionPool } from "./pool.js";
 import { downloadFile, exec, listDir, readFile, uploadFile, writeFile } from "./ssh.js";
 
@@ -36,7 +37,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_exec",
-    "Execute a command on a remote host via SSH. The command is interpreted by the remote login shell — pipes, redirects, globs, and other shell metacharacters work as expected. Returns stdout, stderr, and exit code.",
+    "Execute a command on a remote host via SSH. The command is interpreted by the remote login shell — pipes, redirects, globs, and other shell metacharacters work as expected. Returns stdout, stderr, and exit code. Subject to SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST if configured.",
     {
       ...connectionParams,
       command: z
@@ -45,6 +46,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       timeout: TimeoutSchema,
     },
     async ({ command, timeout, ...conn }) => {
+      enforcePolicy(command);
       return connectionPool.withConnection(conn, async (client) => {
         const result = await exec(client, command, timeout || 30000);
         const parts: string[] = [];
@@ -313,7 +315,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_multi_exec",
-    "Execute a command on multiple remote hosts in parallel. Returns results per host. Use this instead of calling ssh_exec multiple times — it's faster and shows results side by side.",
+    "Execute a command on multiple remote hosts in parallel. Returns results per host. Use this instead of calling ssh_exec multiple times — it's faster and shows results side by side. Subject to SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST if configured (policy is checked once before fan-out).",
     {
       hosts: z.array(z.string()).describe("List of SSH hostnames or IPs"),
       command: z.string().describe("Shell command to execute on all hosts"),
@@ -324,6 +326,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       timeout: TimeoutSchema,
     },
     async ({ hosts, command, port, username, privateKeyPath, password, timeout }) => {
+      enforcePolicy(command);
       const hostConfigs = hosts.map((host) => ({ host, port, username, privateKeyPath, password }));
       const results = await multiExec(connectionPool, hostConfigs, command, timeout || 30000);
 
