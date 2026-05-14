@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it } from "vitest";
-import { find, serviceStatus, tail } from "../ops.js";
+import { find, serviceStatus, shellQuote, tail } from "../ops.js";
 
 // Capture the command string passed to client.exec so tests can assert on it.
 function capturingClient(opts: { stdout?: string; stderr?: string; code?: number }): {
@@ -168,6 +168,30 @@ describe("serviceStatus unknown vs inactive", () => {
     expect(status.unknown).toBe(false);
     expect(status.active).toBe(true);
     expect(status.pid).toBe(1234);
+  });
+});
+
+describe("shellQuote (exported helper used by env-prefix + path injection guards)", () => {
+  it("wraps simple values in single quotes", () => {
+    expect(shellQuote("hello")).toBe("'hello'");
+    expect(shellQuote("/var/log/syslog")).toBe("'/var/log/syslog'");
+  });
+
+  it("escapes embedded single quotes via the close-escape-reopen pattern", () => {
+    // POSIX rule: '...'\''...'  --  close quote, escaped quote, reopen quote.
+    expect(shellQuote("it's")).toBe("'it'\\''s'");
+  });
+
+  it("makes shell metacharacters inert", () => {
+    expect(shellQuote("; rm -rf /")).toBe("'; rm -rf /'");
+    expect(shellQuote("$(whoami)")).toBe("'$(whoami)'");
+    expect(shellQuote("`id`")).toBe("'`id`'");
+    expect(shellQuote("foo | bar")).toBe("'foo | bar'");
+  });
+
+  it("handles values with newlines and tabs literally", () => {
+    expect(shellQuote("line1\nline2")).toBe("'line1\nline2'");
+    expect(shellQuote("a\tb")).toBe("'a\tb'");
   });
 });
 

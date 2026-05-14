@@ -46,18 +46,21 @@ export { find, multiExec, serviceStatus, tail } from "./ops.js";
 export { enforcePolicy, isPolicyConfigured } from "./policy.js";
 export type { PoolOptions } from "./pool.js";
 export { ConnectionPool } from "./pool.js";
-export type { ExecResult, ResolvedConfig, SSHConfig } from "./ssh.js";
+export type { ExecResult, FileStats, ResolvedConfig, SSHConfig } from "./ssh.js";
 export {
   connect,
   connectRaw,
   connectWithProxy,
+  deleteFile,
   downloadFile,
   exec,
   formatDiagnostics,
   listDir,
+  makeDir,
   readFile,
   readKnownHostsKeys,
   resolveConfig,
+  statFile,
   uploadFile,
   writeFile,
 } from "./ssh.js";

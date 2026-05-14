@@ -2,7 +2,10 @@ import type { Client } from "ssh2";
 import type { ConnectionPool } from "./pool.js";
 import { exec } from "./ssh.js";
 
-function shellQuote(s: string): string {
+// POSIX single-quote wrapping. Used by every helper that interpolates user input into
+// a remote shell command -- safe against any byte sequence including embedded quotes.
+// Exported so tools.ts can build env-var prefixes for ssh_exec without duplicating the rule.
+export function shellQuote(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
 

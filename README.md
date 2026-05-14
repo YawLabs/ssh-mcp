@@ -66,12 +66,15 @@ Tools that fix your local SSH setup so everything else — git, deploys, tunnels
 
 | Tool | Description |
 |------|-------------|
-| `ssh_exec` | Execute a command on a remote host. Returns stdout, stderr, and exit code (or `[signal: NAME]` and `code: -1` when the channel closed signal-only). Subject to [command policy](#command-policy) if configured. |
+| `ssh_exec` | Execute a command on a remote host. Returns stdout, stderr, and exit code (or `[signal: NAME]` and `code: -1` when the channel closed signal-only). Optional `env` param sets per-call environment variables (POSIX-safe prefix, works regardless of sshd's `AcceptEnv`). Subject to [command policy](#command-policy) if configured. |
 | `ssh_read_file` | Read a file from a remote host via SFTP. |
 | `ssh_write_file` | Write content to a file on a remote host via SFTP. |
 | `ssh_upload` | Upload a local file to a remote host via SFTP. |
 | `ssh_download` | Download a file from a remote host to local filesystem. |
 | `ssh_ls` | List files in a directory on a remote host. |
+| `ssh_stat` | Get metadata for a file or directory (size, mode in octal, uid/gid, mtime/atime, isFile/isDirectory/isSymbolicLink). Use instead of parsing `ls -la`. |
+| `ssh_mkdir` | Create a directory via SFTP. Set `recursive: true` for `mkdir -p` behavior. |
+| `ssh_delete` | Delete a file or empty directory via SFTP. Auto-dispatches unlink vs rmdir based on the path's type. Recursive directory delete is intentionally NOT supported -- use `ssh_exec rm -rf` if you need it. |
 
 ### Higher-level operations
 

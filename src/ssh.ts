@@ -526,3 +526,119 @@ export async function listDir(client: Client, remotePath: string): Promise<strin
     sftp.end();
   }
 }
+
+export interface FileStats {
+  size: number;
+  /** POSIX mode as a decimal number. Use modeOctal for the human-readable form. */
+  mode: number;
+  /** POSIX mode formatted as a 4-digit octal string (e.g. "0755"). */
+  modeOctal: string;
+  uid: number;
+  gid: number;
+  /** Unix timestamp (seconds since epoch) of last modification. */
+  mtime: number;
+  /** Unix timestamp (seconds since epoch) of last access. */
+  atime: number;
+  isFile: boolean;
+  isDirectory: boolean;
+  isSymbolicLink: boolean;
+}
+
+export async function statFile(client: Client, remotePath: string): Promise<FileStats> {
+  const sftp = await getSftp(client);
+  try {
+    return await new Promise((resolve, reject) => {
+      sftp.stat(remotePath, (err, stats) => {
+        if (err) return reject(err);
+        // ssh2 exposes the type checks as methods, not boolean fields -- materialize them
+        // up front so the result is a plain JSON-safe object the MCP layer can serialize.
+        resolve({
+          size: stats.size,
+          mode: stats.mode,
+          modeOctal: (stats.mode & 0o7777).toString(8).padStart(4, "0"),
+          uid: stats.uid,
+          gid: stats.gid,
+          mtime: stats.mtime,
+          atime: stats.atime,
+          isFile: stats.isFile(),
+          isDirectory: stats.isDirectory(),
+          isSymbolicLink: stats.isSymbolicLink(),
+        });
+      });
+    });
+  } finally {
+    sftp.end();
+  }
+}
+
+// Single-shot path removal. Stats first to dispatch to unlink (files / symlinks) vs rmdir
+// (empty dirs) -- both give better error messages than blind try-unlink-fallback-rmdir,
+// and a directory delete on a non-empty dir fails clearly with ENOTEMPTY rather than the
+// generic "Failure" that SFTP returns when unlink hits a directory.
+//
+// Recursive delete is intentionally NOT supported here. Agents that want it should call
+// `ssh_exec rm -rf <path>` explicitly so the destructive intent is visible in the tool
+// trace, not hidden behind a flag on a "delete" tool.
+export async function deleteFile(client: Client, remotePath: string): Promise<void> {
+  const sftp = await getSftp(client);
+  try {
+    const stats = await new Promise<{ isDirectory: () => boolean }>((resolve, reject) => {
+      sftp.stat(remotePath, (err, stats) => {
+        if (err) return reject(err);
+        resolve(stats);
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      const done = (err: Error | null | undefined) => (err ? reject(err) : resolve());
+      if (stats.isDirectory()) {
+        sftp.rmdir(remotePath, done);
+      } else {
+        sftp.unlink(remotePath, done);
+      }
+    });
+  } finally {
+    sftp.end();
+  }
+}
+
+// Create a directory via SFTP. With recursive=true, walks the path and creates each
+// missing segment in order -- SFTP has no native `mkdir -p` equivalent. Existing
+// intermediate dirs are tolerated; existing leaf is still an error (matches mkdir -p
+// semantics for the deepest segment).
+export async function makeDir(client: Client, remotePath: string, recursive = false): Promise<void> {
+  const sftp = await getSftp(client);
+  try {
+    const mkOne = (path: string) =>
+      new Promise<void>((resolve, reject) => {
+        sftp.mkdir(path, (err) => (err ? reject(err) : resolve()));
+      });
+
+    if (!recursive) {
+      await mkOne(remotePath);
+      return;
+    }
+
+    // Normalize and walk segments. POSIX absolute paths start with /, agents may also pass
+    // home-relative paths -- we don't expand ~ here; ssh_exec'd shell handles that.
+    const isAbsolute = remotePath.startsWith("/");
+    const parts = remotePath.split("/").filter(Boolean);
+    let cur = isAbsolute ? "" : ".";
+    for (let i = 0; i < parts.length; i++) {
+      cur = isAbsolute ? `${cur}/${parts[i]}` : `${cur}/${parts[i]}`;
+      const isLeaf = i === parts.length - 1;
+      try {
+        await mkOne(cur);
+      } catch (e: unknown) {
+        // SFTP returns a generic "Failure" string when a dir already exists. Tolerate it
+        // for intermediate segments; surface it for the leaf so `mkdir -p` on an existing
+        // leaf still errors (matches POSIX `mkdir -p` -- which doesn't error -- only if
+        // the leaf is also a dir; on file collision it does. We can't distinguish cheaply
+        // without re-stating, so we err on the side of surfacing it).
+        if (isLeaf) throw e;
+        // Intermediate segment -- swallow and continue.
+      }
+    }
+  } finally {
+    sftp.end();
+  }
+}

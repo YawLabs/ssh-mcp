@@ -2,10 +2,10 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { diagnose } from "./diagnose.js";
 import { checkGitSsh, configLookup, ensureAgent, fixKnownHosts, listSshKeys, loadKey, testConnection } from "./env.js";
-import { find, multiExec, serviceStatus, tail } from "./ops.js";
+import { find, multiExec, serviceStatus, shellQuote, tail } from "./ops.js";
 import { enforcePolicy } from "./policy.js";
 import { ConnectionPool } from "./pool.js";
-import { downloadFile, exec, listDir, readFile, uploadFile, writeFile } from "./ssh.js";
+import { deleteFile, downloadFile, exec, listDir, makeDir, readFile, statFile, uploadFile, writeFile } from "./ssh.js";
 
 const HostSchema = z.string().describe("SSH hostname or IP address");
 const PortSchema = z.number().int().min(1).max(65535).optional().describe("SSH port (default: 22)");
@@ -37,18 +37,35 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_exec",
-    "Execute a command on a remote host via SSH. The command is interpreted by the remote login shell — pipes, redirects, globs, and other shell metacharacters work as expected. Returns stdout, stderr, and exit code. Subject to SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST if configured.",
+    "Execute a command on a remote host via SSH. The command is interpreted by the remote login shell — pipes, redirects, globs, and other shell metacharacters work as expected. Returns stdout, stderr, and exit code. Use `env` to set environment variables for this call without modifying the command string. Subject to SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST if configured (policy is checked against the env-prefixed command).",
     {
       ...connectionParams,
       command: z
         .string()
         .describe("Shell command to execute on the remote host (interpreted by the remote login shell)"),
+      env: z
+        .record(z.string(), z.string())
+        .optional()
+        .describe(
+          "Environment variables to set for this command. Injected as a `KEY='value' ...` prefix; works on any sshd regardless of AcceptEnv config. Values are POSIX-single-quoted, so any byte is safe.",
+        ),
       timeout: TimeoutSchema,
     },
-    async ({ command, timeout, ...conn }) => {
-      enforcePolicy(command);
+    async ({ command, env, timeout, ...conn }) => {
+      // Prefix env vars as `KEY='value' KEY2='value2' command`. Works on any sshd, unlike
+      // ssh2's protocol-level env which most servers reject via AcceptEnv. The single-quote
+      // wrapping (shellQuote) is the same primitive ops.ts uses for path injection guards,
+      // so any byte sequence is safe.
+      let finalCommand = command;
+      if (env && Object.keys(env).length > 0) {
+        const prefix = Object.entries(env)
+          .map(([k, v]) => `${k}=${shellQuote(v)}`)
+          .join(" ");
+        finalCommand = `${prefix} ${command}`;
+      }
+      enforcePolicy(finalCommand);
       return connectionPool.withConnection(conn, async (client) => {
-        const result = await exec(client, command, timeout || 30000);
+        const result = await exec(client, finalCommand, timeout || 30000);
         const parts: string[] = [];
         if (result.stdout) parts.push(result.stdout);
         if (result.stderr) parts.push(`[stderr]\n${result.stderr}`);
@@ -135,6 +152,69 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       return connectionPool.withConnection(conn, async (client) => {
         const files = await listDir(client, path);
         return { content: [{ type: "text", text: files.join("\n") }] };
+      });
+    },
+  );
+
+  server.tool(
+    "ssh_stat",
+    "Get metadata for a file or directory on a remote host via SFTP. Returns size, permissions (octal), uid/gid, mtime/atime, and type flags (isFile, isDirectory, isSymbolicLink). Use this instead of parsing `ls -la` output.",
+    {
+      ...connectionParams,
+      path: z.string().describe("Absolute path to the remote file or directory"),
+    },
+    async ({ path, ...conn }) => {
+      return connectionPool.withConnection(conn, async (client) => {
+        const stats = await statFile(client, path);
+        const lines: string[] = [];
+        const kind = stats.isDirectory
+          ? "directory"
+          : stats.isSymbolicLink
+            ? "symlink"
+            : stats.isFile
+              ? "file"
+              : "other";
+        lines.push(`${path}: ${kind}`);
+        lines.push(`  Size: ${stats.size} bytes`);
+        lines.push(`  Mode: ${stats.modeOctal}`);
+        lines.push(`  Owner: uid=${stats.uid} gid=${stats.gid}`);
+        lines.push(`  Modified: ${new Date(stats.mtime * 1000).toISOString()}`);
+        lines.push(`  Accessed: ${new Date(stats.atime * 1000).toISOString()}`);
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      });
+    },
+  );
+
+  server.tool(
+    "ssh_mkdir",
+    "Create a directory on a remote host via SFTP. Set `recursive: true` to create parent directories as needed (like `mkdir -p`). Existing intermediate dirs are tolerated; an existing leaf path is still an error.",
+    {
+      ...connectionParams,
+      path: z.string().describe("Absolute path of the directory to create"),
+      recursive: z
+        .boolean()
+        .optional()
+        .describe("Create parent directories as needed (default: false). Like `mkdir -p`."),
+    },
+    async ({ path, recursive, ...conn }) => {
+      return connectionPool.withConnection(conn, async (client) => {
+        await makeDir(client, path, recursive ?? false);
+        return { content: [{ type: "text", text: `Created directory ${path}` }] };
+      });
+    },
+  );
+
+  server.tool(
+    "ssh_delete",
+    "Delete a file or empty directory on a remote host via SFTP. Auto-detects the path type and calls the right SFTP op (unlink for files/symlinks, rmdir for empty dirs). Recursive directory delete is intentionally NOT supported -- for that, use ssh_exec with `rm -rf` explicitly so the destructive intent is visible in the tool trace.",
+    {
+      ...connectionParams,
+      path: z.string().describe("Absolute path of the file or empty directory to delete"),
+    },
+    async ({ path, ...conn }) => {
+      return connectionPool.withConnection(conn, async (client) => {
+        await deleteFile(client, path);
+        return { content: [{ type: "text", text: `Deleted ${path}` }] };
       });
     },
   );
