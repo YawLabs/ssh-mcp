@@ -28,20 +28,37 @@ This happens across every situation that needs SSH keys:
 
 ## Quick start
 
-```bash
-npm install -g @yawlabs/ssh-mcp
-```
-
 Add to your MCP client config:
 
 ```json
 {
   "mcpServers": {
     "ssh": {
-      "command": "ssh-mcp"
+      "command": "npx",
+      "args": ["-y", "@yawlabs/ssh-mcp@latest"]
     }
   }
 }
+```
+
+On Windows wrap with `cmd /c` since Node 20+ can't spawn `.cmd` files directly:
+
+```json
+{
+  "mcpServers": {
+    "ssh": {
+      "command": "cmd",
+      "args": ["/c", "npx", "-y", "@yawlabs/ssh-mcp@latest"]
+    }
+  }
+}
+```
+
+The `@latest` tag makes `npx` re-resolve against the registry on every spawn, so each MCP session uses the newest published version. Or install globally if you'd rather pin (no auto-update):
+
+```bash
+npm install -g @yawlabs/ssh-mcp
+# then in client config: "command": "ssh-mcp"
 ```
 
 ## Tools
