@@ -15,13 +15,27 @@ export interface DiagnosticReport {
 }
 
 // Validate hostname to prevent shell injection — only allow safe characters
+//
+// NOTE on duplicate config parsing: `checkSshConfig` below parses `~/.ssh/config`
+// directly (regex) for the read-only diagnostic, while `resolveConfig` in ssh.ts
+// delegates to `ssh -G` to get the resolved effective settings. The two paths
+// answer different questions (raw text dump vs. resolved values with Match/
+// Include/host-pattern expansion), so unifying them is deferred. If a new SSH
+// config directive is added, both parsers need updating independently.
 export function isValidHostname(host: string): boolean {
   if (host.length === 0 || host.length > 253) return false;
   // IPv6 in brackets: [::1], [2001:db8::1]
   if (host.startsWith("[")) {
     return /^\[[0-9a-fA-F:]+\]$/.test(host);
   }
-  // Standard hostname, IPv4, or SSH config alias (alphanumeric, dots, hyphens, underscores)
+  // Reject a leading '-' so a host like "-oProxyCommand=evil" or "-E" can't be
+  // smuggled in as a flag where it reaches ssh / ssh-keygen positionally (those
+  // calls can't all be guarded with `--` -- e.g. `ssh-keygen -F <host>` takes the
+  // host as the value of -F). Internal hyphens (my-server) stay valid.
+  if (host.startsWith("-")) return false;
+  // Standard hostname, IPv4, or SSH config alias (alphanumeric, dots, hyphens, underscores).
+  // Underscore is allowed even though DNS labels technically forbid it, because SSH config
+  // aliases commonly use it (e.g. "my_server") and rejecting them would surprise users.
   return /^[a-zA-Z0-9._-]+$/.test(host);
 }
 
@@ -182,6 +196,7 @@ export function checkConnectivity(host: string, port = 22): DiagnosticResult {
     "StrictHostKeyChecking=no",
     "-p",
     String(port),
+    "--",
     host,
     "echo",
     "SSH_OK",

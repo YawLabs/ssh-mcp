@@ -132,11 +132,20 @@ info "All checks passed"
 # Step 2: Bump version
 step 2 "Bump version to $VERSION"
 
+# Re-read CURRENT_VERSION from disk here, not the value captured at script-start:
+# `npm version` below mutates package.json, and a stale cached value would make
+# the skip-logic here disagree with the file's actual state on a resume run.
+# Matches the discipline in mcp-hosting's release.sh (dafdc9f).
+CURRENT_VERSION=$(node -p "require('./package.json').version")
+
 if [ "$CURRENT_VERSION" = "$VERSION" ]; then
   info "Already at v${VERSION} -- skipping"
 else
   npm version "$VERSION" --no-git-tag-version
   info "package.json updated"
+  # Reflect the post-bump value so the display below ("v${VERSION} released")
+  # and any later steps that consult CURRENT_VERSION see the truth on disk.
+  CURRENT_VERSION="$VERSION"
 fi
 
 # server.json is published to the MCP Registry in step 7 and must match the
