@@ -159,7 +159,13 @@ export async function serviceStatus(client: Client, serviceName: string, timeout
   const raw = result.stdout;
 
   const activeMatch = raw.match(/Active:\s+(\S+)\s+\(([^)]+)\)/);
-  const descMatch = raw.match(/^\s+.*?-\s+(.+)$/m);
+  // systemctl puts the description on the UNINDENTED header line, e.g.
+  // "* nginx.service - A high performance web server" (optionally led by a status
+  // bullet). Match an optional bullet/leading non-word run, the unit token, " - ",
+  // then the description. The old /^\s+/ anchor required leading whitespace and so
+  // never matched the header (the indented lines below it have no " - " separator),
+  // leaving description permanently undefined.
+  const descMatch = raw.match(/^[^\w\n]*\S+\s+-\s+(.+)$/m);
   const pidMatch = raw.match(/Main PID:\s+(\d+)/);
   const sinceMatch = raw.match(/since\s+(.+?);/);
 

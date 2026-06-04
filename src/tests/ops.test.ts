@@ -152,6 +152,7 @@ describe("serviceStatus unknown vs inactive", () => {
     expect(status.unknown).toBe(false);
     expect(status.active).toBe(false);
     expect(status.status).toContain("inactive");
+    expect(status.description).toBe("A high performance web server");
   });
 
   it("marks unknown=false for an active service", async () => {
@@ -168,6 +169,7 @@ describe("serviceStatus unknown vs inactive", () => {
     expect(status.unknown).toBe(false);
     expect(status.active).toBe(true);
     expect(status.pid).toBe(1234);
+    expect(status.description).toBe("A high performance web server");
   });
 });
 

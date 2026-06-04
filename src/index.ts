@@ -32,6 +32,18 @@ async function main() {
   process.on("SIGTERM", () => {
     shutdown().catch(() => process.exit(1));
   });
+  // SIGINT/SIGTERM aren't the only way this server dies -- a stdio MCP server
+  // normally exits via stdin-EOF / pipe-close, which fires neither signal and so
+  // never runs shutdown(). Without a backstop, an ssh-agent we spawned ourselves
+  // (env.ts ensureAgent) is orphaned. process.on("exit") fires on every normal
+  // termination, including the event loop draining after stdin EOF. The handler
+  // must be synchronous (the only contract 'exit' allows); drain() and
+  // killStartedAgent() are both idempotent, so re-running after a signal-driven
+  // shutdown is harmless.
+  process.on("exit", () => {
+    pool.drain();
+    killStartedAgent();
+  });
 
   await server.connect(transport);
 }

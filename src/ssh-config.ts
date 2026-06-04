@@ -13,7 +13,11 @@ export function parseSshConfigOutput(stdout: string): {
   const all: Record<string, string> = {};
   const identityFiles: string[] = [];
 
-  for (const line of stdout.split("\n")) {
+  // Split on CRLF or LF: Windows-native OpenSSH (ssh.exe) emits CRLF and runArgs
+  // only trims the whole blob, so a plain split("\n") leaves a trailing \r on every
+  // value -- corrupting identityfile paths (readFileSync then fails) and the
+  // resolved hostname (poisons the pool key and the SNI host).
+  for (const line of stdout.split(/\r?\n/)) {
     const spaceIdx = line.indexOf(" ");
     if (spaceIdx > 0) {
       const key = line.substring(0, spaceIdx);

@@ -109,6 +109,32 @@ function buildHostVerifier(hosts: ReadonlyArray<string>, port: number | undefine
   };
 }
 
+// Heuristic: is this private-key file passphrase-encrypted? An encrypted key is
+// useless in a non-interactive ssh2 connect (it errors with "no passphrase given"),
+// so we must not fold one in as an agent fallback -- the common setup is an encrypted
+// key on disk with its decrypted copy held in the agent. Detects the classic PEM
+// markers (Proc-Type/DEK-Info, PKCS#8 "BEGIN ENCRYPTED PRIVATE KEY") and reads the
+// ciphername field of the OpenSSH new format ("none" => unencrypted).
+function isEncryptedKey(content: Buffer): boolean {
+  const text = content.toString("utf8");
+  if (text.includes("ENCRYPTED")) return true;
+  const m = text.match(/-----BEGIN OPENSSH PRIVATE KEY-----([\s\S]+?)-----END/);
+  if (m) {
+    try {
+      const raw = Buffer.from(m[1].replace(/\s+/g, ""), "base64");
+      const magic = "openssh-key-v1\0";
+      if (raw.toString("latin1", 0, magic.length) === magic) {
+        const cipherLen = raw.readUInt32BE(magic.length);
+        const cipher = raw.toString("latin1", magic.length + 4, magic.length + 4 + cipherLen);
+        return cipher !== "none";
+      }
+    } catch {
+      return true; // unparseable -> be conservative, don't fold it in
+    }
+  }
+  return false;
+}
+
 export function resolveConfig(config: SSHConfig): ResolvedConfig {
   // Resolve SSH config for the host (hostname aliases, user, port, identity files, proxy)
   const sshConfig = resolveFromSshConfig(config.host);
@@ -148,20 +174,34 @@ export function resolveConfig(config: SSHConfig): ResolvedConfig {
       (process.platform === "win32" ? "\\\\.\\pipe\\openssh-ssh-agent" : undefined);
     if (agentSock) {
       connectConfig.agent = agentSock;
-    } else {
-      const home = homedir();
-      const keyPaths =
-        sshConfig && sshConfig.identityFiles.length > 0
-          ? sshConfig.identityFiles.map((p) => (p.startsWith("~") ? join(home, p.slice(1)) : p))
-          : [join(home, ".ssh", "id_ed25519"), join(home, ".ssh", "id_rsa"), join(home, ".ssh", "id_ecdsa")];
+    }
 
-      for (const keyPath of keyPaths) {
-        try {
-          connectConfig.privateKey = readFileSync(keyPath);
-          break;
-        } catch {
-          // Key doesn't exist, try next
-        }
+    // Also load an on-disk key (SSH config identity files, else the default key
+    // paths) so the documented "agent > config identity > default keys" chain stays
+    // reachable. Previously the agent branch short-circuited this entirely -- and
+    // because the Windows named-pipe default above is always truthy, the
+    // identity-file/default-key steps were dead on Windows whenever the OpenSSH
+    // agent service was up, even with no usable key loaded in it. ssh2 offers BOTH
+    // the agent keys and this privateKey, matching OpenSSH's client behavior. When
+    // an agent is configured we only fold in an UNENCRYPTED key: an encrypted key
+    // would make ssh2 error on parse ("no passphrase given") and break the common
+    // setup of an encrypted key on disk with its decrypted copy held in the agent.
+    // With no agent we keep the prior behavior (load the first existing key
+    // regardless; ssh2 surfaces the passphrase error itself).
+    const home = homedir();
+    const keyPaths =
+      sshConfig && sshConfig.identityFiles.length > 0
+        ? sshConfig.identityFiles.map((p) => (p.startsWith("~") ? join(home, p.slice(1)) : p))
+        : [join(home, ".ssh", "id_ed25519"), join(home, ".ssh", "id_rsa"), join(home, ".ssh", "id_ecdsa")];
+
+    for (const keyPath of keyPaths) {
+      try {
+        const keyData = readFileSync(keyPath);
+        if (agentSock && isEncryptedKey(keyData)) continue;
+        connectConfig.privateKey = keyData;
+        break;
+      } catch {
+        // Key doesn't exist, try next
       }
     }
   }

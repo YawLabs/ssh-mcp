@@ -40,6 +40,16 @@ describe("isValidHostname", () => {
     expect(isValidHostname("")).toBe(false);
   });
 
+  it("rejects hostnames starting with a dash (flag/option injection)", () => {
+    // A leading '-' would otherwise reach ssh / ssh-keygen positionally and be
+    // parsed as a flag (e.g. -E logfile, -oProxyCommand=...).
+    expect(isValidHostname("-E")).toBe(false);
+    expect(isValidHostname("-rf")).toBe(false);
+    expect(isValidHostname("-oProxyCommand=evil")).toBe(false);
+    // Internal hyphens remain valid.
+    expect(isValidHostname("my-server")).toBe(true);
+  });
+
   it("rejects hostnames over 253 chars", () => {
     expect(isValidHostname("a".repeat(254))).toBe(false);
   });

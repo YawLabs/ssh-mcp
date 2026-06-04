@@ -128,6 +128,38 @@ describe("ConnectionPool — concurrent acquire dedup", () => {
     }
   });
 
+  it("does NOT share a pooled connection across differing credentials", async () => {
+    // Same host:user:port, different password -> distinct auth fingerprint -> distinct
+    // pool key. Without the auth fingerprint in the key the second caller would silently
+    // reuse the first's authenticated connection and ignore its own credential.
+    const pool = new ConnectionPool();
+    try {
+      const a = await pool.acquire({ host: "auth-diff.example.com", password: "pw-a" });
+      const b = await pool.acquire({ host: "auth-diff.example.com", password: "pw-b" });
+      expect(a).not.toBe(b);
+      expect(mockedConnect).toHaveBeenCalledTimes(2);
+      expect(pool.size).toBe(2);
+      pool.release(a);
+      pool.release(b);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("DOES reuse a pooled connection for identical credentials", async () => {
+    const pool = new ConnectionPool();
+    try {
+      const a = await pool.acquire({ host: "auth-same.example.com", password: "pw" });
+      pool.release(a); // goes idle, stays in the pool
+      const b = await pool.acquire({ host: "auth-same.example.com", password: "pw" });
+      expect(a).toBe(b);
+      expect(mockedConnect).toHaveBeenCalledTimes(1);
+      pool.release(b);
+    } finally {
+      pool.drain();
+    }
+  });
+
   it("retries a fresh connect after a prior connection dies", async () => {
     const pool = new ConnectionPool();
     try {

@@ -458,6 +458,7 @@ export function testConnection(host: string, port = 22): { status: "ok" | "warni
     "StrictHostKeyChecking=no",
     "-p",
     String(port),
+    "--",
     host,
     "echo",
     "SSH_OK",

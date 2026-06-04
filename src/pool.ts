@@ -1,4 +1,5 @@
-import type { Client } from "ssh2";
+import { createHash } from "node:crypto";
+import type { Client, ConnectConfig } from "ssh2";
 import { connectWithProxy, formatDiagnostics, resolveConfig, type SSHConfig } from "./ssh.js";
 
 interface PoolEntry {
@@ -29,6 +30,32 @@ function defaultMaxPoolSize(): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 100;
 }
 
+// Distinct credentials must not collide on one pooled connection. The pool keys on
+// username@host:port, but two calls to the same target that differ only in auth
+// (different key, password vs key, different password) would otherwise reuse the
+// first caller's authenticated connection and silently ignore the second's
+// credential. Fold a short fingerprint of the resolved auth material into the key
+// so they get distinct entries. Same effective credential -> same fingerprint ->
+// reuse still works.
+function authFingerprint(cc: ConnectConfig): string {
+  const h = createHash("sha256");
+  if (cc.privateKey) {
+    h.update("k");
+    h.update(cc.privateKey as Buffer | string);
+  }
+  if (cc.password !== undefined) {
+    h.update("p");
+    h.update(cc.password);
+  }
+  // ssh2 types `agent` as string | BaseAgent; resolveConfig only ever sets a string
+  // socket path, so fingerprint that and ignore the (unused) object form.
+  if (typeof cc.agent === "string") {
+    h.update("a");
+    h.update(cc.agent);
+  }
+  return h.digest("hex").slice(0, 16);
+}
+
 export class ConnectionPool {
   private entries = new Map<string, PoolEntry>();
   // Coalesces concurrent connect attempts for the same key so we don't open N
@@ -52,7 +79,7 @@ export class ConnectionPool {
   async acquire(config: SSHConfig): Promise<Client> {
     const resolved = resolveConfig(config);
     const cc = resolved.connectConfig;
-    const key = `${cc.username}@${cc.host}:${cc.port}`;
+    const key = `${cc.username}@${cc.host}:${cc.port}#${authFingerprint(cc)}`;
 
     // Bound the dead-race retry loop. In practice the loop exits on the first
     // iteration; the retry only fires when a connection dies between the time
