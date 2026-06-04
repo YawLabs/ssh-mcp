@@ -83,7 +83,13 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
     "Read a file from a remote host via SFTP.",
     {
       ...connectionParams,
-      path: z.string().describe("Absolute path to the remote file"),
+      path: z
+        .string()
+        .refine((p) => p.startsWith("/"), {
+          message:
+            "Path must be absolute (start with /). Relative paths resolve against the remote user's CWD, which is rarely what you want.",
+        })
+        .describe("Absolute path to the remote file. Must start with /."),
     },
     async ({ path, ...conn }) => {
       return connectionPool.withConnection(conn, async (client) => {
