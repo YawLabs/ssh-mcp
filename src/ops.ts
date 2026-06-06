@@ -68,7 +68,10 @@ export interface FindOptions {
   newer?: string;
 }
 
-const VALID_FIND_SIZE = /^\d+[kMGTP]?$/;
+// POSIX find -size units: c=bytes, w=2-byte words, b=512-byte blocks (default),
+// k=kibibytes, M=mebibytes, G=gibibytes. T and P are not in POSIX and are
+// rejected by most find implementations (GNU findutils, BSD find).
+const VALID_FIND_SIZE = /^\d+[cwbkMG]?$/;
 
 export async function find(client: Client, options: FindOptions, timeoutMs = 30000): Promise<string[]> {
   if (options.minsize && !VALID_FIND_SIZE.test(options.minsize)) {
