@@ -8,6 +8,16 @@ import { ConnectionPool } from "./pool.js";
 import { deleteFile, downloadFile, exec, listDir, makeDir, readFile, statFile, uploadFile, writeFile } from "./ssh.js";
 
 const HostSchema = z.string().describe("SSH hostname or IP address");
+
+// Shared refine for SFTP remote paths. SFTP does not expand ~ or resolve
+// relative paths through a shell — they land on the server verbatim, relative
+// to the SFTP CWD (usually the user's home dir). Absolute paths are unambiguous;
+// ~ paths cause ENOENT on most servers. Matches the enforcement already on
+// ssh_read_file. ssh_mkdir is intentionally excluded: its makeDir implementation
+// supports relative paths from CWD and is the only SFTP tool that documents this.
+const AbsoluteRemotePathSchema = z.string().refine((p) => p.startsWith("/"), {
+  message: "Path must be absolute (start with /). SFTP does not expand ~ or resolve relative paths through a shell.",
+});
 const PortSchema = z.number().int().min(1).max(65535).optional().describe("SSH port (default: 22)");
 const UsernameSchema = z.string().optional().describe("SSH username (default: current user)");
 const KeyPathSchema = z.string().optional().describe("Path to SSH private key");
@@ -104,7 +114,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
     "Write content to a file on a remote host via SFTP. Creates or overwrites the file.",
     {
       ...connectionParams,
-      path: z.string().describe("Absolute path to the remote file"),
+      path: AbsoluteRemotePathSchema.describe("Absolute path to the remote file. Must start with /."),
       content: z.string().describe("File content to write"),
     },
     async ({ path, content, ...conn }) => {
@@ -121,7 +131,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
     {
       ...connectionParams,
       localPath: z.string().describe("Path to the local file to upload"),
-      remotePath: z.string().describe("Absolute path on the remote host"),
+      remotePath: AbsoluteRemotePathSchema.describe("Absolute path on the remote host. Must start with /."),
     },
     async ({ localPath, remotePath, ...conn }) => {
       return connectionPool.withConnection(conn, async (client) => {
@@ -136,7 +146,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
     "Download a file from a remote host to local filesystem via SFTP.",
     {
       ...connectionParams,
-      remotePath: z.string().describe("Absolute path to the remote file"),
+      remotePath: AbsoluteRemotePathSchema.describe("Absolute path to the remote file. Must start with /."),
       localPath: z.string().describe("Local path to save the downloaded file"),
     },
     async ({ remotePath, localPath, ...conn }) => {
@@ -152,7 +162,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
     "List files in a directory on a remote host via SFTP.",
     {
       ...connectionParams,
-      path: z.string().describe("Absolute path to the remote directory"),
+      path: AbsoluteRemotePathSchema.describe("Absolute path to the remote directory. Must start with /."),
     },
     async ({ path, ...conn }) => {
       return connectionPool.withConnection(conn, async (client) => {
@@ -167,7 +177,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
     "Get metadata for a file or directory on a remote host via SFTP. Returns size, permissions (octal), uid/gid, mtime/atime, and type flags (isFile, isDirectory, isSymbolicLink). Use this instead of parsing `ls -la` output.",
     {
       ...connectionParams,
-      path: z.string().describe("Absolute path to the remote file or directory"),
+      path: AbsoluteRemotePathSchema.describe("Absolute path to the remote file or directory. Must start with /."),
     },
     async ({ path, ...conn }) => {
       return connectionPool.withConnection(conn, async (client) => {
@@ -215,7 +225,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
     "Delete a file or empty directory on a remote host via SFTP. Auto-detects the path type and calls the right SFTP op (unlink for files/symlinks, rmdir for empty dirs). Recursive directory delete is intentionally NOT supported -- for that, use ssh_exec with `rm -rf` explicitly so the destructive intent is visible in the tool trace.",
     {
       ...connectionParams,
-      path: z.string().describe("Absolute path of the file or empty directory to delete"),
+      path: AbsoluteRemotePathSchema.describe("Absolute path of the file or empty directory to delete. Must start with /."),
     },
     async ({ path, ...conn }) => {
       return connectionPool.withConnection(conn, async (client) => {
