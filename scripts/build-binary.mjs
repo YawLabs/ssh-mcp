@@ -80,10 +80,13 @@ await esbuild.build({
   // the __VERSION__ define; this is the safety net for everything else.
   banner: { js: "const __seaImportMetaUrl = require('node:url').pathToFileURL(__filename).href;" },
   define: { __VERSION__: JSON.stringify(version), 'import.meta.url': '__seaImportMetaUrl' },
-  // Optional native addons some servers pull transitively (ssh2 -> cpu-features)
-  // are require()'d inside try/catch; mark them external so esbuild doesn't
-  // choke on the .node binary -- they degrade gracefully when absent.
-  external: ['cpu-features'],
+  // Optional native addons some servers pull transitively (ssh2 -> cpu-features
+  // + its own sshcrypto.node) are require()'d inside try/catch. Externalize the
+  // package AND any direct .node import so esbuild doesn't choke on the binary;
+  // absent in the SEA, the try/catch falls back to pure JS. (These addons build
+  // on some CI runners but not others, so the .node may be absent locally and
+  // present in CI -- externalizing covers both.)
+  external: ['cpu-features', '*.node'],
   outfile: bundlePath,
 });
 console.log(`bundle: ${fmtSize(bundlePath)}`);
