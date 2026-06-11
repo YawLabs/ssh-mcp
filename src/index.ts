@@ -1,7 +1,14 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { killStartedAgent } from "./env.js";
 import { ConnectionPool } from "./pool.js";
-import { createServer } from "./server.js";
+import { createServer, version } from "./server.js";
+
+// Handle --version BEFORE main() (which connects stdio and blocks forever) so
+// the single-binary smoke test in release.yml can verify the binary.
+if (process.argv[2] === "--version" || process.argv[2] === "version") {
+  console.log(version);
+  process.exit(0);
+}
 
 async function main() {
   const pool = new ConnectionPool();
