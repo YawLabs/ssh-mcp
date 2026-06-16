@@ -55,9 +55,13 @@
     "@biomejs/biome": "^2.4.15",
     "@types/node": "^25.7.0",
     "@types/ssh2": "^1.15.5",
+    "esbuild": "^0.28.1",
     "postject": "^1.0.0-alpha.6",
     "tsup": "^8.5.1",
     "typescript": "^6.0.3",
     "vitest": "^4.1.6"
+  },
+  "overrides": {
+    "esbuild": "^0.28.1"
   }
 }
