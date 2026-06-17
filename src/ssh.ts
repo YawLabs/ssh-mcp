@@ -163,8 +163,12 @@ export function resolveConfig(config: SSHConfig): ResolvedConfig {
   // predictable way to force a specific auth method.
   //
   //   explicit key > explicit password > agent > SSH config identity > default key paths
+  const home = homedir();
   if (config.privateKeyPath) {
-    connectConfig.privateKey = readFileSync(config.privateKeyPath);
+    const keyPath = config.privateKeyPath.startsWith("~")
+      ? join(home, config.privateKeyPath.slice(1))
+      : config.privateKeyPath;
+    connectConfig.privateKey = readFileSync(keyPath);
   } else if (config.password) {
     connectConfig.password = config.password;
   } else {
@@ -188,7 +192,6 @@ export function resolveConfig(config: SSHConfig): ResolvedConfig {
     // setup of an encrypted key on disk with its decrypted copy held in the agent.
     // With no agent we keep the prior behavior (load the first existing key
     // regardless; ssh2 surfaces the passphrase error itself).
-    const home = homedir();
     const keyPaths =
       sshConfig && sshConfig.identityFiles.length > 0
         ? sshConfig.identityFiles.map((p) => (p.startsWith("~") ? join(home, p.slice(1)) : p))
