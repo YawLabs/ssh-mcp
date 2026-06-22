@@ -68,7 +68,8 @@ describe("find input validation", () => {
       exec: (_cmd: string, cb: (err: Error) => void) => cb(new Error("not connected")),
     } as any;
 
-    const validSizes = ["1k", "100M", "5G", "2T", "10P", "1024"];
+    // POSIX find units: c (bytes), w (words), b (blocks), k, M, G. No unit = b.
+    const validSizes = ["1k", "100M", "5G", "1000c", "512b", "4w", "1024"];
     for (const size of validSizes) {
       // Should reject with SSH error, not validation error
       await expect(find(fakeClient, { path: "/tmp", minsize: size })).rejects.not.toThrow("Invalid minsize format");
