@@ -278,9 +278,9 @@ export function checkSshConfig(host: string): DiagnosticResult {
         if (inHostBlock) hostConfig.push(trimmed);
       } else if (inHostBlock && trimmed) {
         hostConfig.push(trimmed);
-      } else if (inHostBlock && !trimmed) {
-        inHostBlock = false;
       }
+      // Empty lines within a Host block are valid SSH config syntax and must
+      // not end the block. The next `Host` line resets inHostBlock correctly.
     }
 
     if (hostConfig.length === 0) {
