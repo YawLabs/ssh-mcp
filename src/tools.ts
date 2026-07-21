@@ -225,7 +225,9 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
     "Delete a file or empty directory on a remote host via SFTP. Auto-detects the path type and calls the right SFTP op (unlink for files/symlinks, rmdir for empty dirs). Recursive directory delete is intentionally NOT supported -- for that, use ssh_exec with `rm -rf` explicitly so the destructive intent is visible in the tool trace.",
     {
       ...connectionParams,
-      path: AbsoluteRemotePathSchema.describe("Absolute path of the file or empty directory to delete. Must start with /."),
+      path: AbsoluteRemotePathSchema.describe(
+        "Absolute path of the file or empty directory to delete. Must start with /.",
+      ),
     },
     async ({ path, ...conn }) => {
       return connectionPool.withConnection(conn, async (client) => {

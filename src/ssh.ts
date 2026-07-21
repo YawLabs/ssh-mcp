@@ -47,7 +47,28 @@ export interface ResolvedConfig {
   proxyJump?: string;
 }
 
+// `ssh -G <host>` is a synchronous subprocess spawn costing ~0.3-0.9s (worst on
+// Windows). resolveConfig() runs on EVERY pool acquire, including hits on an
+// already-warm pooled connection, so without this memo N concurrent acquires of
+// one host pay N spawns for an answer that cannot differ between them. Cached
+// for process lifetime: ssh_config is read at startup-ish cadence and a running
+// server is expected to be restarted after config edits.
+const sshConfigCache = new Map<string, SshConfigResult | null>();
+
+/** Test-only: drop memoized `ssh -G` results so a suite can vary ssh_config. */
+export function clearSshConfigCache(): void {
+  sshConfigCache.clear();
+}
+
 function resolveFromSshConfig(host: string): SshConfigResult | null {
+  const cached = sshConfigCache.get(host);
+  if (cached !== undefined) return cached;
+  const result = resolveFromSshConfigUncached(host);
+  sshConfigCache.set(host, result);
+  return result;
+}
+
+function resolveFromSshConfigUncached(host: string): SshConfigResult | null {
   try {
     const { stdout, ok } = runArgs("ssh", ["-G", host]);
     if (!ok) return null;

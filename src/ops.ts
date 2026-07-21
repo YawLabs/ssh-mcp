@@ -68,20 +68,22 @@ export interface FindOptions {
   newer?: string;
 }
 
-// POSIX find -size units: c=bytes, w=2-byte words, b=512-byte blocks (default),
-// k=kibibytes, M=mebibytes, G=gibibytes. T and P are not in POSIX and are
-// rejected by most find implementations (GNU findutils, BSD find).
+// GNU findutils -size units: c=bytes, w=2-byte words, b=512-byte blocks
+// (default), k=kibibytes, M=mebibytes, G=gibibytes. BSD/macOS find also accepts
+// T and P, but GNU does not, so we allow only the intersection-safe GNU set --
+// a remote host's find implementation is not known ahead of time.
+// Keep the operator-facing strings below in sync with this character class.
 const VALID_FIND_SIZE = /^\d+[cwbkMG]?$/;
 
 export async function find(client: Client, options: FindOptions, timeoutMs = 30000): Promise<string[]> {
   if (options.minsize && !VALID_FIND_SIZE.test(options.minsize)) {
     throw new Error(
-      `Invalid minsize format: "${options.minsize}". Expected: digits followed by optional k/M/G/T/P (e.g. "1M", "100k")`,
+      `Invalid minsize format: "${options.minsize}". Expected: digits followed by optional c/w/b/k/M/G (e.g. "1M", "100k")`,
     );
   }
   if (options.maxsize && !VALID_FIND_SIZE.test(options.maxsize)) {
     throw new Error(
-      `Invalid maxsize format: "${options.maxsize}". Expected: digits followed by optional k/M/G/T/P (e.g. "10M", "500k")`,
+      `Invalid maxsize format: "${options.maxsize}". Expected: digits followed by optional c/w/b/k/M/G (e.g. "10M", "500k")`,
     );
   }
 

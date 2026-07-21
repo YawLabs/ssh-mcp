@@ -15,9 +15,11 @@ declare const __VERSION__: string;
 export const version =
   typeof __VERSION__ !== "undefined"
     ? __VERSION__
-    : (JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf8")) as {
-        version: string;
-      }).version;
+    : (
+        JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf8")) as {
+          version: string;
+        }
+      ).version;
 
 export function createServer(pool?: ConnectionPool): McpServer {
   const server = new McpServer({

@@ -1,7 +1,7 @@
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { registerTools } from "../tools.js";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 // Collect each tool's inputSchema so we can pull out individual field schemas.
 function collectTools() {
