@@ -526,10 +526,11 @@ export async function writeFile(client: Client, remotePath: string, content: str
 }
 
 export async function uploadFile(client: Client, localPath: string, remotePath: string): Promise<void> {
+  const resolvedLocal = localPath.startsWith("~") ? join(homedir(), localPath.slice(1)) : localPath;
   const sftp = await getSftp(client);
   try {
     await new Promise<void>((resolve, reject) => {
-      sftp.fastPut(localPath, remotePath, (err) => {
+      sftp.fastPut(resolvedLocal, remotePath, (err) => {
         if (err) return reject(err);
         resolve();
       });
@@ -540,10 +541,11 @@ export async function uploadFile(client: Client, localPath: string, remotePath: 
 }
 
 export async function downloadFile(client: Client, remotePath: string, localPath: string): Promise<void> {
+  const resolvedLocal = localPath.startsWith("~") ? join(homedir(), localPath.slice(1)) : localPath;
   const sftp = await getSftp(client);
   try {
     await new Promise<void>((resolve, reject) => {
-      sftp.fastGet(remotePath, localPath, (err) => {
+      sftp.fastGet(remotePath, resolvedLocal, (err) => {
         if (err) return reject(err);
         resolve();
       });
