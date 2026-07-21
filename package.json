@@ -58,7 +58,7 @@
     "esbuild": "^0.28.1",
     "postject": "^1.0.0-alpha.6",
     "tsup": "^8.5.1",
-    "typescript": "^6.0.3",
+    "typescript": "^7.0.2",
     "vitest": "^4.1.6"
   },
   "overrides": {
