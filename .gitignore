@@ -2,6 +2,7 @@ node_modules/
 dist/
 *.tgz
 .claude/settings.local.json
-bin/
+bin/*
+!bin/ssh-mcp.mjs
 build-tmp/
 dist-release/
