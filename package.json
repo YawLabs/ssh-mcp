@@ -5,7 +5,7 @@
   "description": "MCP server for SSH operations with built-in diagnostics",
   "type": "module",
   "bin": {
-    "ssh-mcp": "dist/index.js"
+    "ssh-mcp": "bin/ssh-mcp.mjs"
   },
   "exports": {
     ".": {
@@ -14,6 +14,7 @@
     }
   },
   "files": [
+    "bin/ssh-mcp.mjs",
     "dist",
     "LICENSE",
     "README.md"
