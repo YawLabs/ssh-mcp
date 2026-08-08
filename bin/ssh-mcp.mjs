@@ -22,6 +22,23 @@
  * For an MCP host config, point straight at oam and skip this file:
  *   { "command": "oam", "args": ["run", "<abs>/dist/index.js"] }
  *
+ * NO SANDBOX HERE -- DELIBERATELY
+ * The purpose of this server is to open outbound SSH to hosts the caller names
+ * at run time and run commands there, so the net and child-process grants would
+ * both have to be unrestricted, and key material plus known_hosts need the
+ * filesystem. Nothing meaningful is left to deny, so `--permission` is not
+ * wired up here.
+ *
+ * MINIMUM OAM VERSION
+ * 0.9.0. Below it `child_process.execFile` ran its arguments through a SHELL,
+ * `exec` accepted `timeout` and ignored it, `spawnSync` truncated at
+ * `maxBuffer` while reporting success, and `stdio: 'inherit'`/`'ignore'` both
+ * behaved as `'pipe'`. This server shells out to a CLI on its
+ * main paths, so those were reachable bugs rather than theoretical ones: an
+ * argument containing shell metacharacters was re-split and executed.
+ * An older oam is not an error: the launcher falls back to Node and says so on
+ * stderr. Pinning the floor here is what makes that fallback automatic.
+ *
  * SELECTION
  *   SSH_MCP_RUNTIME=oam    require oam; fail loudly if it is missing
  *   SSH_MCP_RUNTIME=node   never use oam
@@ -29,11 +46,14 @@
  *   OAM_BIN=/path/to/oam     explicit binary, checked before any discovery
  */
 
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { constants, homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
+
+/** Oldest oam whose `child_process` matches Node. See MINIMUM OAM VERSION above. */
+const OAM_MIN = [0, 9, 0];
 
 // Two forms, deliberately. `import()` on Windows REJECTS a bare `C:\...` path
 // with ERR_UNSUPPORTED_ESM_URL_SCHEME (it reads `c:` as a protocol), so the
@@ -83,6 +103,34 @@ function findOam() {
   return null;
 }
 
+/**
+ * `oam --version` -> [major, minor, patch], or null when it cannot be read.
+ * A pre-release suffix (0.9.0-rc.1) truncates to its base version.
+ */
+function oamVersion(cmd) {
+  try {
+    const out = execFileSync(cmd, ["--version"], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const m = /(\d+)\.(\d+)\.(\d+)/.exec(out);
+    return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+  } catch {
+    // Not executable, wrong arch, or deleted since the stat. Caller degrades.
+    return null;
+  }
+}
+
+/** True when `v` is at least `min`, comparing major/minor/patch in order. */
+function atLeast(v, min) {
+  if (!v) return false;
+  for (let i = 0; i < min.length; i++) {
+    if (v[i] > min[i]) return true;
+    if (v[i] < min[i]) return false;
+  }
+  return true;
+}
+
 /** Run the server in THIS process. The zero-overhead fallback. */
 async function runInProcess() {
   // A server may gate its bootstrap on being the process ENTRY POINT --
@@ -119,6 +167,25 @@ if (mode === "node") {
       );
       process.exit(1);
     }
+    await runInProcess();
+  } else if (!atLeast(oamVersion(oam), OAM_MIN)) {
+    // Discovery itself stays stat-only; this is the first subprocess, and it
+    // runs only once we have already decided to spawn oam anyway. Measured 26ms
+    // median (n=12, windows-arm64), paid once per MCP session.
+    const min = OAM_MIN.join(".");
+    if (mode === "oam") {
+      const { writeSync } = await import("node:fs");
+      writeSync(
+        2,
+        `ssh-mcp: SSH_MCP_RUNTIME=oam but ${oam} is older than oam ${min}.\n` +
+          `Run \`oam self-update\`, or use SSH_MCP_RUNTIME=node.\n`,
+      );
+      process.exit(1);
+    }
+    // auto: an old oam is a reason to prefer Node, not to fail. Say so, because
+    // a silent downgrade is how someone keeps running an oam they meant to
+    // update. stderr is safe -- MCP frames travel on stdout.
+    process.stderr.write(`ssh-mcp: oam at ${oam} is older than ${min}; using Node instead.\n`);
     await runInProcess();
   } else {
     // `--` separates oam's own flags from the script's argv, so `ssh-mcp
