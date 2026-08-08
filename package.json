@@ -1,6 +1,6 @@
 {
   "name": "@yawlabs/ssh-mcp",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "mcpName": "io.github.YawLabs/ssh-mcp",
   "description": "MCP server for SSH operations with built-in diagnostics",
   "type": "module",
