@@ -63,11 +63,21 @@ const SERVER_ENTRY = fileURLToPath(SERVER_URL);
 const isWin = process.platform === "win32";
 const exe = isWin ? "oam.exe" : "oam";
 
-/** Locate an oam binary, or null. Every branch is a stat, never a subprocess. */
+/**
+ * Locate an oam binary. Returns `{ path, shim }`:
+ *   path -- an oam this launcher can actually execute, or null
+ *   shim -- an oam-named `.cmd`/`.bat` seen on PATH and SKIPPED, or null
+ *
+ * The shim is reported rather than silently dropped: "no oam binary was found"
+ * is the wrong thing to tell someone who has one installed in a shape we cannot
+ * spawn. Every branch is a stat, never a subprocess.
+ */
 function findOam() {
-  // 1. Explicit override wins and is never second-guessed.
+  // 1. Explicit override wins and is never second-guessed -- including a .cmd.
+  //    If it cannot be executed the version gate reports that specifically,
+  //    which is better than second-guessing an explicit instruction here.
   const override = process.env.OAM_BIN;
-  if (override) return existsSync(override) ? override : null;
+  if (override) return { path: existsSync(override) ? override : null, shim: null };
 
   // 2. Installed locations, BEFORE PATH. Someone who develops oam itself
   //    usually has oam/target/release on PATH, and a build directory is the
@@ -86,26 +96,65 @@ function findOam() {
     installed.unshift(join(process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local"), "oam", "bin", exe));
   }
   for (const candidate of installed) {
-    if (existsSync(candidate)) return candidate;
+    if (existsSync(candidate)) return { path: candidate, shim: null };
   }
 
   // 3. PATH, resolved manually rather than by spawning `which`/`where`, which
   //    would cost a subprocess on every launch just to decide whether to spawn.
   //
-  //    Windows: `.exe` ONLY -- deliberately narrower than PATHEXT. Node refuses
-  //    to run a `.cmd`/`.bat` through execFile/spawn without `shell: true` (it
-  //    throws EINVAL, and for spawn it throws SYNCHRONOUSLY rather than emitting
-  //    'error'), so walking the full PATHEXT list would hand back a path this
-  //    launcher cannot execute -- discovery has to agree with execution. `exe`
-  //    is also what the installed-location checks above look for, so the two
-  //    discovery paths now accept exactly the same shapes.
+  //    Windows: only `.exe` is RETURNED -- deliberately narrower than PATHEXT.
+  //    Node refuses to run a `.cmd`/`.bat` through execFile/spawn without
+  //    `shell: true` (EINVAL, and for spawn it throws SYNCHRONOUSLY rather than
+  //    emitting 'error'), so returning one would hand back a path this launcher
+  //    cannot execute -- discovery has to agree with execution. `exe` is also
+  //    what the installed-location checks above look for, so both discovery
+  //    paths accept exactly the same shapes.
+  //
+  //    A shim is still NOTED, though. An npm-style install puts `oam.cmd` on
+  //    PATH, and staying silent about it means auto mode degrades with no
+  //    explanation and `SSH_MCP_RUNTIME=oam` claims nothing was found -- both
+  //    of which send someone to reinstall an oam they already have.
+  let shim = null;
   for (const dir of (process.env.PATH ?? "").split(delimiter)) {
     if (!dir) continue;
     const candidate = join(dir, exe);
-    if (existsSync(candidate)) return candidate;
+    if (existsSync(candidate)) return { path: candidate, shim: null };
+    if (isWin && shim === null) {
+      for (const ext of [".cmd", ".bat"]) {
+        const alt = join(dir, `oam${ext}`);
+        if (existsSync(alt)) {
+          shim = alt;
+          break;
+        }
+      }
+    }
   }
 
-  return null;
+  return { path: null, shim };
+}
+
+/**
+ * Write a diagnostic to stderr synchronously, so a following process.exit
+ * cannot truncate it.
+ *
+ * Not a bare writeSync: that call can short-write (it returns a byte count) and
+ * on macOS it can throw EAGAIN, because Node makes a piped stderr non-blocking
+ * there rather than blocking the write. Loop over the remaining bytes, and if
+ * stderr turns out to be unusable give up quietly -- failing to print a
+ * diagnostic is not worth crashing a stdio server over.
+ */
+async function errSync(message) {
+  const { writeSync } = await import("node:fs");
+  const buf = Buffer.from(message);
+  let off = 0;
+  for (let attempts = 0; off < buf.length && attempts < 1000; attempts++) {
+    try {
+      off += writeSync(2, buf, off, buf.length - off);
+    } catch (err) {
+      if (err?.code !== "EAGAIN") return;
+      // Pipe is full and the reader has not drained yet -- retry.
+    }
+  }
 }
 
 /**
@@ -157,7 +206,7 @@ const mode = (process.env.SSH_MCP_RUNTIME ?? "auto").toLowerCase();
 if (mode === "node") {
   await runInProcess();
 } else {
-  const oam = findOam();
+  const { path: oam, shim: oamShim } = findOam();
   // Read the version ONCE, and only when discovery found something: the gate
   // below has to tell "too old" apart from "could not be read at all", and
   // re-probing inside the branch would cost a second subprocess.
@@ -169,18 +218,26 @@ if (mode === "node") {
   const found = oam ? oamVersion(oam) : null;
 
   if (!oam) {
+    // An oam-named .cmd/.bat on PATH is a real install in a shape this launcher
+    // cannot spawn. Naming it turns "no oam binary was found" -- which reads as
+    // "install oam", the one thing that will not help -- into something the user
+    // can act on.
+    const shimNote = oamShim
+      ? `Found ${oamShim}, but Node cannot execute a .cmd/.bat directly.\n` +
+        "Install the native oam binary, or point OAM_BIN at one.\n"
+      : "";
     if (mode === "oam") {
-      // Explicitly demanded, so this is a real misconfiguration. writeSync
-      // because stderr is async for TTYs/pipes on Windows and process.exit
-      // truncates pending writes.
-      const { writeSync } = await import("node:fs");
-      writeSync(
-        2,
-        "ssh-mcp: SSH_MCP_RUNTIME=oam but no oam binary was found.\n" +
+      // Explicitly demanded, so this is a real misconfiguration.
+      await errSync(
+        `ssh-mcp: SSH_MCP_RUNTIME=oam but no runnable oam binary was found.\n${shimNote}` +
           "Install from https://oamjs.org, set OAM_BIN=/path/to/oam, or use SSH_MCP_RUNTIME=node.\n",
       );
       process.exit(1);
     }
+    // auto: falling back is correct, but silence is how someone never learns
+    // their oam install is a shape this launcher skips. Only worth saying when
+    // there was actually something to skip.
+    if (oamShim) await errSync(`ssh-mcp: ${shimNote}Using Node instead.\n`);
     await runInProcess();
   } else if (!atLeast(found, OAM_MIN)) {
     const min = OAM_MIN.join(".");
@@ -197,8 +254,7 @@ if (mode === "node") {
       ? "Run `oam self-update`, or use SSH_MCP_RUNTIME=node.\n"
       : "Check that it is an executable oam binary for this platform, or use SSH_MCP_RUNTIME=node.\n";
     if (mode === "oam") {
-      const { writeSync } = await import("node:fs");
-      writeSync(2, `ssh-mcp: SSH_MCP_RUNTIME=oam but ${detail}.\n${remedy}`);
+      await errSync(`ssh-mcp: SSH_MCP_RUNTIME=oam but ${detail}.\n${remedy}`);
       process.exit(1);
     }
     // auto: neither cause is worth failing over -- prefer Node. Say so, because
@@ -206,24 +262,22 @@ if (mode === "node") {
     // update, or never learns their oam is unexecutable. stdout carries the MCP
     // frames, so stderr is the only safe channel.
     //
-    // writeSync, not process.stderr.write: an exit DOES follow, just indirectly.
+    // errSync, not process.stderr.write: an exit DOES follow, just indirectly.
     // runInProcess() imports dist/index.js, whose top level answers `--version`
     // with console.log + process.exit(0) (src/index.ts) -- and that exit
     // truncates a pending async stderr write on Windows TTYs and pipes.
-    const { writeSync } = await import("node:fs");
-    writeSync(2, `ssh-mcp: ${detail}; using Node instead.\n`);
+    await errSync(`ssh-mcp: ${detail}; using Node instead.\n`);
     await runInProcess();
   } else {
     // Every "oam could not be executed" outcome lands here: the synchronous
     // throw from spawn() and the async 'error' event both mean the same thing
     // and must degrade the same way, so the handling lives in one place.
-    // writeSync rather than process.stderr.write because stderr is async for
+    // errSync rather than process.stderr.write because stderr is async for
     // TTYs and pipes on Windows and the process.exit below truncates pending
     // writes -- the same reason the two branches above use it.
     const launchFailed = async (err) => {
       if (mode === "oam") {
-        const { writeSync } = await import("node:fs");
-        writeSync(2, `ssh-mcp: failed to launch oam (${err?.message ?? err})\n`);
+        await errSync(`ssh-mcp: failed to launch oam (${err?.message ?? err})\n`);
         process.exit(1);
       }
       await runInProcess();
@@ -296,40 +350,50 @@ if (mode === "node") {
       // that the child is gone, so gating on it swallows every signal after the
       // first and wedges the launcher with no escape hatch.
       //
-      // Escalation is TIME-gated, not count-gated. A second signal arriving
-      // immediately is not an impatient user: a supervisor routinely sends
-      // SIGINT then SIGTERM milliseconds apart, and a terminal Ctrl-C is
-      // delivered to the whole process group, so the child often gets its own
-      // copy alongside ours. Counting those as "hit it again" SIGKILLs the
-      // child mid-shutdown, which skips both its shutdown tail and its
-      // process.on("exit") backstop -- and that backstop is what reaps an
-      // ssh-agent this server spawned (see killStartedAgent in src/env.ts), so
-      // the daemon leaks. Inside the window we just keep forwarding; only once
-      // the child has had the full window and is still alive do we escalate.
+      // Escalation is driven by a TIMER, not by counting signals, and not by
+      // comparing timestamps. Counting is ambiguous: a supervisor routinely
+      // sends SIGINT then SIGTERM milliseconds apart, and a terminal Ctrl-C
+      // reaches the whole process group, so the child usually gets its own copy
+      // alongside ours -- reading "a second signal" as impatience hard-kills a
+      // child that is already shutting down cleanly. A timer makes the count
+      // irrelevant: ONE press is enough, and a wedged child dies on schedule
+      // without the user having to guess how many times to press. It also
+      // sidesteps the wall clock -- setTimeout is monotonic, so a clock step
+      // cannot mis-gate the window in either direction.
+      //
+      // POSIX vs Windows, and why we do not forward on Windows.
+      // On POSIX child.kill(sig) delivers a real, catchable signal, so
+      // forwarding is what lets the child run its shutdown. On Windows there
+      // are no POSIX signals: child.kill IGNORES the name and calls
+      // TerminateProcess -- an immediate hard kill (verified: a child with a
+      // SIGTERM handler never runs it and dies with code=null). Forwarding
+      // there would ABORT the graceful shutdown the console's own Ctrl-C just
+      // started, skipping the child's process.on("exit") backstop -- which is
+      // what reaps an ssh-agent this server spawned (killStartedAgent,
+      // src/env.ts) -- and leak the daemon. The console has already notified
+      // the child, so on Windows the timer below is the only kill we issue.
       //
       // The window comfortably exceeds the child's own shutdown budget
       // (server.close -> pool.drain -> killStartedAgent -> ~100ms FIN grace).
       const ESCALATE_AFTER_MS = 2000;
-      // null, not 0: a falsy sentinel would fail to arm the gate for a
-      // timestamp of 0, and "has a first signal been forwarded" is a different
-      // question from "is that timestamp truthy".
-      let firstForwardedAt = null;
+      let escalation = null;
       for (const sig of ["SIGINT", "SIGTERM"]) {
         process.on(sig, () => {
-          if (firstForwardedAt !== null && Date.now() - firstForwardedAt >= ESCALATE_AFTER_MS) {
-            // Had its grace window and is still here. Stop waiting on it.
-            child.kill("SIGKILL");
-            process.exit(128 + (constants.signals[sig] ?? 15));
-          }
-          if (firstForwardedAt === null) firstForwardedAt = Date.now();
           // No try/catch: kill() on an already-exited child returns false, it
           // does not throw. It throws only for a signal the platform does not
           // know, which SIGINT/SIGTERM/SIGKILL never are.
-          child.kill(sig);
+          if (!isWin) child.kill(sig);
+          if (escalation) return; // already counting down; further signals are noise
+          escalation = setTimeout(() => {
+            // Still here after its grace window. Stop waiting on it.
+            child.kill("SIGKILL");
+            process.exit(128 + (constants.signals[sig] ?? 15));
+          }, ESCALATE_AFTER_MS);
         });
       }
 
       child.on("exit", (code, signal) => {
+        if (escalation) clearTimeout(escalation);
         // Mirror the child's fate: a signal death becomes 128+n so callers see a
         // conventional shell exit status rather than a bare 0.
         if (signal) {
