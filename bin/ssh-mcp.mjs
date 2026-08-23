@@ -254,12 +254,19 @@ if (mode === "node") {
         windowsHide: true,
       });
     } catch (err) {
-      // spawn() THROWS for some unexecutable targets instead of emitting
-      // 'error' -- notably a .cmd/.bat on Windows, which Node rejects with a
-      // synchronous EINVAL. The 'error' listener is registered AFTER this call
-      // and so can never observe it; without this catch the launcher dies with
-      // a raw stack trace instead of falling back to Node. findOam no longer
-      // returns those shapes, but OAM_BIN can still point straight at one.
+      // spawn() THROWS for some failures instead of emitting 'error', and the
+      // 'error' listener is registered AFTER this call, so it can never observe
+      // one -- an uncaught throw here kills the launcher with a raw stack trace
+      // instead of falling back to Node.
+      //
+      // Belt-and-braces, deliberately: reaching this line already means
+      // execFileSync ran this same binary and read a version from it, so the
+      // shapes that throw synchronously (a .cmd/.bat Node refuses with EINVAL)
+      // have been diverted by the version gate above, and the ones the comments
+      // below name -- deleted (ENOENT), permission (EACCES) -- are among the
+      // errnos Node routes to the async 'error' event instead. What is left is
+      // a genuine TOCTOU: the binary replaced between the probe and the spawn.
+      // Cheap to keep, and the alternative is a stack trace in a stdio server.
       await launchFailed(err).catch(fallbackFailed);
     }
 
@@ -286,28 +293,39 @@ if (mode === "node") {
       // Registering ANY handler for these suppresses Node's default
       // terminate-on-signal, so the parent's exit has to be arranged
       // explicitly. `child.killed` only records that kill() was CALLED, never
-      // that the child is gone, so gating on it swallowed every signal after
-      // the first and wedged the launcher with no escape hatch. Forward once,
-      // then let a repeat signal escalate and take the parent down with it --
-      // double-Ctrl-C is the conventional way out and has to actually work.
-      let forwarded = false;
+      // that the child is gone, so gating on it swallows every signal after the
+      // first and wedges the launcher with no escape hatch.
+      //
+      // Escalation is TIME-gated, not count-gated. A second signal arriving
+      // immediately is not an impatient user: a supervisor routinely sends
+      // SIGINT then SIGTERM milliseconds apart, and a terminal Ctrl-C is
+      // delivered to the whole process group, so the child often gets its own
+      // copy alongside ours. Counting those as "hit it again" SIGKILLs the
+      // child mid-shutdown, which skips both its shutdown tail and its
+      // process.on("exit") backstop -- and that backstop is what reaps an
+      // ssh-agent this server spawned (see killStartedAgent in src/env.ts), so
+      // the daemon leaks. Inside the window we just keep forwarding; only once
+      // the child has had the full window and is still alive do we escalate.
+      //
+      // The window comfortably exceeds the child's own shutdown budget
+      // (server.close -> pool.drain -> killStartedAgent -> ~100ms FIN grace).
+      const ESCALATE_AFTER_MS = 2000;
+      // null, not 0: a falsy sentinel would fail to arm the gate for a
+      // timestamp of 0, and "has a first signal been forwarded" is a different
+      // question from "is that timestamp truthy".
+      let firstForwardedAt = null;
       for (const sig of ["SIGINT", "SIGTERM"]) {
         process.on(sig, () => {
-          const status = 128 + (constants.signals[sig] ?? 15);
-          if (forwarded) {
-            try {
-              child.kill("SIGKILL");
-            } catch {
-              // already gone
-            }
-            process.exit(status);
+          if (firstForwardedAt !== null && Date.now() - firstForwardedAt >= ESCALATE_AFTER_MS) {
+            // Had its grace window and is still here. Stop waiting on it.
+            child.kill("SIGKILL");
+            process.exit(128 + (constants.signals[sig] ?? 15));
           }
-          forwarded = true;
-          try {
-            child.kill(sig);
-          } catch {
-            // already gone -- the exit handler below settles the status
-          }
+          if (firstForwardedAt === null) firstForwardedAt = Date.now();
+          // No try/catch: kill() on an already-exited child returns false, it
+          // does not throw. It throws only for a signal the platform does not
+          // know, which SIGINT/SIGTERM/SIGKILL never are.
+          child.kill(sig);
         });
       }
 
