@@ -1,0 +1,18 @@
+# Throwaway probe: does the repo/org NPM_TOKEN secret still authenticate?
+# Secrets are write-only via the API, so the only way to test one is from a job.
+name: npm auth check
+on: workflow_dispatch
+jobs:
+  whoami:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: npm whoami
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then echo "SECRET_EMPTY"; exit 1; fi
+          echo "authenticated as: $(npm whoami)"
