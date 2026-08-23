@@ -78,7 +78,7 @@ function findOam() {
   //    point deliberately at a dev build.
   //
   //    Both forms are checked on Windows: the installer defaults to
-  //    %LOCALAPPDATA%oamin there, but oam's docs name ~/.oam/bin first and
+  //    %LOCALAPPDATA%\oam\bin there, but oam's docs name ~/.oam/bin first and
   //    OAM_INSTALL_DIR can pick either, so checking one silently misses a real
   //    install.
   const installed = [join(homedir(), ".oam", "bin", exe)];
@@ -91,13 +91,18 @@ function findOam() {
 
   // 3. PATH, resolved manually rather than by spawning `which`/`where`, which
   //    would cost a subprocess on every launch just to decide whether to spawn.
-  const pathExt = isWin ? (process.env.PATHEXT ?? ".EXE").split(";").filter(Boolean) : [""];
+  //
+  //    Windows: `.exe` ONLY -- deliberately narrower than PATHEXT. Node refuses
+  //    to run a `.cmd`/`.bat` through execFile/spawn without `shell: true` (it
+  //    throws EINVAL, and for spawn it throws SYNCHRONOUSLY rather than emitting
+  //    'error'), so walking the full PATHEXT list would hand back a path this
+  //    launcher cannot execute -- discovery has to agree with execution. `exe`
+  //    is also what the installed-location checks above look for, so the two
+  //    discovery paths now accept exactly the same shapes.
   for (const dir of (process.env.PATH ?? "").split(delimiter)) {
     if (!dir) continue;
-    for (const ext of isWin ? pathExt : [""]) {
-      const candidate = join(dir, isWin ? `oam${ext.toLowerCase()}` : "oam");
-      if (existsSync(candidate)) return candidate;
-    }
+    const candidate = join(dir, exe);
+    if (existsSync(candidate)) return candidate;
   }
 
   return null;
@@ -153,6 +158,15 @@ if (mode === "node") {
   await runInProcess();
 } else {
   const oam = findOam();
+  // Read the version ONCE, and only when discovery found something: the gate
+  // below has to tell "too old" apart from "could not be read at all", and
+  // re-probing inside the branch would cost a second subprocess.
+  //
+  // Discovery itself stays stat-only; this is the first subprocess. It is paid
+  // on every launch that finds an oam -- including the ones that go on to fall
+  // back to Node -- not only the ones that end up spawning it. Measured 26ms
+  // median (n=12, windows-arm64), once per MCP session.
+  const found = oam ? oamVersion(oam) : null;
 
   if (!oam) {
     if (mode === "oam") {
@@ -168,69 +182,161 @@ if (mode === "node") {
       process.exit(1);
     }
     await runInProcess();
-  } else if (!atLeast(oamVersion(oam), OAM_MIN)) {
-    // Discovery itself stays stat-only; this is the first subprocess, and it
-    // runs only once we have already decided to spawn oam anyway. Measured 26ms
-    // median (n=12, windows-arm64), paid once per MCP session.
+  } else if (!atLeast(found, OAM_MIN)) {
     const min = OAM_MIN.join(".");
+    // Two different causes reach this branch and they need different remedies.
+    // `found === null` is NOT "old": oamVersion returns null when the binary
+    // could not be run at all (not executable, wrong arch, a .cmd/.bat Node
+    // refuses, deleted between the stat and the probe) or when its --version
+    // output did not parse. Telling that user to `oam self-update` sends them
+    // after the one cause it definitely is not, so the wording splits here.
+    const detail = found
+      ? `${oam} is oam ${found.join(".")}, older than ${min}`
+      : `${oam} could not be run, or did not report a version this launcher understands`;
+    const remedy = found
+      ? "Run `oam self-update`, or use SSH_MCP_RUNTIME=node.\n"
+      : "Check that it is an executable oam binary for this platform, or use SSH_MCP_RUNTIME=node.\n";
     if (mode === "oam") {
       const { writeSync } = await import("node:fs");
-      writeSync(
-        2,
-        `ssh-mcp: SSH_MCP_RUNTIME=oam but ${oam} is older than oam ${min}.\n` +
-          `Run \`oam self-update\`, or use SSH_MCP_RUNTIME=node.\n`,
-      );
+      writeSync(2, `ssh-mcp: SSH_MCP_RUNTIME=oam but ${detail}.\n${remedy}`);
       process.exit(1);
     }
-    // auto: an old oam is a reason to prefer Node, not to fail. Say so, because
+    // auto: neither cause is worth failing over -- prefer Node. Say so, because
     // a silent downgrade is how someone keeps running an oam they meant to
-    // update. stderr is safe -- MCP frames travel on stdout.
-    process.stderr.write(`ssh-mcp: oam at ${oam} is older than ${min}; using Node instead.\n`);
+    // update, or never learns their oam is unexecutable. stdout carries the MCP
+    // frames, so stderr is the only safe channel.
+    //
+    // writeSync, not process.stderr.write: an exit DOES follow, just indirectly.
+    // runInProcess() imports dist/index.js, whose top level answers `--version`
+    // with console.log + process.exit(0) (src/index.ts) -- and that exit
+    // truncates a pending async stderr write on Windows TTYs and pipes.
+    const { writeSync } = await import("node:fs");
+    writeSync(2, `ssh-mcp: ${detail}; using Node instead.\n`);
     await runInProcess();
   } else {
-    // `--` separates oam's own flags from the script's argv, so `ssh-mcp
-    // --version` and any host-supplied flags survive the hop unchanged.
-    const child = spawn(oam, ["run", SERVER_ENTRY, "--", ...process.argv.slice(2)], {
-      // inherit keeps the SAME fds, so MCP's newline-delimited JSON framing on
-      // stdin/stdout is untouched and the host's stdin-close still reaches the
-      // server's shutdown path.
-      stdio: "inherit",
-      env: process.env,
-      windowsHide: true,
-    });
-
-    // If oam cannot be executed at all (deleted between the stat and the spawn,
-    // wrong arch, permission), fall back rather than failing the whole server.
-    // `spawned` prevents falling back AFTER the child started, which would
-    // double-start the server on the same stdio.
-    let spawned = false;
-    child.on("spawn", () => {
-      spawned = true;
-    });
-    child.on("error", (err) => {
-      if (spawned) return;
+    // Every "oam could not be executed" outcome lands here: the synchronous
+    // throw from spawn() and the async 'error' event both mean the same thing
+    // and must degrade the same way, so the handling lives in one place.
+    // writeSync rather than process.stderr.write because stderr is async for
+    // TTYs and pipes on Windows and the process.exit below truncates pending
+    // writes -- the same reason the two branches above use it.
+    const launchFailed = async (err) => {
       if (mode === "oam") {
-        process.stderr.write(`ssh-mcp: failed to launch oam (${err.message})\n`);
+        const { writeSync } = await import("node:fs");
+        writeSync(2, `ssh-mcp: failed to launch oam (${err?.message ?? err})\n`);
         process.exit(1);
       }
-      void runInProcess();
-    });
+      await runInProcess();
+    };
 
-    // Forward termination so the server's own shutdown path runs in the child
-    // rather than the child being orphaned. No-op on Windows, harmless to add.
-    for (const sig of ["SIGINT", "SIGTERM"]) {
-      process.on(sig, () => {
-        if (!child.killed) child.kill(sig);
+    // ONE reporter shared by both launchFailed call sites below, so the
+    // sync-throw path and the 'error'-event path cannot drift apart. Either can
+    // reject: in auto mode launchFailed awaits runInProcess(), a bare import()
+    // that rejects whenever dist/index.js is missing or throws at load. At ESM
+    // top level an unhandled rejection is an uncaught exception -- it kills the
+    // process and replaces this launcher's diagnostic with a raw stack trace,
+    // which is the exact failure this handling exists to prevent.
+    const fallbackFailed = (e) => {
+      process.stderr.write(`ssh-mcp: fallback to Node failed (${e?.message ?? e})\n`);
+      process.exitCode = 1;
+    };
+
+    // `--` separates oam's own flags from the script's argv, so `ssh-mcp
+    // --version` and any host-supplied flags survive the hop unchanged.
+    let child = null;
+    try {
+      child = spawn(oam, ["run", SERVER_ENTRY, "--", ...process.argv.slice(2)], {
+        // inherit keeps the SAME fds, so MCP's newline-delimited JSON framing on
+        // stdin/stdout is untouched and the host's stdin-close still reaches the
+        // server's shutdown path.
+        stdio: "inherit",
+        env: process.env,
+        windowsHide: true,
       });
+    } catch (err) {
+      // spawn() THROWS for some failures instead of emitting 'error', and the
+      // 'error' listener is registered AFTER this call, so it can never observe
+      // one -- an uncaught throw here kills the launcher with a raw stack trace
+      // instead of falling back to Node.
+      //
+      // Belt-and-braces, deliberately: reaching this line already means
+      // execFileSync ran this same binary and read a version from it, so the
+      // shapes that throw synchronously (a .cmd/.bat Node refuses with EINVAL)
+      // have been diverted by the version gate above, and the ones the comments
+      // below name -- deleted (ENOENT), permission (EACCES) -- are among the
+      // errnos Node routes to the async 'error' event instead. What is left is
+      // a genuine TOCTOU: the binary replaced between the probe and the spawn.
+      // Cheap to keep, and the alternative is a stack trace in a stdio server.
+      await launchFailed(err).catch(fallbackFailed);
     }
 
-    child.on("exit", (code, signal) => {
-      // Mirror the child's fate: a signal death becomes 128+n so callers see a
-      // conventional shell exit status rather than a bare 0.
-      if (signal) {
-        process.exit(128 + (constants.signals[signal] ?? 15));
+    if (child) {
+      // If oam cannot be executed at all (deleted between the stat and the spawn,
+      // wrong arch, permission), fall back rather than failing the whole server.
+      // `spawned` prevents falling back AFTER the child started, which would
+      // double-start the server on the same stdio.
+      let spawned = false;
+      child.on("spawn", () => {
+        spawned = true;
+      });
+      child.on("error", (err) => {
+        if (spawned) return;
+        // Handle the rejection instead of discarding the promise: a failing
+        // runInProcess() used to escape as an unhandled rejection, replacing
+        // this launcher's diagnostic with a raw stack trace.
+        launchFailed(err).catch(fallbackFailed);
+      });
+
+      // Forward termination so the server's own shutdown path runs in the child
+      // rather than the child being orphaned.
+      //
+      // Registering ANY handler for these suppresses Node's default
+      // terminate-on-signal, so the parent's exit has to be arranged
+      // explicitly. `child.killed` only records that kill() was CALLED, never
+      // that the child is gone, so gating on it swallows every signal after the
+      // first and wedges the launcher with no escape hatch.
+      //
+      // Escalation is TIME-gated, not count-gated. A second signal arriving
+      // immediately is not an impatient user: a supervisor routinely sends
+      // SIGINT then SIGTERM milliseconds apart, and a terminal Ctrl-C is
+      // delivered to the whole process group, so the child often gets its own
+      // copy alongside ours. Counting those as "hit it again" SIGKILLs the
+      // child mid-shutdown, which skips both its shutdown tail and its
+      // process.on("exit") backstop -- and that backstop is what reaps an
+      // ssh-agent this server spawned (see killStartedAgent in src/env.ts), so
+      // the daemon leaks. Inside the window we just keep forwarding; only once
+      // the child has had the full window and is still alive do we escalate.
+      //
+      // The window comfortably exceeds the child's own shutdown budget
+      // (server.close -> pool.drain -> killStartedAgent -> ~100ms FIN grace).
+      const ESCALATE_AFTER_MS = 2000;
+      // null, not 0: a falsy sentinel would fail to arm the gate for a
+      // timestamp of 0, and "has a first signal been forwarded" is a different
+      // question from "is that timestamp truthy".
+      let firstForwardedAt = null;
+      for (const sig of ["SIGINT", "SIGTERM"]) {
+        process.on(sig, () => {
+          if (firstForwardedAt !== null && Date.now() - firstForwardedAt >= ESCALATE_AFTER_MS) {
+            // Had its grace window and is still here. Stop waiting on it.
+            child.kill("SIGKILL");
+            process.exit(128 + (constants.signals[sig] ?? 15));
+          }
+          if (firstForwardedAt === null) firstForwardedAt = Date.now();
+          // No try/catch: kill() on an already-exited child returns false, it
+          // does not throw. It throws only for a signal the platform does not
+          // know, which SIGINT/SIGTERM/SIGKILL never are.
+          child.kill(sig);
+        });
       }
-      process.exit(code ?? 0);
-    });
+
+      child.on("exit", (code, signal) => {
+        // Mirror the child's fate: a signal death becomes 128+n so callers see a
+        // conventional shell exit status rather than a bare 0.
+        if (signal) {
+          process.exit(128 + (constants.signals[signal] ?? 15));
+        }
+        process.exit(code ?? 0);
+      });
+    }
   }
 }
