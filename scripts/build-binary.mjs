@@ -36,11 +36,10 @@ const { version } = pkg;
 // Binary name = the package's first `bin` command, so this script is
 // copy-paste generic across @yawlabs/* servers -- no per-repo rename.
 const binName = Object.keys(pkg.bin ?? {})[0] ?? pkg.name.split('/').pop();
-// Bundle the SOURCE behind the bin's dist entry (src/index.ts, src/server.ts,
-// src/runner.ts, ...) so this works regardless of the server's entry filename.
-// Pinned, NOT derived from `bin`. Mapping bin's VALUE to a source path
-// (dist/index.js -> src/index.ts) breaks the moment `bin` is repointed at the
-// runtime launcher: it yields bin/ssh-mcp.ts, which does not exist.
+// The CLI source entry, pinned -- NOT derived from `bin`. Mapping bin's VALUE
+// to a source path (dist/index.js -> src/index.ts) breaks the moment `bin` is
+// repointed at the runtime launcher: it yields bin/ssh-mcp.ts, which does not
+// exist.
 // postgres-mcp shipped exactly that breakage in its 0.9.0. This script is a
 // manual per-host step that neither `npm test` nor the release flow runs, so a
 // wrong guess stays invisible until someone builds a binary.

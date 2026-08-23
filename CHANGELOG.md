@@ -14,6 +14,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Launcher no longer dies with a raw stack trace when `spawn` fails synchronously. Node throws (rather than emitting `error`) for some unexecutable targets — notably a `.cmd`/`.bat` on Windows, which it rejects with `EINVAL` unless `shell: true` — and the `error` listener is registered *after* the `spawn` call, so it could never observe that throw. The documented fall-back-to-Node contract was broken in exactly the case it exists for. Both failure modes now route through one handler.
+- Windows runtime discovery scans `PATH` for `oam.exe` only, instead of walking every `PATHEXT` entry. The installed-location checks already looked for `oam.exe` alone, so the two discovery paths disagreed: `PATH` could hand back an `oam.cmd` this launcher cannot execute, which then surfaced as a misleading "older than 0.9.0 — run `oam self-update`" error. Discovery and execution now accept the same shapes, and a real `oam.exe` further along `PATH` is found instead of being shadowed by a shim.
+- A second `SIGINT`/`SIGTERM` now escalates to `SIGKILL` and exits `128+n`. Registering a handler suppresses Node's default terminate-on-signal, and `child.killed` records only that `kill()` was *called* — never that the child is gone — so gating on it swallowed every signal after the first and left the launcher wedged with no escape hatch. Double-Ctrl-C works again.
+- The launch-failure message is written with `writeSync` rather than `process.stderr.write`, matching the two sibling branches. On Windows stderr is async for TTYs and pipes, so the immediately-following `process.exit(1)` could truncate it.
+- The child `error` handler no longer discards its promise with `void`. A failing in-process fallback surfaced as an unhandled rejection — replacing the launcher's own diagnostic with a raw stack trace — and now reports and sets a non-zero exit code. Both `launchFailed` call sites share one reporter so the synchronous and event-driven paths cannot drift.
+- An oam binary that cannot be run is no longer reported as an old one. `oamVersion` returns `null` for several distinct causes — not executable, wrong architecture, a shim Node refuses, deleted since the stat, or a `--version` format this launcher does not parse — and every one of them produced "is older than oam 0.9.0. Run `oam self-update`", pointing the user at the single cause it definitely was not. The two cases now carry separate wording and separate remedies, and the too-old message reports the version actually detected.
+- Removed a literal backspace byte (`U+0008`) from the runtime-discovery comment in `bin/ssh-mcp.mjs`, present since 0.13.0 and therefore in the published package. The Windows installer path was written as `%LOCALAPPDATA%\oam\bin` and round-tripped through escape processing, which dropped the first backslash and turned `\b` into a real control character — rendering the line as `%LOCALAPPDATA%oamin` and making git treat the file as binary, so its diff could not be reviewed. Lint, `tsc` and the tests passed either way.
+
+### Changed
+- `scripts/build-binary.mjs`: dropped the stale comment claiming the bundle entry is derived from `bin` "regardless of the server's entry filename". It contradicted the pinned `srcEntry` constant directly below it, and this script is copy-pasted across the `@yawlabs/*` servers, so the contradiction travelled with it.
+
 ## [0.13.0] — 2026-08-07
 
 ### Added
