@@ -249,6 +249,67 @@ describe("fixKnownHosts reports the removal that actually happened", () => {
     expect(result.actions).toContain("No existing host key for [db.example.com]:2222 (nothing to remove)");
   });
 
+  // IPv6 targeting. Probed against OpenSSH_10.2p1 with a seeded known_hosts:
+  //   -R '[::1]'        -> "not found", removes NOTHING
+  //   -R '[[::1]]:2222' -> "not found", removes NOTHING   (the old template's output)
+  //   -R '::1' and -R '[::1]:2222' -> both remove the entry
+  // The removal silently no-opped while ssh-keyscan still appended a fresh key, so the
+  // stale IPv6 key survived alongside the new one -- and the verifier accepts if ANY
+  // known key matches, leaving the retired key trusted.
+  describe("IPv6 hosts target the spelling ssh-keygen actually matches", () => {
+    /** Capture every target handed to `ssh-keygen -R`. */
+    function recordRemovalTargets(): string[] {
+      const targets: string[] = [];
+      fakeExec((cmd, args) => {
+        if (cmd === "ssh-keygen" && args[0] === "-R") {
+          targets.push(args[1]);
+          return keygenHit(args[1]);
+        }
+        return { fail: true, stderr: "getaddrinfo: Name or service not known" };
+      });
+      return targets;
+    }
+
+    it("removes the BARE address at the default port, never the bracketed form", () => {
+      const targets = recordRemovalTargets();
+      fixKnownHosts("[::1]");
+
+      expect(targets).toEqual(["::1"]);
+      expect(targets).not.toContain("[::1]");
+    });
+
+    it("uses [addr]:port on a non-default port, never the double-bracketed form", () => {
+      const targets = recordRemovalTargets();
+      fixKnownHosts("[::1]", 2222);
+
+      expect(targets).toContain("[::1]:2222");
+      expect(targets).toContain("::1");
+      // The regression: `[${host}]:${port}` on an already-bracketed host.
+      expect(targets).not.toContain("[[::1]]:2222");
+    });
+
+    it("hands ssh-keyscan the bare address so its output matches the -R targets", () => {
+      let scanArgs: string[] = [];
+      fakeExec((cmd, args) => {
+        if (cmd === "ssh-keygen" && args[0] === "-R") return keygenHit(args[1]);
+        scanArgs = args;
+        return { stdout: "::1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI" };
+      });
+
+      fixKnownHosts("[::1]");
+
+      expect(scanArgs).toEqual(["-H", "::1"]);
+    });
+
+    it("leaves ordinary hostnames exactly as before", () => {
+      const targets = recordRemovalTargets();
+      fixKnownHosts("db.example.com", 2222);
+
+      expect(targets).toContain("db.example.com");
+      expect(targets).toContain("[db.example.com]:2222");
+    });
+  });
+
   it("keeps the truthful removal line on the success path", () => {
     fakeExec((cmd, args) => {
       if (cmd === "ssh-keygen" && args[0] === "-R") return keygenMiss(args[1]);

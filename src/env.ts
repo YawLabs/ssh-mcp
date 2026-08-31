@@ -3,6 +3,7 @@ import { appendFileSync, existsSync, readdirSync, readFileSync, statSync } from 
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isValidHostname, probeSshConnection, runArgs, SSH_NON_KEY_FILES } from "./diagnose.js";
+import { knownHostsTargets, unbracketHost } from "./ssh.js";
 import { parseSshConfigOutput } from "./ssh-config.js";
 
 export interface KeyInfo {
@@ -410,17 +411,25 @@ export function fixKnownHosts(host: string, port = 22): { status: "ok" | "error"
 
   const actions: string[] = [];
 
-  // Remove stale entry (if there is one -- see removeKnownHostEntry)
-  actions.push(describeRemoval(host, removeKnownHostEntry(host)));
-
-  // Also remove [host]:port if non-standard port
-  if (port !== 22) {
-    const target = `[${host}]:${port}`;
+  // Delegate target spelling to knownHostsTargets (ssh.ts) rather than building
+  // `[${host}]:${port}` here. That template was wrong for IPv6 in BOTH directions,
+  // probed against OpenSSH_10.2p1 with a seeded known_hosts:
+  //   `ssh-keygen -R '[::1]'`        -> "not found", exit 0, removes NOTHING
+  //   `ssh-keygen -R '[[::1]]:2222'` -> "not found", exit 0, removes NOTHING
+  //   `ssh-keygen -R '::1'` / `-R '[::1]:2222'` -> both remove the entry
+  // Because the removal silently no-opped while the ssh-keyscan half below still
+  // APPENDED a fresh key, ssh_known_hosts_fix left the stale IPv6 key in the file
+  // next to the new one -- and buildHostVerifier (ssh.ts) accepts if ANY known key
+  // matches, so the key this tool exists to retire stayed trusted.
+  for (const target of knownHostsTargets(host, port)) {
     actions.push(describeRemoval(target, removeKnownHostEntry(target)));
   }
 
-  // Re-scan
-  const scanArgs = port !== 22 ? ["-H", "-p", String(port), host] : ["-H", host];
+  // Re-scan. ssh-keyscan takes the address BARE and writes the canonical spelling
+  // itself (`host` at :22, `[host]:port` otherwise) -- which is exactly what the
+  // `-R` targets above look for, so the two halves stay in agreement.
+  const scanHost = unbracketHost(host);
+  const scanArgs = port !== 22 ? ["-H", "-p", String(port), scanHost] : ["-H", scanHost];
   const { stdout: scanOut, ok: scanOk } = runArgs("ssh-keyscan", scanArgs);
   if (scanOk && scanOut.trim()) {
     try {
