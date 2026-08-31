@@ -1,4 +1,6 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ---------------------------------------------------------------------------
 // Fakes
@@ -95,7 +97,7 @@ import {
   classifySshProbe,
   SSH_NON_KEY_FILES,
 } from "../diagnose.js";
-import { fixKnownHosts, listSshKeys, testConnection } from "../env.js";
+import { ensureAgent, fixKnownHosts, listSshKeys, loadKey, testConnection } from "../env.js";
 
 function fakeExec(handler: (cmd: string, args: string[]) => FakeRun): void {
   execHandler = handler;
@@ -729,5 +731,357 @@ describe("checkSshConfig host-pattern matching", () => {
     // makes this block apply to srv1.example.com.
     expect(checkSshConfig("srv1.example.com").message).toContain("User deploy");
     expect(checkSshConfig("srv[12].example.com").message).toContain("User deploy");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GAP 5 -- loadKey's three-way ssh-add failure classification.
+//
+// `ssh_key_load` against a 0644 key or a passphrased key is the most common
+// operator failure this server exists to explain, and the branch that wins
+// decides whether the operator is sent to `chmod` or to `ssh-add`. Sending them
+// to the wrong one is worse than saying nothing.
+//
+// Harness: the module-level `node:child_process` mock above means the REAL
+// `runArgs` (diagnose.ts) and the REAL `runArgsWithEnv` (env.ts) run -- only the
+// subprocess is fake. `ensureAgent` lives in the same module as `loadKey`, so it
+// cannot be mocked out; it is driven through that same fake subprocess instead.
+// `agentUp`/`agentDown` below decide what `ssh-add -l` answers, which is exactly
+// what `probeAgent` (and therefore `ensureAgent`) classifies on.
+// ---------------------------------------------------------------------------
+
+describe("loadKey classifies ssh-add failures into the right operator fix", () => {
+  /** Every (cmd, args) pair the fake subprocess saw, in order. */
+  let calls: Array<{ cmd: string; args: string[] }> = [];
+
+  /** A key that the ~/.ssh fake reports as existing. */
+  const KEY_NAME = "id_gap5";
+  const KEY_ARG = `~/.ssh/${KEY_NAME}`;
+  /** What loadKey must resolve KEY_ARG to before it touches the filesystem. */
+  const KEY_RESOLVED = join(homedir(), ".ssh", KEY_NAME);
+
+  /**
+   * Reachable agent: `ssh-add -l` exits 0 with a key list, which is what
+   * probeAgent needs to report `reachable: true`. Every OTHER ssh-add
+   * invocation -- i.e. the `ssh-add <path>` load itself -- gets `load`.
+   */
+  function agentUp(load: FakeRun): void {
+    vi.stubEnv("SSH_AUTH_SOCK", "/tmp/gap5-agent.sock");
+    fakeExec((cmd, args) => {
+      calls.push({ cmd, args });
+      if (cmd === "ssh-add" && args[0] === "-l") return { stdout: "256 SHA256:abc123 u@h (ED25519)" };
+      return load;
+    });
+  }
+
+  /**
+   * Unreachable agent: `ssh-add -l` fails with a message that is NOT "no
+   * identities", so probeAgent returns null on every channel. On Unix the
+   * `ssh-agent -s` spawn fails too (the fake fails everything), so both
+   * platforms land on `reachable: false` -- with platform-specific wording,
+   * which is why the assertions below compare against ensureAgent() rather than
+   * hardcoding one platform's string.
+   */
+  function agentDown(): void {
+    vi.stubEnv("SSH_AUTH_SOCK", "/tmp/gap5-agent.sock");
+    fakeExec((cmd, args) => {
+      calls.push({ cmd, args });
+      return { fail: true, stderr: "Could not open a connection to your authentication agent." };
+    });
+  }
+
+  /** Did ssh-add ever get run against the key itself (as opposed to `-l`)? */
+  const loadWasAttempted = () => calls.some((c) => c.cmd === "ssh-add" && c.args[0] !== "-l");
+
+  beforeEach(() => {
+    calls = [];
+    // Present in ~/.ssh, so the not-found branch is only reached deliberately.
+    mockSshFiles = { [KEY_NAME]: "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----" };
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  // -- the agent-unreachable early return ------------------------------------
+
+  describe("agent unreachable", () => {
+    it("returns ensureAgent's own message and never runs ssh-add against the key", () => {
+      agentDown();
+
+      const result = loadKey(KEY_ARG);
+
+      expect(result.status).toBe("error");
+      // The message is the AGENT's, verbatim -- not a load failure dressed up as
+      // one. Compared against a live ensureAgent() under the same fake because
+      // the wording is platform-specific (Windows names the service; Unix says
+      // to eval ssh-agent -s).
+      expect(result.message).toBe(ensureAgent().message);
+      expect(result.message).not.toContain("Failed to load key");
+      expect(result.message).not.toContain("chmod");
+    });
+
+    it("does not spawn ssh-add against a dead agent", () => {
+      agentDown();
+
+      loadKey(KEY_ARG);
+
+      // Only the `-l` probes ensureAgent itself makes. Loading a key into an
+      // agent that is not there produces a confusing generic failure, which is
+      // precisely what the early return exists to prevent.
+      expect(loadWasAttempted()).toBe(false);
+      expect(calls.every((c) => c.cmd !== "ssh-add" || c.args[0] === "-l")).toBe(true);
+    });
+
+    it("reports the dead agent even for a key that does not exist (agent check comes first)", () => {
+      agentDown();
+
+      const result = loadKey("~/.ssh/definitely-absent");
+
+      // Ordering pin: a missing agent is the operator's real problem, so it must
+      // not be masked by "Key not found".
+      expect(result.message).toBe(ensureAgent().message);
+      expect(result.message).not.toContain("Key not found");
+    });
+  });
+
+  // -- `~` expansion ---------------------------------------------------------
+
+  describe("~ expansion", () => {
+    it("expands a leading ~ to the home directory before handing the path to ssh-add", () => {
+      agentUp({ stdout: "Identity added" });
+
+      const result = loadKey(KEY_ARG);
+
+      const loadCall = calls.find((c) => c.cmd === "ssh-add" && c.args[0] !== "-l");
+      // ssh-add gets the EXPANDED path: no shell is involved (execFileSync
+      // spawns it directly), so a literal "~/..." would be looked up as a
+      // directory actually named "~".
+      expect(loadCall?.args).toEqual([KEY_RESOLVED]);
+      expect(loadCall?.args[0].startsWith("~")).toBe(false);
+      expect(result.message).toBe(`Key loaded: ${KEY_RESOLVED}`);
+    });
+
+    it("leaves an already-absolute path untouched", () => {
+      agentUp({ stdout: "Identity added" });
+
+      const result = loadKey(KEY_RESOLVED);
+
+      expect(result).toEqual({ status: "ok", message: `Key loaded: ${KEY_RESOLVED}` });
+    });
+
+    it("reports the EXPANDED path in error messages, not the ~ form", () => {
+      agentUp({ fail: true, stderr: "Permissions 0644 for 'k' are too open." });
+
+      const result = loadKey(KEY_ARG);
+
+      expect(result.message).toContain(KEY_RESOLVED);
+      expect(result.message).not.toContain("~/.ssh");
+    });
+
+    it("treats a leading ~ as the CURRENT user's home even in the ~user form", () => {
+      // Documented limitation, shared with ssh.ts's local-path expansion: only a
+      // bare leading "~" is understood, so "~root/.ssh/id_rsa" resolves under the
+      // CURRENT user's home rather than root's. Pinned rather than asserted as
+      // desirable -- it decides which path the "Key not found" line names, and
+      // that path is the only thing the operator has to go on. See bugsFound.
+      agentUp({ stdout: "Identity added" });
+
+      const result = loadKey("~root/.ssh/id_rsa");
+
+      expect(result.message).toBe(`Key not found: ${join(homedir(), "root", ".ssh", "id_rsa")}`);
+    });
+  });
+
+  // -- key not found ---------------------------------------------------------
+
+  describe("key not found", () => {
+    it("says so by resolved path and never spawns ssh-add for the key", () => {
+      agentUp({ stdout: "Identity added" });
+
+      const result = loadKey("~/.ssh/absent-key");
+
+      expect(result).toEqual({
+        status: "error",
+        message: `Key not found: ${join(homedir(), ".ssh", "absent-key")}`,
+      });
+      expect(loadWasAttempted()).toBe(false);
+    });
+  });
+
+  // -- too-open permissions --------------------------------------------------
+  //
+  // Real OpenSSH prints all three markers together, but they are three separate
+  // substring tests in the source and any one of them can be dropped without the
+  // others noticing. Each is therefore pinned on a fixture that isolates it.
+
+  describe("too-open permissions -> chmod", () => {
+    const chmodMessage = `Key ${KEY_RESOLVED} has too-open permissions. Fix: chmod 600 ${KEY_RESOLVED}`;
+
+    it("classifies on UNPROTECTED PRIVATE KEY alone", () => {
+      agentUp({
+        fail: true,
+        stderr: [
+          "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@",
+          "@         WARNING: UNPROTECTED PRIVATE KEY FILE!          @",
+          "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@",
+          "It is required that your private key files are NOT accessible by others.",
+          "This private key will be ignored.",
+        ].join("\n"),
+      });
+
+      expect(loadKey(KEY_ARG)).toEqual({ status: "error", message: chmodMessage });
+    });
+
+    it("classifies on 'too open' alone", () => {
+      agentUp({ fail: true, stderr: `Permissions 0644 for '${KEY_RESOLVED}' are too open.` });
+
+      expect(loadKey(KEY_ARG)).toEqual({ status: "error", message: chmodMessage });
+    });
+
+    it("classifies on 'bad permissions' alone", () => {
+      // Recent OpenSSH ends the too-open block with this line; on some builds it
+      // is the only marker that survives into ssh-add's output.
+      agentUp({ fail: true, stderr: `Error loading key "${KEY_RESOLVED}": bad permissions` });
+
+      expect(loadKey(KEY_ARG)).toEqual({ status: "error", message: chmodMessage });
+    });
+
+    it("handles the full real-world block (all three markers at once)", () => {
+      agentUp({
+        fail: true,
+        stderr: [
+          "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@",
+          "@         WARNING: UNPROTECTED PRIVATE KEY FILE!          @",
+          "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@",
+          `Permissions 0644 for '${KEY_RESOLVED}' are too open.`,
+          "It is required that your private key files are NOT accessible by others.",
+          "This private key will be ignored.",
+          `Error loading key "${KEY_RESOLVED}": bad permissions`,
+        ].join("\n"),
+      });
+
+      const result = loadKey(KEY_ARG);
+
+      expect(result.message).toBe(chmodMessage);
+      // The operator gets a runnable fix, not a wall of ssh-add output.
+      expect(result.message).not.toContain("WARNING");
+    });
+  });
+
+  // -- passphrase ------------------------------------------------------------
+
+  describe("passphrase-protected key -> ssh-add manually", () => {
+    const passphraseMessage = `Key ${KEY_RESOLVED} requires a passphrase. Add it manually: ssh-add ${KEY_RESOLVED}`;
+
+    it("classifies on 'passphrase' alone", () => {
+      agentUp({ fail: true, stderr: `Enter passphrase for ${KEY_RESOLVED}:` });
+
+      expect(loadKey(KEY_ARG)).toEqual({ status: "error", message: passphraseMessage });
+    });
+
+    it("classifies on 'incorrect' alone", () => {
+      // Trimmed deliberately: the real line ("incorrect passphrase supplied to
+      // decrypt private key") carries BOTH markers, so it cannot show that the
+      // "incorrect" test is load-bearing on its own.
+      agentUp({ fail: true, stderr: `Error loading key "${KEY_RESOLVED}": incorrect` });
+
+      expect(loadKey(KEY_ARG)).toEqual({ status: "error", message: passphraseMessage });
+    });
+
+    it("handles the real non-interactive wording (both markers)", () => {
+      agentUp({
+        fail: true,
+        stderr: `Error loading key "${KEY_RESOLVED}": incorrect passphrase supplied to decrypt private key`,
+      });
+
+      expect(loadKey(KEY_ARG).message).toBe(passphraseMessage);
+    });
+  });
+
+  // -- ordering: permissions BEFORE passphrase -------------------------------
+
+  describe("check order is load-bearing", () => {
+    it("prefers the permissions fix when an output carries BOTH sets of markers", () => {
+      // The permissions check runs FIRST in the source, and this is why: a
+      // too-open key needs `chmod 600`, and telling the operator to re-run
+      // `ssh-add` by hand sends them to a command that fails exactly the same
+      // way. The reverse ordering is silently wrong on any output that mentions
+      // a passphrase alongside the permissions complaint.
+      agentUp({
+        fail: true,
+        stderr: [`Permissions 0644 for '${KEY_RESOLVED}' are too open.`, `Enter passphrase for ${KEY_RESOLVED}:`].join(
+          "\n",
+        ),
+      });
+
+      const result = loadKey(KEY_ARG);
+
+      expect(result.message).toBe(`Key ${KEY_RESOLVED} has too-open permissions. Fix: chmod 600 ${KEY_RESOLVED}`);
+      expect(result.message).not.toContain("requires a passphrase");
+    });
+
+    it("still reaches the passphrase branch when no permissions marker is present", () => {
+      // The other half of the ordering pin: permissions-first must not swallow
+      // an ordinary passphrase failure.
+      agentUp({ fail: true, stderr: `Enter passphrase for ${KEY_RESOLVED}:` });
+
+      const result = loadKey(KEY_ARG);
+
+      expect(result.message).toContain("requires a passphrase");
+      expect(result.message).not.toContain("chmod");
+    });
+  });
+
+  // -- generic fall-through --------------------------------------------------
+
+  describe("unrecognised failure", () => {
+    it("carries the raw ssh-add output through instead of guessing a fix", () => {
+      agentUp({ fail: true, stderr: "Error connecting to agent: Connection refused" });
+
+      const result = loadKey(KEY_ARG);
+
+      expect(result).toEqual({
+        status: "error",
+        message: "Failed to load key: Error connecting to agent: Connection refused",
+      });
+      // An unknown failure must not be dressed up as one of the two known fixes.
+      expect(result.message).not.toContain("chmod");
+      expect(result.message).not.toContain("requires a passphrase");
+    });
+
+    it("includes BOTH streams of the failed ssh-add, since ssh-add talks on stderr", () => {
+      agentUp({ fail: true, stdout: "some stdout noise", stderr: "the actual reason" });
+
+      // runArgs joins stdout and stderr on its failure path, and this branch is
+      // the only one that shows the operator that text -- losing a stream here
+      // loses the only diagnostic they get.
+      expect(loadKey(KEY_ARG).message).toBe("Failed to load key: some stdout noise\nthe actual reason");
+    });
+  });
+
+  // -- success ---------------------------------------------------------------
+
+  describe("success", () => {
+    it("reports ok with the resolved path and runs ssh-add with exactly that one argument", () => {
+      agentUp({ stdout: `Identity added: ${KEY_RESOLVED} (u@h)` });
+
+      const result = loadKey(KEY_ARG);
+
+      expect(result).toEqual({ status: "ok", message: `Key loaded: ${KEY_RESOLVED}` });
+      // No extra flags: a stray `-q`, `-t`, or `-l` here changes what the agent
+      // ends up holding.
+      expect(calls.filter((c) => c.cmd === "ssh-add" && c.args[0] !== "-l")).toEqual([
+        { cmd: "ssh-add", args: [KEY_RESOLVED] },
+      ]);
+    });
+
+    it("does not report success merely because ssh-add printed something reassuring", () => {
+      // Classification is on the EXIT STATUS, not on the text. A non-zero exit
+      // whose output happens to say "Identity added" is still a failure.
+      agentUp({ fail: true, stderr: "Identity added: but the process exited non-zero" });
+
+      expect(loadKey(KEY_ARG).status).toBe("error");
+    });
   });
 });
