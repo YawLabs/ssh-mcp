@@ -13,8 +13,9 @@ const HostSchema = z.string().describe("SSH hostname or IP address");
 // relative paths through a shell — they land on the server verbatim, relative
 // to the SFTP CWD (usually the user's home dir). Absolute paths are unambiguous;
 // ~ paths cause ENOENT on most servers. Matches the enforcement already on
-// ssh_read_file. ssh_mkdir is intentionally excluded: its makeDir implementation
-// supports relative paths from CWD and is the only SFTP tool that documents this.
+// ssh_read_file. ssh_mkdir is intentionally excluded: makeDir (src/ssh.ts) walks
+// path segments itself and handles a CWD-relative path, so ssh_mkdir takes a
+// plain z.string() and its `path` description spells out that both forms work.
 const AbsoluteRemotePathSchema = z.string().refine((p) => p.startsWith("/"), {
   message: "Path must be absolute (start with /). SFTP does not expand ~ or resolve relative paths through a shell.",
 });
@@ -34,6 +35,13 @@ const TimeoutSchema = z
   .optional()
   .describe("Command timeout in milliseconds (default: 30000)");
 
+const EnvSchema = z
+  .record(z.string(), z.string())
+  .optional()
+  .describe(
+    "Environment variables to set for this command. Injected as a `KEY='value' ...` prefix; works on any sshd regardless of AcceptEnv config. VALUES are POSIX-single-quoted, so any byte is safe in a value. KEYS cannot be quoted (a shell assignment prefix requires a bare name), so each key must match /^[A-Za-z_][A-Za-z0-9_]*$/ (the POSIX name grammar) — a key outside that grammar is rejected and the call fails before anything is sent to a host. Command policy is checked against the PREFIXED command, so a `^`-anchored whitelist pattern stops matching once this is set.",
+  );
+
 const connectionParams = {
   host: HostSchema,
   port: PortSchema,
@@ -41,6 +49,59 @@ const connectionParams = {
   privateKeyPath: KeyPathSchema,
   password: PasswordSchema,
 };
+
+// Standard note appended to every tool description that command policy does NOT cover.
+// See the SCOPE LIMIT block in src/policy.ts -- a blacklist is not whole-server coverage,
+// and an admin who assumes otherwise leaves remote mutation wide open.
+const POLICY_EXEMPT_NOTE =
+  " NOT gated by SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST: command policy applies only to ssh_exec and ssh_multi_exec, so a blacklist such as `^rm` does NOT block this tool.";
+
+// POSIX portable environment-variable name grammar (IEEE Std 1003.1, "Name"): an initial
+// letter or underscore followed by letters, digits, or underscores. Keys are interpolated
+// into the remote command as a BARE assignment prefix, so this is the only thing standing
+// between an env key and the remote shell.
+const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * Build the `KEY='value' ...` env prefix shared by ssh_exec and ssh_multi_exec. Works on any
+ * sshd, unlike ssh2's protocol-level env which most servers reject via AcceptEnv.
+ *
+ * VALUES are wrapped by shellQuote -- the same POSIX single-quote primitive ops.ts uses for
+ * path injection guards -- so any byte sequence in a value is inert on the remote.
+ *
+ * KEYS get no such protection: a shell assignment prefix requires a bare name, so a key
+ * cannot be quoted. Each one is therefore validated against ENV_NAME_PATTERN and a
+ * non-conforming key THROWS. Two reasons it throws rather than being dropped: silently
+ * dropping it would let the caller believe the variable was set, and the key is a live
+ * injection vector -- `{"A=1; reboot #": "x"}` would otherwise emit
+ * `A=1; reboot #='x' <command>`, running `reboot` on the remote and swallowing the real
+ * command as a comment. It is also a policy bypass, because enforcePolicy only ever sees a
+ * string whose command verb looks benign. The throw happens in the handler BEFORE
+ * enforcePolicy and before any connection is acquired, so a rejected key never reaches a host.
+ *
+ * Returns the prefixed command plus whether a prefix was actually applied. Policy is enforced
+ * on the PREFIXED string (deliberate, and pinned by src/tests/exec-env-policy.test.ts); the
+ * flag lets enforcePolicy explain a whitelist rejection that only happens because of it.
+ */
+function applyEnvPrefix(
+  command: string,
+  env: Record<string, string> | undefined,
+): { finalCommand: string; envPrefixApplied: boolean } {
+  if (!env || Object.keys(env).length === 0) {
+    return { finalCommand: command, envPrefixApplied: false };
+  }
+  const prefix = Object.entries(env)
+    .map(([k, v]) => {
+      if (!ENV_NAME_PATTERN.test(k)) {
+        throw new Error(
+          `Invalid environment variable name ${JSON.stringify(k)}: env keys must match ${ENV_NAME_PATTERN.source} (the POSIX name grammar). Values are single-quoted before they reach the remote shell, but a key is emitted as a bare \`KEY=\` assignment and cannot be quoted, so anything outside that grammar is rejected instead of escaped.`,
+        );
+      }
+      return `${k}=${shellQuote(v)}`;
+    })
+    .join(" ");
+  return { finalCommand: `${prefix} ${command}`, envPrefixApplied: true };
+}
 
 export function registerTools(server: McpServer, pool?: ConnectionPool) {
   const connectionPool = pool ?? new ConnectionPool();
@@ -53,27 +114,12 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       command: z
         .string()
         .describe("Shell command to execute on the remote host (interpreted by the remote login shell)"),
-      env: z
-        .record(z.string(), z.string())
-        .optional()
-        .describe(
-          "Environment variables to set for this command. Injected as a `KEY='value' ...` prefix; works on any sshd regardless of AcceptEnv config. Values are POSIX-single-quoted, so any byte is safe.",
-        ),
+      env: EnvSchema,
       timeout: TimeoutSchema,
     },
     async ({ command, env, timeout, ...conn }) => {
-      // Prefix env vars as `KEY='value' KEY2='value2' command`. Works on any sshd, unlike
-      // ssh2's protocol-level env which most servers reject via AcceptEnv. The single-quote
-      // wrapping (shellQuote) is the same primitive ops.ts uses for path injection guards,
-      // so any byte sequence is safe.
-      let finalCommand = command;
-      if (env && Object.keys(env).length > 0) {
-        const prefix = Object.entries(env)
-          .map(([k, v]) => `${k}=${shellQuote(v)}`)
-          .join(" ");
-        finalCommand = `${prefix} ${command}`;
-      }
-      enforcePolicy(finalCommand);
+      const { finalCommand, envPrefixApplied } = applyEnvPrefix(command, env);
+      enforcePolicy(finalCommand, { envPrefixApplied });
       return connectionPool.withConnection(conn, async (client) => {
         const result = await exec(client, finalCommand, timeout || 30000);
         const parts: string[] = [];
@@ -111,7 +157,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_write_file",
-    "Write content to a file on a remote host via SFTP. Creates or overwrites the file.",
+    `Write content to a file on a remote host via SFTP. Creates or overwrites the file.${POLICY_EXEMPT_NOTE}`,
     {
       ...connectionParams,
       path: AbsoluteRemotePathSchema.describe("Absolute path to the remote file. Must start with /."),
@@ -120,14 +166,19 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
     async ({ path, content, ...conn }) => {
       return connectionPool.withConnection(conn, async (client) => {
         await writeFile(client, path, content);
-        return { content: [{ type: "text", text: `Wrote ${content.length} bytes to ${path}` }] };
+        // Buffer.byteLength, not content.length: a JS string's .length counts UTF-16 code
+        // units, so any non-ASCII content (accents, CJK, emoji) under-reports what actually
+        // landed on the remote. ssh2's sftp.writeFile encodes a string as utf8 by default,
+        // which is what we measure here.
+        const bytes = Buffer.byteLength(content, "utf8");
+        return { content: [{ type: "text", text: `Wrote ${bytes} bytes to ${path}` }] };
       });
     },
   );
 
   server.tool(
     "ssh_upload",
-    "Upload a local file to a remote host via SFTP.",
+    `Upload a local file to a remote host via SFTP.${POLICY_EXEMPT_NOTE}`,
     {
       ...connectionParams,
       localPath: z.string().describe("Path to the local file to upload"),
@@ -203,10 +254,14 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_mkdir",
-    "Create a directory on a remote host via SFTP. Set `recursive: true` to create parent directories as needed (like `mkdir -p`). Existing intermediate dirs are tolerated; an existing leaf path is still an error.",
+    `Create a directory on a remote host via SFTP. Set \`recursive: true\` to create parent directories as needed (like \`mkdir -p\`). Existing intermediate dirs are tolerated; an existing leaf path is still an error. Unlike the other SFTP tools, the path may be relative.${POLICY_EXEMPT_NOTE}`,
     {
       ...connectionParams,
-      path: z.string().describe("Absolute path of the directory to create"),
+      path: z
+        .string()
+        .describe(
+          "Path of the directory to create. Absolute (starting with /) is recommended and unambiguous. A relative path is also accepted and resolves against the SFTP working directory, which is normally the remote user's home. ~ is NOT expanded — SFTP has no shell to expand it.",
+        ),
       recursive: z
         .boolean()
         .optional()
@@ -222,7 +277,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_delete",
-    "Delete a file or empty directory on a remote host via SFTP. Auto-detects the path type and calls the right SFTP op (unlink for files/symlinks, rmdir for empty dirs). Recursive directory delete is intentionally NOT supported -- for that, use ssh_exec with `rm -rf` explicitly so the destructive intent is visible in the tool trace.",
+    `Delete a file or empty directory on a remote host via SFTP. Auto-detects the path type and calls the right SFTP op (unlink for files/symlinks, rmdir for empty dirs). Recursive directory delete is intentionally NOT supported -- for that, use ssh_exec with \`rm -rf\` explicitly so the destructive intent is visible in the tool trace.${POLICY_EXEMPT_NOTE}`,
     {
       ...connectionParams,
       path: AbsoluteRemotePathSchema.describe(
@@ -413,7 +468,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_multi_exec",
-    "Execute a command on multiple remote hosts in parallel. Returns results per host. Use this instead of calling ssh_exec multiple times — it's faster and shows results side by side. Subject to SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST if configured (policy is checked once before fan-out).",
+    "Execute a command on multiple remote hosts in parallel. Returns results per host. Use this instead of calling ssh_exec multiple times — it's faster and shows results side by side. Use `env` to set environment variables for this call without modifying the command string. Subject to SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST if configured (policy is checked once, against the env-prefixed command, before fan-out).",
     {
       hosts: z.array(z.string()).describe("List of SSH hostnames or IPs"),
       command: z.string().describe("Shell command to execute on all hosts"),
@@ -421,12 +476,16 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       username: UsernameSchema,
       privateKeyPath: KeyPathSchema,
       password: PasswordSchema,
+      env: EnvSchema,
       timeout: TimeoutSchema,
     },
-    async ({ hosts, command, port, username, privateKeyPath, password, timeout }) => {
-      enforcePolicy(command);
+    async ({ hosts, command, port, username, privateKeyPath, password, env, timeout }) => {
+      // Same env-prefix + policy semantics as ssh_exec: one prefixed command string, checked
+      // once here, then sent verbatim to every host. multiExec takes the final string.
+      const { finalCommand, envPrefixApplied } = applyEnvPrefix(command, env);
+      enforcePolicy(finalCommand, { envPrefixApplied });
       const hostConfigs = hosts.map((host) => ({ host, port, username, privateKeyPath, password }));
-      const results = await multiExec(connectionPool, hostConfigs, command, timeout || 30000);
+      const results = await multiExec(connectionPool, hostConfigs, finalCommand, timeout || 30000);
 
       const lines: string[] = [];
       for (const r of results) {
@@ -436,6 +495,9 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
         } else {
           if (r.stdout) lines.push(r.stdout);
           if (r.stderr) lines.push(`[stderr] ${r.stderr}`);
+          // Same reason ssh_exec emits it above: a signal-killed command reports `code: -1`,
+          // which on its own is indistinguishable from a generic channel failure.
+          if (r.signal) lines.push(`[signal: ${r.signal}]`);
           lines.push(`[exit code: ${r.code}]`);
         }
         lines.push("");
@@ -492,13 +554,17 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       return connectionPool.withConnection(conn, async (client) => {
         const output = await tail(client, path, lines || 100, grep, timeout || 30000);
         if (!output.trim()) {
+          // Reachable only when the remote produced no stdout AND no stderr. A missing or
+          // unreadable file cannot land here: tail() throws on any non-empty stderr
+          // (src/ops.ts), which is exactly what tail writes for those cases. So the only
+          // thing this branch can be reporting is genuinely blank content.
           return {
             content: [
               {
                 type: "text",
                 text: grep
                   ? `No lines matching "${grep}" in last ${lines || 100} lines.`
-                  : "File is empty or does not exist.",
+                  : "File is empty (no content in the last lines read; whitespace-only counts as empty here).",
               },
             ],
           };

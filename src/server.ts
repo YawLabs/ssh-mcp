@@ -53,10 +53,20 @@ export {
 } from "./env.js";
 export type { FindOptions, MultiExecHost, MultiExecResult, ServiceStatus } from "./ops.js";
 export { find, multiExec, serviceStatus, tail } from "./ops.js";
+export type { PolicyContext } from "./policy.js";
 export { enforcePolicy, isPolicyConfigured } from "./policy.js";
 export type { PoolOptions } from "./pool.js";
 export { ConnectionPool } from "./pool.js";
-export type { ExecResult, FileStats, ResolvedConfig, SSHConfig } from "./ssh.js";
+// HostKeyRejection / HostKeyRejectionReason are named by the public ResolvedConfig,
+// so a consumer cannot fully type that value without them.
+export type {
+  ExecResult,
+  FileStats,
+  HostKeyRejection,
+  HostKeyRejectionReason,
+  ResolvedConfig,
+  SSHConfig,
+} from "./ssh.js";
 export {
   connect,
   connectRaw,

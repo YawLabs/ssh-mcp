@@ -3,12 +3,17 @@ import { shellQuote } from "../ops.js";
 import { ConnectionPool } from "../pool.js";
 import { registerTools } from "../tools.js";
 
-// These tests cover two HIGH-severity gaps in the ssh_exec handler (src/tools.ts:54-78):
+// These tests cover two HIGH-severity gaps in the ssh_exec handler -- the `ssh_exec`
+// server.tool registration in src/tools.ts and the shared `applyEnvPrefix` helper it
+// calls. (Referenced by symbol, not line number: the earlier line range in this comment
+// went stale the first time the helper was extracted.)
 //
 //   Gap 1 -- env-var prefixing: when `env` is supplied the handler builds a
 //   `KEY='value' ...` prefix via shellQuote and prepends it to the command. Hostile
 //   values (a'b, "; rm -rf /") must be POSIX-single-quoted so the remote shell treats
-//   them as inert literal bytes, never as breakout metacharacters.
+//   them as inert literal bytes, never as breakout metacharacters. Keys get the
+//   complementary defense in applyEnvPrefix -- validated against the POSIX name
+//   grammar and rejected, since an assignment prefix cannot quote its own name.
 //
 //   Gap 2 -- policy is enforced against finalCommand (the env-PREFIXED string), not the
 //   raw command. A whitelist anchored with `^` is therefore evaluated against the prefix,

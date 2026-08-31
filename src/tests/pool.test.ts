@@ -130,7 +130,7 @@ describe("hostVerifier (via resolveConfig)", () => {
     vi.unstubAllEnvs();
   });
 
-  it("accepts unknown hosts by default (TOFU)", () => {
+  it("accepts unknown hosts by default (trust-always -- no key is ever persisted)", () => {
     const resolved = resolveConfig({ host: UNKNOWN });
     const verify = resolved.connectConfig.hostVerifier as (key: Buffer) => boolean;
     expect(verify(Buffer.from("fake-key-bytes"))).toBe(true);

@@ -16,6 +16,14 @@ export interface MultiExecResult {
   stdout: string;
   stderr: string;
   code: number;
+  /**
+   * Signal name (e.g. "TERM") when the remote channel closed via signal instead of exit --
+   * mirrors ExecResult.signal (src/ssh.ts). A signal-killed command reports `code: -1`, the
+   * same sentinel exec() uses for "no exit code", so without the signal name a caller cannot
+   * tell "the remote was killed" from "the channel died". ssh_exec already surfaces it; this
+   * field is what lets ssh_multi_exec do the same instead of printing a bare `[exit code: -1]`.
+   */
+  signal?: string;
   error?: string;
 }
 
@@ -37,6 +45,9 @@ export async function multiExec(
     hosts.map(async (hostConfig) => {
       return pool.withConnection(hostConfig, async (client) => {
         const result = await exec(client, command, timeoutMs);
+        // Spreading the whole ExecResult carries `signal` (and the truncation flags) through
+        // per-host without re-listing every field; `signal` is declared on MultiExecResult so
+        // the ssh_multi_exec formatter can actually see it.
         return { host: hostConfig.host, ...result };
       });
     }),
@@ -75,6 +86,12 @@ export interface FindOptions {
 // Keep the operator-facing strings below in sync with this character class.
 const VALID_FIND_SIZE = /^\d+[cwbkMG]?$/;
 
+// find's expression operators that do NOT start with `-`. Both GNU and BSD match these as
+// operators only when the operand is EXACTLY the token, so the set is exact-match, not a
+// leading-character class: `(archive)/2024` and `!important` are already read as paths and
+// must stay untouched.
+const FIND_EXPRESSION_TOKENS = new Set(["(", ")", "!", ","]);
+
 export async function find(client: Client, options: FindOptions, timeoutMs = 30000): Promise<string[]> {
   if (options.minsize && !VALID_FIND_SIZE.test(options.minsize)) {
     throw new Error(
@@ -87,10 +104,26 @@ export async function find(client: Client, options: FindOptions, timeoutMs = 300
     );
   }
 
-  // `--` separates the path from any options that follow, so a path that starts with `-`
-  // isn't reparsed as a find option. shellQuote alone only blocks shell-level injection;
-  // find's own argument parser still treats a leading `-` on a bare path as a flag.
-  const args: string[] = ["--", shellQuote(options.path)];
+  // Two kinds of path operand get reparsed by find's own argument grammar instead of being
+  // treated as a path: one starting with `-` (read as an option), and one that is exactly an
+  // expression operator -- `(`, `)`, `!` or `,` -- none of which start with `-`. `find '('`
+  // fails with "find: paths must precede expression", which surfaces below as a stderr throw.
+  // shellQuote alone doesn't help either case -- it only blocks shell-level injection; the
+  // operand still reaches find intact.
+  //
+  // `find -- <path>` fixes both on GNU findutils but is NOT portable: `--` is a GNU
+  // extension, and BSD/macOS find treats it as a literal path operand, so the command breaks
+  // against a BSD remote. Same reasoning as the VALID_FIND_SIZE set above -- the remote's
+  // find implementation is not known ahead of time, so only use what both flavors accept.
+  //
+  // `./`-prefixing is understood identically by every find implementation: `./-rf` and `./(`
+  // are unambiguously path operands, not a flag or an operator. The rewrite is deliberately
+  // narrow -- a leading `-`, or an operand that is exactly one of the four operator tokens.
+  // Every other path is passed through untouched, so ordinary absolute and relative paths
+  // (and the printed results for them) are unchanged.
+  const pathOperand =
+    options.path.startsWith("-") || FIND_EXPRESSION_TOKENS.has(options.path) ? `./${options.path}` : options.path;
+  const args: string[] = [shellQuote(pathOperand)];
 
   if (options.maxdepth !== undefined) args.push("-maxdepth", String(options.maxdepth));
   if (options.type) args.push("-type", options.type);

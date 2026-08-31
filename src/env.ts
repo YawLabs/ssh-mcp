@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { appendFileSync, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { isValidHostname, runArgs } from "./diagnose.js";
+import { isValidHostname, probeSshConnection, runArgs, SSH_NON_KEY_FILES } from "./diagnose.js";
 import { parseSshConfigOutput } from "./ssh-config.js";
 
 export interface KeyInfo {
@@ -237,8 +237,6 @@ export function listSshKeys(): KeyInfo[] {
     }
   }
 
-  const skipFiles = new Set(["known_hosts", "known_hosts.old", "config", "authorized_keys", "environment"]);
-
   const keys: KeyInfo[] = [];
 
   let files: string[];
@@ -249,7 +247,7 @@ export function listSshKeys(): KeyInfo[] {
   }
 
   for (const file of files) {
-    if (file.endsWith(".pub") || file.startsWith(".") || skipFiles.has(file)) continue;
+    if (file.endsWith(".pub") || file.startsWith(".") || SSH_NON_KEY_FILES.has(file)) continue;
 
     const filePath = join(sshDir, file);
     try {
@@ -349,6 +347,62 @@ export function configLookup(host: string): ConfigLookupResult | { error: string
   };
 }
 
+type KnownHostRemoval = { result: "removed" | "absent" | "failed"; output: string };
+
+// `ssh-keygen -R <target>` EXITS 0 whether or not the target was in known_hosts,
+// so branching on the exit code alone claimed "Removed old host key" on every
+// first-time host -- a removal that did not happen. Classify on the output text.
+//
+// Which stream carries what is load-bearing here. Probed on OpenSSH_10.2p1:
+//   hit  -> STDOUT: "# Host <t> found: line N" (one per hit) + "<path> updated."
+//   miss -> STDERR: "Host <t> not found in <path>"   (stdout is EMPTY)
+// Both exit 0; only a real error (e.g. "Cannot stat <path>: No such file or
+// directory") exits non-zero. `runArgs` merges stderr into `stdout` ONLY on its
+// failure path -- on a zero exit it returns stdout alone and DISCARDS stderr.
+// Since this function returns early on !ok, it classifies exclusively on the
+// zero-exit path, which is precisely where stderr is gone. So the miss marker is
+// not visible here at all on this OpenSSH, and testing for its ABSENCE would
+// report "removed" for every miss -- reinstating the very bug above.
+//
+// Therefore classify POSITIVELY on the hit markers and FAIL CLOSED: no hit
+// marker means "absent" (under-claim), never "removed" (over-claim). That is
+// correct whichever stream a given OpenSSH build uses for the miss line.
+//
+// Both markers are anchored so `target` cannot forge them. isValidHostname
+// permits [a-zA-Z0-9._-] only, so a host can contain neither the space+colon of
+// "found: line" nor a trailing " updated." at end-of-line.
+const KEYGEN_REMOVED = [/(?:^|\s)found: line \d+/m, / updated\.$/m];
+
+// A known_hosts file that does not exist at all is not a failure -- there is simply
+// nothing to remove, which is the normal state on a fresh machine. Probed on
+// OpenSSH_10.2p1: that case exits 255 with "Cannot stat <path>: No such file or
+// directory", so without this it lands in the `!ok` branch below and a first-time
+// host reports "Could not remove existing host key ..." even though the overall
+// operation succeeded. Matched loosely (any "Cannot stat" + not-found) because the
+// path in the message is the user's, and locale may reword the errno string.
+const KEYGEN_NO_FILE = /Cannot stat .*No such file or directory/s;
+
+function removeKnownHostEntry(target: string): KnownHostRemoval {
+  const { stdout, ok } = runArgs("ssh-keygen", ["-R", target]);
+  if (!ok) {
+    return KEYGEN_NO_FILE.test(stdout) ? { result: "absent", output: stdout } : { result: "failed", output: stdout };
+  }
+  if (KEYGEN_REMOVED.some((re) => re.test(stdout))) return { result: "removed", output: stdout };
+  return { result: "absent", output: stdout };
+}
+
+// Turns a removal outcome into an action line that states what actually happened.
+function describeRemoval(target: string, removal: KnownHostRemoval): string {
+  switch (removal.result) {
+    case "removed":
+      return `Removed old host key for ${target}`;
+    case "absent":
+      return `No existing host key for ${target} (nothing to remove)`;
+    default:
+      return `Could not remove existing host key for ${target}: ${removal.output || "ssh-keygen failed"}`;
+  }
+}
+
 export function fixKnownHosts(host: string, port = 22): { status: "ok" | "error"; message: string; actions: string[] } {
   if (!isValidHostname(host)) {
     return { status: "error", message: `Invalid hostname: "${host}"`, actions: [] };
@@ -356,16 +410,13 @@ export function fixKnownHosts(host: string, port = 22): { status: "ok" | "error"
 
   const actions: string[] = [];
 
-  // Remove stale entry
-  const { ok: removeOk } = runArgs("ssh-keygen", ["-R", host]);
-  if (removeOk) {
-    actions.push(`Removed old host key for ${host}`);
-  }
+  // Remove stale entry (if there is one -- see removeKnownHostEntry)
+  actions.push(describeRemoval(host, removeKnownHostEntry(host)));
 
   // Also remove [host]:port if non-standard port
   if (port !== 22) {
-    const { ok } = runArgs("ssh-keygen", ["-R", `[${host}]:${port}`]);
-    if (ok) actions.push(`Removed old host key for [${host}]:${port}`);
+    const target = `[${host}]:${port}`;
+    actions.push(describeRemoval(target, removeKnownHostEntry(target)));
   }
 
   // Re-scan
@@ -441,58 +492,35 @@ export function testConnection(host: string, port = 22): { status: "ok" | "warni
     return { status: "error", message: `Invalid hostname: "${host}"` };
   }
 
-  const start = Date.now();
-  // StrictHostKeyChecking=no on a read-only "echo SSH_OK" probe. No passwords or
-  // private-key material transit -- BatchMode=yes suppresses password prompts and ssh
-  // never sends private keys over the wire. But the SSH client WILL attempt pubkey auth
-  // against the (possibly-MitM'd) endpoint, so the public-key fingerprints of any
-  // identities loaded in the agent are observable to whatever answers on this port.
-  // For real connections, hostVerifier in resolveConfig (src/ssh.ts) enforces
-  // known_hosts matching and prevents this exposure.
-  const { ok, stdout } = runArgs("ssh", [
-    "-o",
-    "ConnectTimeout=5",
-    "-o",
-    "BatchMode=yes",
-    "-o",
-    "StrictHostKeyChecking=no",
-    "-p",
-    String(port),
-    "--",
-    host,
-    "echo",
-    "SSH_OK",
-  ]);
-  const elapsed = Date.now() - start;
+  // The probe command and its error classification are shared with
+  // checkConnectivity in diagnose.ts -- the two used to carry independent copies of
+  // the same ~40 lines. Only the wording and the elapsed-ms timing below are
+  // specific to this tool.
+  const { outcome, output, elapsedMs } = probeSshConnection(host, port);
 
-  if (ok && stdout.includes("SSH_OK")) {
-    return { status: "ok", message: `Connected to ${host}:${port} in ${elapsed}ms` };
+  switch (outcome) {
+    case "ok":
+      return { status: "ok", message: `Connected to ${host}:${port} in ${elapsedMs}ms` };
+    case "permission-denied":
+      return {
+        status: "error",
+        message: `Authentication failed to ${host}:${port} (${elapsedMs}ms). Key not authorized. Check: ssh-add -l, verify correct username, verify key is in remote authorized_keys.`,
+      };
+    case "connection-refused":
+      return {
+        status: "error",
+        message: `Connection refused at ${host}:${port}. SSH server not running or port blocked.`,
+      };
+    case "timed-out":
+      return { status: "error", message: `Connection timed out to ${host}:${port}. Host down or firewall blocking.` };
+    case "host-key-mismatch":
+      return {
+        status: "error",
+        message: `Host key mismatch for ${host}. Instance was likely recreated. Fix with ssh_known_hosts_fix.`,
+      };
+    case "dns-failure":
+      return { status: "error", message: `Could not resolve "${host}". Check DNS, /etc/hosts, or SSH config.` };
+    default:
+      return { status: "error", message: `Connection failed to ${host}:${port}: ${output}` };
   }
-
-  if (stdout.includes("Permission denied")) {
-    return {
-      status: "error",
-      message: `Authentication failed to ${host}:${port} (${elapsed}ms). Key not authorized. Check: ssh-add -l, verify correct username, verify key is in remote authorized_keys.`,
-    };
-  }
-  if (stdout.includes("Connection refused")) {
-    return {
-      status: "error",
-      message: `Connection refused at ${host}:${port}. SSH server not running or port blocked.`,
-    };
-  }
-  if (stdout.includes("timed out")) {
-    return { status: "error", message: `Connection timed out to ${host}:${port}. Host down or firewall blocking.` };
-  }
-  if (stdout.includes("Host key verification failed")) {
-    return {
-      status: "error",
-      message: `Host key mismatch for ${host}. Instance was likely recreated. Fix with ssh_known_hosts_fix.`,
-    };
-  }
-  if (stdout.includes("Could not resolve")) {
-    return { status: "error", message: `Could not resolve "${host}". Check DNS, /etc/hosts, or SSH config.` };
-  }
-
-  return { status: "error", message: `Connection failed to ${host}:${port}: ${stdout}` };
 }
