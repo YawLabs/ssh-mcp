@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Client, ConnectConfig } from "ssh2";
-import { connectWithProxy, formatDiagnostics, resolveConfig, type SSHConfig } from "./ssh.js";
+import { connectWithProxy, enhanceSshError, type ResolvedConfig, resolveConfig, type SSHConfig } from "./ssh.js";
 
 interface PoolEntry {
   client: Client;
@@ -56,11 +56,33 @@ function authFingerprint(cc: ConnectConfig): string {
   return h.digest("hex").slice(0, 16);
 }
 
+// resolveConfig() does real I/O (readFileSync on privateKeyPath, `ssh -G`) and can
+// throw. It used to sit OUTSIDE acquire()'s diagnostic wrapper, so a bad
+// privateKeyPath escaped as a raw readFileSync ENOENT with none of the
+// auto-diagnostics this server advertises. Routed through the same
+// `enhanceSshError` helper the connect path uses -- one shape, not two.
+function resolveOrDiagnose(config: SSHConfig): ResolvedConfig {
+  try {
+    return resolveConfig(config);
+  } catch (err: unknown) {
+    throw enhanceSshError(err, config.host);
+  }
+}
+
 export class ConnectionPool {
   private entries = new Map<string, PoolEntry>();
   // Coalesces concurrent connect attempts for the same key so we don't open N
   // duplicate TCP connections when N tool calls fire simultaneously.
-  private pending = new Map<string, Promise<Client>>();
+  //
+  // The ResolvedConfig is stored alongside the promise because the coalesced dial
+  // runs with the FIRST caller's resolved: only that one's `hostVerifier` is ever
+  // invoked, so only that one's `hostKeyRejection` side channel records why the
+  // server's key was turned down. Waiters must report the failure from THAT resolved
+  // rather than their own (whose verifier never ran and whose rejection is still
+  // null), or one caller gets "the server offered an ed25519 key but known_hosts
+  // has only ecdsa" while the other N-1 get generic environment diagnostics for the
+  // very same failure.
+  private pending = new Map<string, { promise: Promise<Client>; resolved: ResolvedConfig }>();
   private idleTtlMs: number;
   private maxPoolSize: number;
   // Total number of successful connects ever made by this pool. Useful for
@@ -77,7 +99,7 @@ export class ConnectionPool {
   }
 
   async acquire(config: SSHConfig): Promise<Client> {
-    const resolved = resolveConfig(config);
+    const resolved = resolveOrDiagnose(config);
     const cc = resolved.connectConfig;
     const key = `${cc.username}@${cc.host}:${cc.port}#${authFingerprint(cc)}`;
 
@@ -108,8 +130,8 @@ export class ConnectionPool {
       }
 
       // Slow path: share a single in-flight connect across concurrent callers.
-      let pending = this.pending.get(key);
-      if (!pending) {
+      let inflight = this.pending.get(key);
+      if (!inflight) {
         // Eviction is only needed when we're about to create a new entry.
         if (this.entries.size >= this.maxPoolSize) {
           let evicted = false;
@@ -131,7 +153,7 @@ export class ConnectionPool {
           }
         }
 
-        pending = (async () => {
+        const promise = (async () => {
           try {
             const client = await connectWithProxy(resolved);
             // If drain() ran while we were dialing, do not register this client
@@ -171,21 +193,20 @@ export class ConnectionPool {
             this.pending.delete(key);
           }
         })();
-        this.pending.set(key, pending);
+        // `resolved` here is this caller's, and it is the one the factory above dials
+        // with -- so it is also the one whose hostVerifier writes the rejection.
+        inflight = { promise, resolved };
+        this.pending.set(key, inflight);
       }
 
       let client: Client;
       try {
-        client = await pending;
+        client = await inflight.promise;
       } catch (err: unknown) {
-        const diag = formatDiagnostics(config.host);
-        if (diag) {
-          const message = err instanceof Error ? err.message : String(err);
-          const enhanced = new Error(`${message}\n\nSSH Diagnostics:\n${diag}`);
-          enhanced.cause = err;
-          throw enhanced;
-        }
-        throw err;
+        // Deliberately `inflight.resolved`, not this caller's `resolved`: see the
+        // comment on `pending`. Every waiter on one coalesced dial reports the same
+        // reason, because there was only ever one dial to have a reason.
+        throw enhanceSshError(err, config.host, inflight.resolved);
       }
 
       // NOTE: There is a narrow window between `connectWithProxy` resolving and

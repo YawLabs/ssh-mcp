@@ -94,8 +94,8 @@ Tools that fix your local SSH setup so everything else — git, deploys, tunnels
 | `ssh_download` | Download a file from a remote host to local filesystem. |
 | `ssh_ls` | List files in a directory on a remote host. |
 | `ssh_stat` | Get metadata for a file or directory (size, mode in octal, uid/gid, mtime/atime, isFile/isDirectory/isSymbolicLink). Use instead of parsing `ls -la`. |
-| `ssh_mkdir` | Create a directory via SFTP. Set `recursive: true` for `mkdir -p` behavior. |
-| `ssh_delete` | Delete a file or empty directory via SFTP. Auto-dispatches unlink vs rmdir based on the path's type. Recursive directory delete is intentionally NOT supported -- use `ssh_exec rm -rf` if you need it. |
+| `ssh_mkdir` | Create a directory via SFTP. Set `recursive: true` for `mkdir -p` behavior. Unlike the other SFTP tools, the path may be relative — it resolves against the SFTP working directory (normally the remote user's home). `~` is not expanded; SFTP has no shell. |
+| `ssh_delete` | Delete a file or empty directory via SFTP. Auto-dispatches unlink vs rmdir based on the path's *own* type (`lstat`), so a symlink is always unlinked — never followed — including a dangling one or one pointing at a directory. Recursive directory delete is intentionally NOT supported -- use `ssh_exec rm -rf` if you need it. |
 
 ### Higher-level operations
 
@@ -103,7 +103,7 @@ Tools that wrap common patterns agents build with ssh_exec — faster and less e
 
 | Tool | Description |
 |------|-------------|
-| `ssh_multi_exec` | Run a command on multiple hosts in parallel. Returns results per host. Subject to [command policy](#command-policy) if configured (policy is checked once before fan-out). |
+| `ssh_multi_exec` | Run a command on multiple hosts in parallel. Returns results per host. Optional `env` param sets per-call environment variables (same POSIX-safe prefix as `ssh_exec`, applied once and sent to every host). Subject to [command policy](#command-policy) if configured (policy is checked once, against the env-prefixed command, before fan-out). |
 | `ssh_find` | Search for files remotely with structured parameters (`name`, `type`, `size`, `depth`, `newer` — match files modified more recently than a reference path). |
 | `ssh_tail` | Read the last N lines of a file, optionally filtered by a grep pattern. |
 | `ssh_service_status` | Check systemd service status (active, PID, uptime, description). Flags `isError` only when the unit could not be found / queried, not when an existing unit is intentionally stopped. |
@@ -129,8 +129,10 @@ All connections respect your `~/.ssh/config`. Host aliases, custom ports, userna
 All remote operations verify the server's host key against `~/.ssh/known_hosts`:
 
 - **Known host, key matches** — accept.
-- **Known host, key changed** — reject (MITM protection).
-- **Unknown host** — accept on first connection (TOFU). Use `ssh_known_hosts_fix` to pin the key for future mismatch detection.
+- **Known host, key changed** — reject (MITM protection). The rejection message distinguishes a genuine key mismatch from "the server offered a key type your `known_hosts` entry doesn't cover", so a missing ed25519 line doesn't read as an attack.
+- **Unknown host** — accept, unless `SSH_MCP_STRICT_HOST_KEY=1`.
+
+**That last branch is trust-always, not TOFU.** Real trust-on-first-use pins the key it saw the first time and rejects a change afterwards. The connection path never writes to `known_hosts` — no tool adds an entry as a side effect of connecting — so connecting pins nothing: *every* connection to a host absent from `known_hosts` is a "first" use and is accepted, including one where an attacker swapped the key since your last call. Only hosts put into `known_hosts` out of band get mismatch protection — by you, by `ssh-keyscan`, or by `ssh_known_hosts_fix`, the one tool here that does write the file. Call it explicitly to add an entry so future changes are caught.
 
 For stricter environments, set `SSH_MCP_STRICT_HOST_KEY=1` to reject unknown hosts. Add them explicitly with `ssh_known_hosts_fix` first.
 
@@ -157,11 +159,21 @@ SSH_MCP_COMMAND_BLACKLIST="^rm ,^shutdown,^reboot,^mkfs,^dd if=,>\s*/dev/"
 
 Blocked commands surface as a clear error mentioning which pattern (or which env var) rejected the call, so the agent can adapt rather than guess. Policy is enforced before the SSH connection opens — no remote process is started for a blocked command.
 
-The structured higher-level tools (`ssh_find`, `ssh_tail`, `ssh_service_status`, SFTP ops) are exempt from policy. They build commands from typed parameters, so a tight `^ls` whitelist would otherwise force you to allow `^find `, `^tail `, `^systemctl ` just to keep those tools working — defeating the point of a tight whitelist.
+#### Scope: policy covers `ssh_exec` and `ssh_multi_exec` only
 
-#### Policy interaction with `ssh_exec`'s `env` parameter
+Every other tool runs unchecked. That splits into two very different cases.
 
-When `ssh_exec` is called with `env: { KEY: "value" }`, the values are injected as a `KEY='value' ...` shell prefix before the command (see the `ssh_exec` description). **Policy is checked against the full prefixed command**, not the bare `command` argument. That's the safer ordering at the protocol layer — but it means whitelist patterns need to anticipate the prefix and must be **anchored**, not substring matches:
+The structured **read** tools are all exempt, but for two different reasons — they don't reach the remote the same way.
+
+`ssh_find`, `ssh_tail` and `ssh_service_status` do build a shell command (`find`, `tail`, `systemctl`), but from typed parameters with every interpolated value shell-quoted, never from free-form agent input. They're exempt for ergonomics: a tight `^ls` whitelist would otherwise force you to allow `^find `, `^tail `, `^systemctl ` just to keep those tools working — defeating the point of a tight whitelist.
+
+`ssh_ls`, `ssh_stat`, `ssh_read_file` and `ssh_download` build no command at all. They're pure SFTP (`readdir`, `stat`, `readFile`, `fastGet`), so — exactly like the mutating SFTP tools below — there is no command string for a regex to match, and these env vars could not gate them even if you wanted them to. They're grouped with the reads rather than flagged as a gap because they don't mutate remote state. One caveat: `ssh_download` is non-mutating on the **remote** only — it writes to whatever local path it's handed, and these env vars don't constrain that either.
+
+**The SFTP tools that mutate remote state are also unchecked, and that is a genuine gap — not an ergonomics call.** `ssh_write_file`, `ssh_upload`, `ssh_mkdir`, and `ssh_delete` never build a shell command string, so a command-shaped regex has nothing to match. Concretely: `SSH_MCP_COMMAND_BLACKLIST="^rm "` does **not** stop `ssh_delete`, and `SSH_MCP_COMMAND_WHITELIST="^ls "` does **not** stop `ssh_write_file`. Closing this would need a separate path-policy mechanism, which this server deliberately does not have. If you must prevent remote mutation, drop those four tools from your MCP client's tool allowlist (or run a client that gates them) — these two env vars cannot do it.
+
+#### Policy interaction with the `env` parameter (`ssh_exec`, `ssh_multi_exec`)
+
+When `ssh_exec` or `ssh_multi_exec` is called with `env: { KEY: "value" }`, the values are injected as a `KEY='value' ...` shell prefix before the command (see the tool descriptions). **Policy is checked against the full prefixed command**, not the bare `command` argument — once, before fan-out, in the `ssh_multi_exec` case. That's the safer ordering at the protocol layer — but it means whitelist patterns need to anticipate the prefix and must be **anchored**, not substring matches:
 
 ```bash
 # WRONG -- blocks any ssh_exec call that uses `env`, because the final command
@@ -171,6 +183,8 @@ SSH_MCP_COMMAND_WHITELIST="^ls "
 # RIGHT -- allow zero or more `KEY='value' ` prefixes before the real command.
 SSH_MCP_COMMAND_WHITELIST="^([A-Za-z_][A-Za-z0-9_]*='[^']*' )*ls( |$)"
 ```
+
+You don't have to diagnose this from a bare rejection: when a whitelist blocks a call that used `env`, the error appends a note explaining that the prefix is why the `^` anchor stopped matching, and suggests the tolerant pattern above.
 
 **Avoid substring-match patterns** like ` ls ` if you're worried about a hostile agent. An agent could pass `env: { ATTACK: " ls " }` to make the final command `ATTACK=' ls ' rm -rf /`, which matches a substring ` ls ` and bypasses the whitelist. Anchored patterns of the form above don't have this weakness because they require the real command name to follow the env-prefix block, not appear inside a quoted env value.
 
@@ -184,7 +198,9 @@ If you don't trust the agent's `env` values at all, the simplest mitigation is t
 
 ### Windows support
 
-On Windows, ssh-mcp detects the OpenSSH Authentication Agent service automatically (via the `\\.\pipe\openssh-ssh-agent` named pipe). No `SSH_AUTH_SOCK` needed — just make sure the OpenSSH agent service is running.
+On Windows, ssh-mcp uses the OpenSSH Authentication Agent's `\\.\pipe\openssh-ssh-agent` named pipe automatically when `SSH_AUTH_SOCK` is not set. No `SSH_AUTH_SOCK` needed — just make sure the OpenSSH agent service is running.
+
+`ssh_agent_ensure` and `ssh_diagnose` probe that pipe and tell you if the service is down. Remote operations do *not*: they assume the pipe and let the connection fail on its own if the agent isn't there. That is why a stopped agent service shows up as an auth failure rather than an "agent not running" error until you run the diagnostic tools.
 
 ## Authentication
 
@@ -198,13 +214,18 @@ All remote operations accept connection parameters:
 | `privateKeyPath` | Path to SSH private key | Auto-detect |
 | `password` | SSH password (prefer keys) | — |
 
-**Auth resolution order:** ssh-mcp picks the first match from this list and does not fall through to later entries — this makes the auth method deterministic and predictable.
+**Auth resolution.** An *explicit* credential wins outright and nothing else is offered. With neither given, ssh-mcp offers the ssh-agent **and** one on-disk key **together** — the way the OpenSSH client does — and lets the server pick during the auth exchange. It is not a strict first-match chain past step 2.
 
-1. Explicit `privateKeyPath`
-2. Explicit `password`
-3. ssh-agent (`SSH_AUTH_SOCK` on Unix, `\\.\pipe\openssh-ssh-agent` on Windows)
-4. Identity files from `~/.ssh/config` for the host
-5. Default key paths (`~/.ssh/id_ed25519`, `id_rsa`, `id_ecdsa`)
+1. **Explicit `privateKeyPath`** — used alone. The agent is not offered and no other key is read.
+2. **Explicit `password`** — used alone, same as above.
+3. **Neither given** — both of the following are configured on the same connection:
+   - **ssh-agent** — `SSH_AUTH_SOCK`, or on Windows the `\\.\pipe\openssh-ssh-agent` named pipe. The Windows pipe is assumed unconditionally; ssh-mcp does not check that the OpenSSH Authentication Agent service is actually running.
+   - **One on-disk key** — the first *readable* path in `ssh -G <host>`'s `identityfile` list. OpenSSH emits that list for **every** host, including one with no `IdentityFile` line (it defaults to `~/.ssh/id_rsa`, `id_ecdsa`, `id_ecdsa_sk`, `id_ed25519`, `id_ed25519_sk`), so this is the normal path — not a path reserved for hosts you configured an identity for. ssh-mcp's own built-in list (`~/.ssh/id_ed25519`, `id_rsa`, `id_ecdsa`) is a fallback used only when `ssh -G` cannot run at all, e.g. no SSH client installed.
+
+Two things worth knowing about step 3:
+
+- **Only one on-disk key is ever offered** — the first candidate that exists. ssh-mcp does not walk the whole identity list the way `ssh` does, so if the first readable key is the wrong one, authentication rests on the agent's keys. Pass `privateKeyPath` to force a specific key.
+- **When an agent is configured, an *encrypted* on-disk key is skipped** and the scan moves to the next candidate. The underlying ssh2 library parses `privateKey` eagerly and errors with "no passphrase given" on an encrypted key, which would break the common setup of an encrypted key on disk with its decrypted copy loaded in the agent. With no agent configured, the first existing key is loaded regardless of encryption and ssh2 surfaces the passphrase error itself. Because the Windows pipe above is assumed unconditionally, the skip is always in force on Windows.
 
 ## Example workflows
 

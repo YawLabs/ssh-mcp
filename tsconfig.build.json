@@ -1,0 +1,24 @@
+{
+  // Declaration emit for the published package.
+  //
+  // tsup's own `dts` step cannot run here: it inlines rollup-plugin-dts 6.1.1,
+  // which predates TypeScript 7 and dies with "Cannot read properties of
+  // undefined (reading 'useCaseSensitiveFileNames')". tsup 8.5.1 is the latest
+  // release, and its alternative `experimentalDts` engine fails too
+  // ("parseJsonConfigFileContent is not a function") -- tsup's TypeScript
+  // interop has not caught up with TS 7's module shape. So `tsc` emits the
+  // declarations instead; it is the reference implementation and needs no
+  // third-party plugin to track the compiler version.
+  //
+  // This config exists only to narrow `include` to the shipped sources. The
+  // root tsconfig covers `src` wholesale, which is right for typechecking but
+  // would publish declarations for every test file into dist/.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // No declaration maps in the published package: they point back at src/*.ts,
+    // which `files` does not ship, so every map would dangle for consumers.
+    "declarationMap": false
+  },
+  "include": ["src"],
+  "exclude": ["node_modules", "dist", "src/tests", "src/**/*.test.ts"]
+}

@@ -1,7 +1,15 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { diagnose } from "./diagnose.js";
-import { checkGitSsh, configLookup, ensureAgent, fixKnownHosts, listSshKeys, loadKey, testConnection } from "./env.js";
+import {
+  checkGitSsh,
+  configLookup,
+  ensureAgent,
+  fixKnownHosts,
+  listSshKeysDetailed,
+  loadKey,
+  testConnection,
+} from "./env.js";
 import { find, multiExec, serviceStatus, shellQuote, tail } from "./ops.js";
 import { enforcePolicy } from "./policy.js";
 import { ConnectionPool } from "./pool.js";
@@ -13,8 +21,9 @@ const HostSchema = z.string().describe("SSH hostname or IP address");
 // relative paths through a shell — they land on the server verbatim, relative
 // to the SFTP CWD (usually the user's home dir). Absolute paths are unambiguous;
 // ~ paths cause ENOENT on most servers. Matches the enforcement already on
-// ssh_read_file. ssh_mkdir is intentionally excluded: its makeDir implementation
-// supports relative paths from CWD and is the only SFTP tool that documents this.
+// ssh_read_file. ssh_mkdir is intentionally excluded: makeDir (src/ssh.ts) walks
+// path segments itself and handles a CWD-relative path, so ssh_mkdir takes a
+// plain z.string() and its `path` description spells out that both forms work.
 const AbsoluteRemotePathSchema = z.string().refine((p) => p.startsWith("/"), {
   message: "Path must be absolute (start with /). SFTP does not expand ~ or resolve relative paths through a shell.",
 });
@@ -34,6 +43,13 @@ const TimeoutSchema = z
   .optional()
   .describe("Command timeout in milliseconds (default: 30000)");
 
+const EnvSchema = z
+  .record(z.string(), z.string())
+  .optional()
+  .describe(
+    "Environment variables to set for this command. Injected as a `KEY='value' ...` prefix; works on any sshd regardless of AcceptEnv config. VALUES are POSIX-single-quoted, so any byte is safe in a value. KEYS cannot be quoted (a shell assignment prefix requires a bare name), so each key must match /^[A-Za-z_][A-Za-z0-9_]*$/ (the POSIX name grammar) — a key outside that grammar is rejected and the call fails before anything is sent to a host. Command policy is checked against the PREFIXED command, so a `^`-anchored whitelist pattern stops matching once this is set.",
+  );
+
 const connectionParams = {
   host: HostSchema,
   port: PortSchema,
@@ -41,6 +57,59 @@ const connectionParams = {
   privateKeyPath: KeyPathSchema,
   password: PasswordSchema,
 };
+
+// Standard note appended to every tool description that command policy does NOT cover.
+// See the SCOPE LIMIT block in src/policy.ts -- a blacklist is not whole-server coverage,
+// and an admin who assumes otherwise leaves remote mutation wide open.
+const POLICY_EXEMPT_NOTE =
+  " NOT gated by SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST: command policy applies only to ssh_exec and ssh_multi_exec, so a blacklist such as `^rm` does NOT block this tool.";
+
+// POSIX portable environment-variable name grammar (IEEE Std 1003.1, "Name"): an initial
+// letter or underscore followed by letters, digits, or underscores. Keys are interpolated
+// into the remote command as a BARE assignment prefix, so this is the only thing standing
+// between an env key and the remote shell.
+const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * Build the `KEY='value' ...` env prefix shared by ssh_exec and ssh_multi_exec. Works on any
+ * sshd, unlike ssh2's protocol-level env which most servers reject via AcceptEnv.
+ *
+ * VALUES are wrapped by shellQuote -- the same POSIX single-quote primitive ops.ts uses for
+ * path injection guards -- so any byte sequence in a value is inert on the remote.
+ *
+ * KEYS get no such protection: a shell assignment prefix requires a bare name, so a key
+ * cannot be quoted. Each one is therefore validated against ENV_NAME_PATTERN and a
+ * non-conforming key THROWS. Two reasons it throws rather than being dropped: silently
+ * dropping it would let the caller believe the variable was set, and the key is a live
+ * injection vector -- `{"A=1; reboot #": "x"}` would otherwise emit
+ * `A=1; reboot #='x' <command>`, running `reboot` on the remote and swallowing the real
+ * command as a comment. It is also a policy bypass, because enforcePolicy only ever sees a
+ * string whose command verb looks benign. The throw happens in the handler BEFORE
+ * enforcePolicy and before any connection is acquired, so a rejected key never reaches a host.
+ *
+ * Returns the prefixed command plus whether a prefix was actually applied. Policy is enforced
+ * on the PREFIXED string (deliberate, and pinned by src/tests/exec-env-policy.test.ts); the
+ * flag lets enforcePolicy explain a whitelist rejection that only happens because of it.
+ */
+function applyEnvPrefix(
+  command: string,
+  env: Record<string, string> | undefined,
+): { finalCommand: string; envPrefixApplied: boolean } {
+  if (!env || Object.keys(env).length === 0) {
+    return { finalCommand: command, envPrefixApplied: false };
+  }
+  const prefix = Object.entries(env)
+    .map(([k, v]) => {
+      if (!ENV_NAME_PATTERN.test(k)) {
+        throw new Error(
+          `Invalid environment variable name ${JSON.stringify(k)}: env keys must match ${ENV_NAME_PATTERN.source} (the POSIX name grammar). Values are single-quoted before they reach the remote shell, but a key is emitted as a bare \`KEY=\` assignment and cannot be quoted, so anything outside that grammar is rejected instead of escaped.`,
+        );
+      }
+      return `${k}=${shellQuote(v)}`;
+    })
+    .join(" ");
+  return { finalCommand: `${prefix} ${command}`, envPrefixApplied: true };
+}
 
 export function registerTools(server: McpServer, pool?: ConnectionPool) {
   const connectionPool = pool ?? new ConnectionPool();
@@ -53,27 +122,12 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       command: z
         .string()
         .describe("Shell command to execute on the remote host (interpreted by the remote login shell)"),
-      env: z
-        .record(z.string(), z.string())
-        .optional()
-        .describe(
-          "Environment variables to set for this command. Injected as a `KEY='value' ...` prefix; works on any sshd regardless of AcceptEnv config. Values are POSIX-single-quoted, so any byte is safe.",
-        ),
+      env: EnvSchema,
       timeout: TimeoutSchema,
     },
     async ({ command, env, timeout, ...conn }) => {
-      // Prefix env vars as `KEY='value' KEY2='value2' command`. Works on any sshd, unlike
-      // ssh2's protocol-level env which most servers reject via AcceptEnv. The single-quote
-      // wrapping (shellQuote) is the same primitive ops.ts uses for path injection guards,
-      // so any byte sequence is safe.
-      let finalCommand = command;
-      if (env && Object.keys(env).length > 0) {
-        const prefix = Object.entries(env)
-          .map(([k, v]) => `${k}=${shellQuote(v)}`)
-          .join(" ");
-        finalCommand = `${prefix} ${command}`;
-      }
-      enforcePolicy(finalCommand);
+      const { finalCommand, envPrefixApplied } = applyEnvPrefix(command, env);
+      enforcePolicy(finalCommand, { envPrefixApplied });
       return connectionPool.withConnection(conn, async (client) => {
         const result = await exec(client, finalCommand, timeout || 30000);
         const parts: string[] = [];
@@ -111,7 +165,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_write_file",
-    "Write content to a file on a remote host via SFTP. Creates or overwrites the file.",
+    `Write content to a file on a remote host via SFTP. Creates or overwrites the file.${POLICY_EXEMPT_NOTE}`,
     {
       ...connectionParams,
       path: AbsoluteRemotePathSchema.describe("Absolute path to the remote file. Must start with /."),
@@ -120,14 +174,19 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
     async ({ path, content, ...conn }) => {
       return connectionPool.withConnection(conn, async (client) => {
         await writeFile(client, path, content);
-        return { content: [{ type: "text", text: `Wrote ${content.length} bytes to ${path}` }] };
+        // Buffer.byteLength, not content.length: a JS string's .length counts UTF-16 code
+        // units, so any non-ASCII content (accents, CJK, emoji) under-reports what actually
+        // landed on the remote. ssh2's sftp.writeFile encodes a string as utf8 by default,
+        // which is what we measure here.
+        const bytes = Buffer.byteLength(content, "utf8");
+        return { content: [{ type: "text", text: `Wrote ${bytes} bytes to ${path}` }] };
       });
     },
   );
 
   server.tool(
     "ssh_upload",
-    "Upload a local file to a remote host via SFTP.",
+    `Upload a local file to a remote host via SFTP.${POLICY_EXEMPT_NOTE}`,
     {
       ...connectionParams,
       localPath: z.string().describe("Path to the local file to upload"),
@@ -167,6 +226,13 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
     async ({ path, ...conn }) => {
       return connectionPool.withConnection(conn, async (client) => {
         const files = await listDir(client, path);
+        // An empty join() is an empty text block, which a caller cannot tell apart from a
+        // read that produced nothing at all. Say so explicitly, the way ssh_find does with
+        // "No files found." -- and, like ssh_find, do NOT flag it: an empty directory is a
+        // legitimate answer to "what is in here?", not a failure.
+        if (files.length === 0) {
+          return { content: [{ type: "text", text: `Directory is empty: ${path}` }] };
+        }
         return { content: [{ type: "text", text: files.join("\n") }] };
       });
     },
@@ -174,7 +240,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_stat",
-    "Get metadata for a file or directory on a remote host via SFTP. Returns size, permissions (octal), uid/gid, mtime/atime, and type flags (isFile, isDirectory, isSymbolicLink). Use this instead of parsing `ls -la` output.",
+    "Get metadata for a file or directory on a remote host via SFTP. Returns size, permissions (octal), uid/gid, mtime/atime, and the path type. Symlinks are reported as `symlink -> <target kind>`: the type describes the link itself while size/mode/mtime describe its TARGET, and a dangling symlink is reported rather than erroring. Use this instead of parsing `ls -la` output.",
     {
       ...connectionParams,
       path: AbsoluteRemotePathSchema.describe("Absolute path to the remote file or directory. Must start with /."),
@@ -183,13 +249,13 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       return connectionPool.withConnection(conn, async (client) => {
         const stats = await statFile(client, path);
         const lines: string[] = [];
-        const kind = stats.isDirectory
-          ? "directory"
-          : stats.isSymbolicLink
-            ? "symlink"
-            : stats.isFile
-              ? "file"
-              : "other";
+        // isSymbolicLink describes the PATH, isFile/isDirectory the TARGET, so a
+        // symlink to a directory is legitimately both -- report it as "symlink ->
+        // directory" rather than picking one and hiding the other. Checking
+        // isDirectory first (as this did) made the symlink half permanently
+        // invisible, which is why the flag read as dead.
+        const targetKind = stats.isDirectory ? "directory" : stats.isFile ? "file" : "other";
+        const kind = stats.isSymbolicLink ? `symlink -> ${targetKind}` : targetKind;
         lines.push(`${path}: ${kind}`);
         lines.push(`  Size: ${stats.size} bytes`);
         lines.push(`  Mode: ${stats.modeOctal}`);
@@ -203,10 +269,14 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_mkdir",
-    "Create a directory on a remote host via SFTP. Set `recursive: true` to create parent directories as needed (like `mkdir -p`). Existing intermediate dirs are tolerated; an existing leaf path is still an error.",
+    `Create a directory on a remote host via SFTP. Set \`recursive: true\` to create parent directories as needed (like \`mkdir -p\`). Existing intermediate dirs are tolerated; an existing leaf path is still an error. Unlike the other SFTP tools, the path may be relative.${POLICY_EXEMPT_NOTE}`,
     {
       ...connectionParams,
-      path: z.string().describe("Absolute path of the directory to create"),
+      path: z
+        .string()
+        .describe(
+          "Path of the directory to create. Absolute (starting with /) is recommended and unambiguous. A relative path is also accepted and resolves against the SFTP working directory, which is normally the remote user's home. ~ is NOT expanded — SFTP has no shell to expand it.",
+        ),
       recursive: z
         .boolean()
         .optional()
@@ -222,7 +292,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_delete",
-    "Delete a file or empty directory on a remote host via SFTP. Auto-detects the path type and calls the right SFTP op (unlink for files/symlinks, rmdir for empty dirs). Recursive directory delete is intentionally NOT supported -- for that, use ssh_exec with `rm -rf` explicitly so the destructive intent is visible in the tool trace.",
+    `Delete a file or empty directory on a remote host via SFTP. Auto-detects the path type and calls the right SFTP op (unlink for files/symlinks, rmdir for empty dirs). Recursive directory delete is intentionally NOT supported -- for that, use ssh_exec with \`rm -rf\` explicitly so the destructive intent is visible in the tool trace.${POLICY_EXEMPT_NOTE}`,
     {
       ...connectionParams,
       path: AbsoluteRemotePathSchema.describe(
@@ -296,10 +366,39 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_key_list",
-    "List all SSH private keys in ~/.ssh/ with their type, fingerprint, and whether they are loaded in the agent. Use this to find which keys are available and which ones need to be loaded.",
+    "List all SSH private keys in ~/.ssh/ with their type, fingerprint, and whether they are loaded in the agent. Use this to find which keys are available and which ones need to be loaded. Reports isError only when ~/.ssh exists but could not be read -- an absent or empty ~/.ssh is a successful answer with a ssh-keygen hint.",
     {},
     async () => {
-      const keys = listSshKeys();
+      // Three different situations all produce zero keys and only one of them is fixed by
+      // running ssh-keygen, so each gets its own message and its own isError. Telling an
+      // operator whose ~/.ssh is unreadable to "generate a key" sends them the wrong way.
+      const listing = listSshKeysDetailed();
+
+      if (listing.status === "unreadable") {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Could not read ${listing.dir}: ${listing.reason}. This is NOT "no keys" -- the directory exists but could not be listed. Check that it is a directory and that you own it: ls -ld ${listing.dir}, then chmod 700 ${listing.dir}.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      if (listing.status === "no-dir") {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No ~/.ssh directory yet (${listing.dir} does not exist). Generate a key to create it: ssh-keygen -t ed25519 -C "your@email.com"`,
+            },
+          ],
+          isError: false,
+        };
+      }
+
+      const keys = listing.keys;
       if (keys.length === 0) {
         return {
           content: [
@@ -308,6 +407,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
               text: 'No SSH private keys found in ~/.ssh/. Generate one: ssh-keygen -t ed25519 -C "your@email.com"',
             },
           ],
+          isError: false,
         };
       }
 
@@ -319,7 +419,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
         if (key.fingerprint) lines.push(`  Fingerprint: ${key.fingerprint}`);
         lines.push("");
       }
-      return { content: [{ type: "text", text: lines.join("\n") }] };
+      return { content: [{ type: "text", text: lines.join("\n") }], isError: false };
     },
   );
 
@@ -396,8 +496,21 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
     "ssh_git_check",
     "Test Git-over-SSH authentication to a hosting provider (GitHub, GitLab, Bitbucket, etc). Verifies your SSH key is registered and working. Use this when git clone/pull/push fails with SSH errors.",
     {
-      host: z.string().optional().describe('Git hosting hostname (default: "github.com")'),
-      user: z.string().optional().describe('SSH user for the git host (default: "git")'),
+      // .min(1), not a bare optional string: the handler defaults with `host || "github.com"`,
+      // so an explicitly-empty host would silently probe github.com and report on a host the
+      // caller never named -- and, because "" never reaches checkGitSsh, it would skip the
+      // isValidHostname check every other host-taking tool routes its input through. Omitting
+      // the field is the way to ask for the default; "" is rejected at the schema boundary.
+      host: z
+        .string()
+        .min(1, "host must not be empty. Omit it to use the default (github.com).")
+        .optional()
+        .describe('Git hosting hostname (default: "github.com"). Omit for the default; an empty string is rejected.'),
+      user: z
+        .string()
+        .min(1, "user must not be empty. Omit it to use the default (git).")
+        .optional()
+        .describe('SSH user for the git host (default: "git"). Omit for the default; an empty string is rejected.'),
     },
     async ({ host, user }) => {
       const result = checkGitSsh(host || "github.com", user || "git");
@@ -413,7 +526,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_multi_exec",
-    "Execute a command on multiple remote hosts in parallel. Returns results per host. Use this instead of calling ssh_exec multiple times — it's faster and shows results side by side. Subject to SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST if configured (policy is checked once before fan-out).",
+    "Execute a command on multiple remote hosts in parallel. Returns results per host. Use this instead of calling ssh_exec multiple times — it's faster and shows results side by side. Use `env` to set environment variables for this call without modifying the command string. Subject to SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST if configured (policy is checked once, against the env-prefixed command, before fan-out).",
     {
       hosts: z.array(z.string()).describe("List of SSH hostnames or IPs"),
       command: z.string().describe("Shell command to execute on all hosts"),
@@ -421,12 +534,16 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       username: UsernameSchema,
       privateKeyPath: KeyPathSchema,
       password: PasswordSchema,
+      env: EnvSchema,
       timeout: TimeoutSchema,
     },
-    async ({ hosts, command, port, username, privateKeyPath, password, timeout }) => {
-      enforcePolicy(command);
+    async ({ hosts, command, port, username, privateKeyPath, password, env, timeout }) => {
+      // Same env-prefix + policy semantics as ssh_exec: one prefixed command string, checked
+      // once here, then sent verbatim to every host. multiExec takes the final string.
+      const { finalCommand, envPrefixApplied } = applyEnvPrefix(command, env);
+      enforcePolicy(finalCommand, { envPrefixApplied });
       const hostConfigs = hosts.map((host) => ({ host, port, username, privateKeyPath, password }));
-      const results = await multiExec(connectionPool, hostConfigs, command, timeout || 30000);
+      const results = await multiExec(connectionPool, hostConfigs, finalCommand, timeout || 30000);
 
       const lines: string[] = [];
       for (const r of results) {
@@ -436,6 +553,9 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
         } else {
           if (r.stdout) lines.push(r.stdout);
           if (r.stderr) lines.push(`[stderr] ${r.stderr}`);
+          // Same reason ssh_exec emits it above: a signal-killed command reports `code: -1`,
+          // which on its own is indistinguishable from a generic channel failure.
+          if (r.signal) lines.push(`[signal: ${r.signal}]`);
           lines.push(`[exit code: ${r.code}]`);
         }
         lines.push("");
@@ -492,13 +612,17 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       return connectionPool.withConnection(conn, async (client) => {
         const output = await tail(client, path, lines || 100, grep, timeout || 30000);
         if (!output.trim()) {
+          // Reachable only when the remote produced no stdout AND no stderr. A missing or
+          // unreadable file cannot land here: tail() throws on any non-empty stderr
+          // (src/ops.ts), which is exactly what tail writes for those cases. So the only
+          // thing this branch can be reporting is genuinely blank content.
           return {
             content: [
               {
                 type: "text",
                 text: grep
                   ? `No lines matching "${grep}" in last ${lines || 100} lines.`
-                  : "File is empty or does not exist.",
+                  : "File is empty (no content in the last lines read; whitespace-only counts as empty here).",
               },
             ],
           };

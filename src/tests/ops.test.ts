@@ -199,11 +199,37 @@ describe("shellQuote (exported helper used by env-prefix + path injection guards
 });
 
 describe("argument flag-injection hardening", () => {
-  it("find separates path with `--` so leading-dash paths aren't parsed as flags", async () => {
+  it("find `./`-prefixes a leading-dash path so it isn't parsed as a flag", async () => {
     const cap = capturingClient({ stdout: "", code: 0 });
     await find(cap.client, { path: "-rf" });
     const cmd = cap.lastCommand();
-    expect(cmd).toMatch(/^find -- '-rf'/);
+    // Was `find -- '-rf'`. `--` works on GNU findutils but is a GNU extension: BSD/macOS
+    // find treats it as a literal path operand, so the command breaks on a BSD remote.
+    // `./-rf` is an unambiguous path operand on every find implementation.
+    expect(cmd).toMatch(/^find '\.\/-rf'/);
+    expect(cmd).not.toContain("--");
+  });
+
+  it("find `./`-prefixes the expression operators that don't start with a dash", async () => {
+    // `(`, `)`, `!` and `,` are find OPERATORS, so they escape a leading-dash-only guard:
+    // `find '('` fails with "find: paths must precede expression", which find() surfaces as
+    // a stderr throw. `./(` is a path operand to every find implementation.
+    for (const token of ["(", ")", "!", ","]) {
+      const cap = capturingClient({ stdout: "", code: 0 });
+      await find(cap.client, { path: token });
+      expect(cap.lastCommand()).toBe(`find './${token}'`);
+    }
+  });
+
+  it("find leaves a path that merely contains an operator character alone", async () => {
+    // The rewrite is exact-match, not a leading-character class: find only treats these as
+    // operators when the operand IS the token, so rewriting these would change the printed
+    // result paths for no reason.
+    for (const path of ["(archive)/2024", "!important", "/var/log"]) {
+      const cap = capturingClient({ stdout: "", code: 0 });
+      await find(cap.client, { path });
+      expect(cap.lastCommand()).toBe(`find '${path}'`);
+    }
   });
 
   it("tail separates path with `--`", async () => {
