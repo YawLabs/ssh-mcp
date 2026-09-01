@@ -166,6 +166,7 @@ afterEach(() => {
 
 interface SftpProbe {
   stat: string[];
+  lstat: string[];
   readFile: string[];
   ended: number;
 }
@@ -196,11 +197,15 @@ function ssh2Stats(
 }
 
 /** A fake SFTPWrapper plus the client that hands it out, with an end() counter. */
-function fakeSftpClient(opts: { stat?: (path: string) => unknown; readFile?: (path: string) => Buffer | Error }): {
+function fakeSftpClient(opts: {
+  stat?: (path: string) => unknown;
+  lstat?: (path: string) => unknown;
+  readFile?: (path: string) => Buffer | Error;
+}): {
   client: any;
   probe: SftpProbe;
 } {
-  const probe: SftpProbe = { stat: [], readFile: [], ended: 0 };
+  const probe: SftpProbe = { stat: [], lstat: [], readFile: [], ended: 0 };
   const settle = (result: unknown, cb: (err: any, value?: any) => void) => {
     queueMicrotask(() => (result instanceof Error ? cb(result) : cb(undefined, result)));
   };
@@ -208,6 +213,13 @@ function fakeSftpClient(opts: { stat?: (path: string) => unknown; readFile?: (pa
     stat: (path: string, cb: (err: any, stats?: any) => void) => {
       probe.stat.push(path);
       settle(opts.stat?.(path) ?? new Error("stat not stubbed"), cb);
+    },
+    // statFile calls lstat FIRST (the path's own type), then stat only when that
+    // says symlink. With no explicit lstat stub we fall back to the stat stub,
+    // which mirrors a real server: for a non-symlink the two calls agree.
+    lstat: (path: string, cb: (err: any, stats?: any) => void) => {
+      probe.lstat.push(path);
+      settle(opts.lstat?.(path) ?? opts.stat?.(path) ?? new Error("lstat not stubbed"), cb);
     },
     readFile: (path: string, cb: (err: any, data?: Buffer) => void) => {
       probe.readFile.push(path);
@@ -377,6 +389,88 @@ describe("connectWithProxy jump-client teardown", () => {
 });
 
 // ---------------------------------------------------------------- gap 3
+
+describe("statFile symlink handling -- lstat for TYPE, stat for METADATA", () => {
+  // These are the only tests that can tell the two calls apart, so they are what
+  // actually pins the fix. Every other statFile test lets lstat fall back to the
+  // stat stub, which makes both calls return the same object -- a mutation from
+  // lstat to stat is then invisible. Verified: reverting the source to stat-only
+  // fails EXACTLY the three tests below and nothing else in the suite.
+  const linkStats = () => ({
+    size: 11, // a symlink's own "size" is the length of its target path
+    mode: 0o120777,
+    uid: 0,
+    gid: 0,
+    mtime: 100,
+    atime: 100,
+    isFile: () => false,
+    isDirectory: () => false,
+    isSymbolicLink: () => true,
+  });
+  const targetDirStats = () => ({
+    size: 4096,
+    mode: 0o40755,
+    uid: 7,
+    gid: 8,
+    mtime: 900,
+    atime: 901,
+    isFile: () => false,
+    isDirectory: () => true,
+    isSymbolicLink: () => false, // stat FOLLOWS the link, so it never reports one
+  });
+
+  it("takes isSymbolicLink from lstat, which stat can never report", async () => {
+    const { client } = fakeSftpClient({ lstat: linkStats, stat: targetDirStats });
+    const result = await statFile(client, "/link");
+    expect(result.isSymbolicLink).toBe(true);
+    // ...and the target's own type still comes through alongside it.
+    expect(result.isDirectory).toBe(true);
+  });
+
+  it("takes size and mode from stat -- the TARGET, not the link", async () => {
+    const { client } = fakeSftpClient({ lstat: linkStats, stat: targetDirStats });
+    const result = await statFile(client, "/link");
+    // 4096 (the directory) rather than 11 (the length of the link's path string).
+    expect(result.size).toBe(4096);
+    expect(result.modeOctal).toBe("0755");
+    expect(result.mtime).toBe(900);
+    expect(result.uid).toBe(7);
+  });
+
+  it("reports a DANGLING symlink instead of failing the call", async () => {
+    // stat rejects ENOENT because the target is gone; lstat still describes the link.
+    // Before this, ssh_stat on a dangling link just errored.
+    const { client, probe } = fakeSftpClient({
+      lstat: linkStats,
+      stat: () => new Error("No such file or directory"),
+    });
+    const result = await statFile(client, "/broken");
+    expect(result.isSymbolicLink).toBe(true);
+    expect(result.size).toBe(11); // falls back to the link's own stats
+    expect(probe.ended).toBe(1); // and the session is still closed
+  });
+
+  it("does not pay a second round-trip for a non-symlink", async () => {
+    const { client, probe } = fakeSftpClient({
+      lstat: () => ({
+        size: 1,
+        mode: 0o100644,
+        uid: 0,
+        gid: 0,
+        mtime: 1,
+        atime: 1,
+        isFile: () => true,
+        isDirectory: () => false,
+        isSymbolicLink: () => false,
+      }),
+      stat: () => new Error("stat must not be called for a plain file"),
+    });
+    const result = await statFile(client, "/plain");
+    expect(result.isFile).toBe(true);
+    expect(probe.stat).toEqual([]);
+    expect(probe.lstat).toEqual(["/plain"]);
+  });
+});
 
 describe("statFile result shape", () => {
   it("materializes ssh2's type-check METHODS into booleans that survive JSON", async () => {

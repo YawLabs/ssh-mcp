@@ -2,7 +2,14 @@ import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { Client, type ClientChannel, type ConnectConfig, type ServerHostKeyAlgorithm, type SFTPWrapper } from "ssh2";
+import {
+  Client,
+  type ClientChannel,
+  type ConnectConfig,
+  type ServerHostKeyAlgorithm,
+  type SFTPWrapper,
+  type Stats,
+} from "ssh2";
 import {
   checkKnownHosts,
   checkSshAgent,
@@ -1185,28 +1192,62 @@ export interface FileStats {
   isSymbolicLink: boolean;
 }
 
+/**
+ * Two calls, deliberately, because one cannot answer both questions.
+ *
+ * TYPE comes from `lstat`, which reports on the path itself. SFTP `stat` FOLLOWS
+ * symlinks, so it can never report `isSymbolicLink: true` -- the flag this function
+ * has always returned, and which `ssh_stat` advertises, was dead: a symlink to a
+ * directory arrived as `isDirectory` and a dangling one rejected ENOENT before
+ * anything was formatted. `deleteFile` below already uses `lstat` for exactly this
+ * distinction.
+ *
+ * SIZE and the rest come from `stat`, the TARGET's metadata, because "how big is
+ * this" means the target -- a symlink's own size is the length of its path string,
+ * which is never the answer anyone wants. When the target cannot be resolved (a
+ * dangling link) we fall back to the link's own stats and still report it, rather
+ * than failing the call the way `stat` alone did.
+ *
+ * For a non-symlink the two calls agree by definition, so nothing changes there.
+ */
 export async function statFile(client: Client, remotePath: string): Promise<FileStats> {
   const sftp = await getSftp(client);
-  try {
-    return await new Promise((resolve, reject) => {
-      sftp.stat(remotePath, (err, stats) => {
-        if (err) return reject(err);
-        // ssh2 exposes the type checks as methods, not boolean fields -- materialize them
-        // up front so the result is a plain JSON-safe object the MCP layer can serialize.
-        resolve({
-          size: stats.size,
-          mode: stats.mode,
-          modeOctal: (stats.mode & 0o7777).toString(8).padStart(4, "0"),
-          uid: stats.uid,
-          gid: stats.gid,
-          mtime: stats.mtime,
-          atime: stats.atime,
-          isFile: stats.isFile(),
-          isDirectory: stats.isDirectory(),
-          isSymbolicLink: stats.isSymbolicLink(),
-        });
-      });
+  const call = (fn: "lstat" | "stat") =>
+    new Promise<Stats>((resolve, reject) => {
+      sftp[fn](remotePath, (err, stats) => (err ? reject(err) : resolve(stats)));
     });
+  try {
+    // lstat first: it succeeds for anything that exists, link or not. If this fails
+    // the path is genuinely absent, which is the same rejection as before.
+    const link = await call("lstat");
+    const isSymbolicLink = link.isSymbolicLink();
+    // Only pay the second round-trip when it can differ.
+    let meta = link;
+    if (isSymbolicLink) {
+      try {
+        meta = await call("stat");
+      } catch {
+        // Dangling symlink -- keep the link's own stats and report it as a symlink
+        // rather than rejecting, which is strictly more useful to an operator.
+      }
+    }
+    // ssh2 exposes the type checks as methods, not boolean fields -- materialize them
+    // up front so the result is a plain JSON-safe object the MCP layer can serialize.
+    return {
+      size: meta.size,
+      mode: meta.mode,
+      modeOctal: (meta.mode & 0o7777).toString(8).padStart(4, "0"),
+      uid: meta.uid,
+      gid: meta.gid,
+      mtime: meta.mtime,
+      atime: meta.atime,
+      // isFile / isDirectory describe the TARGET (they pair with the metadata above);
+      // isSymbolicLink describes the PATH. A symlink to a directory is therefore both
+      // a directory and a symlink, and the caller decides which matters.
+      isFile: meta.isFile(),
+      isDirectory: meta.isDirectory(),
+      isSymbolicLink,
+    };
   } finally {
     sftp.end();
   }

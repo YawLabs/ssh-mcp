@@ -240,7 +240,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_stat",
-    "Get metadata for a file or directory on a remote host via SFTP. Returns size, permissions (octal), uid/gid, mtime/atime, and type flags (isFile, isDirectory, isSymbolicLink). Use this instead of parsing `ls -la` output.",
+    "Get metadata for a file or directory on a remote host via SFTP. Returns size, permissions (octal), uid/gid, mtime/atime, and the path type. Symlinks are reported as `symlink -> <target kind>`: the type describes the link itself while size/mode/mtime describe its TARGET, and a dangling symlink is reported rather than erroring. Use this instead of parsing `ls -la` output.",
     {
       ...connectionParams,
       path: AbsoluteRemotePathSchema.describe("Absolute path to the remote file or directory. Must start with /."),
@@ -249,13 +249,13 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       return connectionPool.withConnection(conn, async (client) => {
         const stats = await statFile(client, path);
         const lines: string[] = [];
-        const kind = stats.isDirectory
-          ? "directory"
-          : stats.isSymbolicLink
-            ? "symlink"
-            : stats.isFile
-              ? "file"
-              : "other";
+        // isSymbolicLink describes the PATH, isFile/isDirectory the TARGET, so a
+        // symlink to a directory is legitimately both -- report it as "symlink ->
+        // directory" rather than picking one and hiding the other. Checking
+        // isDirectory first (as this did) made the symlink half permanently
+        // invisible, which is why the flag read as dead.
+        const targetKind = stats.isDirectory ? "directory" : stats.isFile ? "file" : "other";
+        const kind = stats.isSymbolicLink ? `symlink -> ${targetKind}` : targetKind;
         lines.push(`${path}: ${kind}`);
         lines.push(`  Size: ${stats.size} bytes`);
         lines.push(`  Mode: ${stats.modeOctal}`);

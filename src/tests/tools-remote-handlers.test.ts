@@ -23,7 +23,7 @@ import { registerTools } from "../tools.js";
 //
 // One defect remains pinned as-is because it cannot be fixed from tools.ts: ssh_stat's
 // "symlink" kind label is UNREACHABLE in production. statFile (src/ssh.ts) calls SFTP
-// `stat`, which follows symlinks, so isSymbolicLink is always false -- a link to a directory
+// lstat for the TYPE and stat for the METADATA, so isSymbolicLink is now real -- a link to a directory
 // renders "directory" and a dangling one rejects ENOENT before any formatting happens. The
 // fix is an lstat in ssh.ts (deleteFile already uses one for exactly this distinction); the
 // tests below drive statFile through a mock, so they exercise the label but cannot prove it
@@ -461,7 +461,7 @@ describe("ssh_service_status isError is driven by `unknown`, never by the servic
 describe("ssh_stat kind label", () => {
   const cases: [label: string, flags: Partial<FileStats>, kind: string][] = [
     ["a directory", { isDirectory: true }, "directory"],
-    ["a symlink", { isSymbolicLink: true }, "symlink"],
+    ["a symlink to nothing resolvable", { isSymbolicLink: true }, "symlink -> other"],
     ["a plain file", { isFile: true }, "file"],
     ["none of the three (socket, fifo, device)", {}, "other"],
   ];
@@ -472,20 +472,25 @@ describe("ssh_stat kind label", () => {
     expect(text.split("\n")[0]).toBe(`/p: ${kind}`);
   });
 
-  it("resolves the ternary directory-first when several flags are set", async () => {
-    // This is the shape a symlink-to-a-directory would arrive in IF statFile ever reported
-    // the link itself. It cannot today: the real statFile (src/ssh.ts) calls SFTP `stat`,
-    // which FOLLOWS symlinks, so isSymbolicLink is always false and such a link arrives as
-    // a plain isDirectory=true. Pinned so that whichever way statFile is later fixed, the
-    // label precedence here is a deliberate choice rather than an accident. Fixing the
-    // unreachability itself needs an lstat in ssh.ts -- see the header note.
-    statFileSpy.mockResolvedValue(stats({ isDirectory: true, isSymbolicLink: true, isFile: true }));
-    expect(textOf(await call("ssh_stat", { ...HOST, path: "/p" }))).toContain("/p: directory");
+  it("reports a symlink to a directory as BOTH, not as one or the other", async () => {
+    // statFile now takes the type from lstat (the path) and the metadata from stat (the
+    // target), so a symlink to a directory legitimately carries isSymbolicLink AND
+    // isDirectory. It used to check isDirectory first, which made the symlink half
+    // permanently invisible -- the reason the flag read as dead code.
+    statFileSpy.mockResolvedValue(stats({ isDirectory: true, isSymbolicLink: true }));
+    expect(textOf(await call("ssh_stat", { ...HOST, path: "/p" }))).toContain("/p: symlink -> directory");
   });
 
-  it("prefers symlink over file when both are set", async () => {
+  it("names the target kind when a symlink points at a file", async () => {
     statFileSpy.mockResolvedValue(stats({ isSymbolicLink: true, isFile: true }));
-    expect(textOf(await call("ssh_stat", { ...HOST, path: "/p" }))).toContain("/p: symlink");
+    expect(textOf(await call("ssh_stat", { ...HOST, path: "/p" }))).toContain("/p: symlink -> file");
+  });
+
+  it("still reports a plain directory without any symlink prefix", async () => {
+    // Guard against the fix over-reaching: nothing about a non-link changed.
+    statFileSpy.mockResolvedValue(stats({ isDirectory: true }));
+    expect(textOf(await call("ssh_stat", { ...HOST, path: "/p" }))).toContain("/p: directory");
+    expect(textOf(await call("ssh_stat", { ...HOST, path: "/p" }))).not.toContain("symlink");
   });
 
   it("the flags themselves are never printed -- only the single derived kind word", async () => {
