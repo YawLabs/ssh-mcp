@@ -1,4 +1,7 @@
 import { EventEmitter } from "node:events";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Mock ONLY connectWithProxy. resolveConfig, exec, hostVerifier, etc. keep their real
@@ -791,5 +794,161 @@ describe("serviceStatus — crashed and masked units", () => {
     expect(status.since).toBeUndefined(); // no "since ...;" in a masked unit's output
     expect(status.pid).toBeUndefined();
     expect(status.raw).toContain("Loaded: masked");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The acquire() retry loop -- the pool's resilience mechanism, and the last
+// uncovered region v8 reported in pool.ts. Every branch here fires only when a
+// connection dies in the narrow window between connectWithProxy resolving and
+// acquire() taking a ref on its entry, which no other test reaches.
+// ---------------------------------------------------------------------------
+
+describe("ConnectionPool — the dead-race retry loop", () => {
+  beforeEach(() => {
+    mockedConnect.mockReset();
+  });
+
+  /**
+   * A client that marks itself dead the instant the pool registers it: the pool's
+   * markDead listener fires on "close", deleting the entry before acquire() can take
+   * a ref. That is exactly the race the retry loop exists for.
+   */
+  function makeSelfClosingClient(): EventEmitter & { endCalls: number; end: () => void } {
+    const client = makeQuietClient();
+    // Timing is the whole trick. Emitting on a plain queueMicrotask fires BEFORE the
+    // pool has attached markDead (the emit is scheduled while connectWithProxy is
+    // still resolving), so the entry never gets flagged and no retry happens.
+    // Hooking the registration instead puts the close exactly in the race window:
+    // the pool has just registered the entry and has NOT yet taken its ref.
+    const originalOn = client.on.bind(client);
+    client.on = (event: string | symbol, listener: (...a: unknown[]) => void) => {
+      const r = originalOn(event as string, listener);
+      if (event === "close") queueMicrotask(() => client.emit("close"));
+      return r;
+    };
+    return client;
+  }
+
+  it("dials again when the connection dies before acquire can take a ref", async () => {
+    let call = 0;
+    mockedConnect.mockImplementation(async () => {
+      call++;
+      // First connection dies in the race window; the second is healthy.
+      return (call === 1 ? makeSelfClosingClient() : makeQuietClient()) as never;
+    });
+
+    const pool = new ConnectionPool();
+    try {
+      const client = await pool.acquire({ host: "racy.test" });
+
+      expect(mockedConnect).toHaveBeenCalledTimes(2);
+      expect((client as unknown as { endCalls: number }).endCalls).toBe(0);
+      expect(pool.size).toBe(1);
+      pool.release(client);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("gives up after MAX_ACQUIRE_ATTEMPTS against a peer that closes every connection", async () => {
+    // A pathological peer that accepts then immediately drops. Without the bound the
+    // loop would spin forever; the error has to name the host and the attempt count.
+    mockedConnect.mockImplementation(async () => makeSelfClosingClient() as never);
+
+    const pool = new ConnectionPool();
+    try {
+      await expect(pool.acquire({ host: "flapping.test" })).rejects.toThrow(/after 3 attempts/);
+      expect(mockedConnect).toHaveBeenCalledTimes(3);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("carries the underlying cause into the give-up message", async () => {
+    mockedConnect.mockImplementation(async () => makeSelfClosingClient() as never);
+
+    const pool = new ConnectionPool();
+    try {
+      await expect(pool.acquire({ host: "flapping.test" })).rejects.toThrow(
+        /connection died before acquire could take a ref/,
+      );
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("evicts a dead entry off the fast path instead of handing out a closed client", async () => {
+    // Second acquire finds the entry still in the map but flagged dead. It must be
+    // deleted and redialed -- returning it would hand the caller a closed socket that
+    // fails on first use with an unrelated "Not connected".
+    const first = makeQuietClient();
+    const second = makeQuietClient();
+    let call = 0;
+    mockedConnect.mockImplementation(async () => (++call === 1 ? first : second) as never);
+
+    const pool = new ConnectionPool();
+    try {
+      const a = await pool.acquire({ host: "reaped.test" });
+      pool.release(a);
+      first.emit("close"); // the server hung up while the entry sat idle
+
+      const b = await pool.acquire({ host: "reaped.test" });
+
+      expect(b).not.toBe(a);
+      expect(mockedConnect).toHaveBeenCalledTimes(2);
+      pool.release(b);
+    } finally {
+      pool.drain();
+    }
+  });
+});
+
+// Two distinct on-disk keys. resolveConfig reads privateKeyPath verbatim, so the
+// FILE CONTENT is what reaches the fingerprint -- the paths must differ in body,
+// not just in name.
+const KEY_DIR = mkdtempSync(join(tmpdir(), "pool-keys-"));
+const KEY_A = join(KEY_DIR, "a");
+const KEY_B = join(KEY_DIR, "b");
+writeFileSync(KEY_A, "-----BEGIN OPENSSH PRIVATE KEY-----aaaa-----END OPENSSH PRIVATE KEY-----");
+writeFileSync(KEY_B, "-----BEGIN OPENSSH PRIVATE KEY-----bbbb-----END OPENSSH PRIVATE KEY-----");
+
+describe("ConnectionPool — the auth fingerprint covers key material too", () => {
+  beforeEach(() => {
+    mockedConnect.mockReset();
+    mockedConnect.mockImplementation(async () => makeQuietClient() as never);
+  });
+
+  it("does not share one pooled connection across two different private keys", async () => {
+    // The password case is covered elsewhere; the privateKey arm of the fingerprint
+    // was never executed. Two keys to the same host must not collide, or the second
+    // caller silently rides the first caller's authenticated session.
+    const pool = new ConnectionPool();
+    try {
+      const a = await pool.acquire({ host: "keyed.test", privateKeyPath: KEY_A });
+      const b = await pool.acquire({ host: "keyed.test", privateKeyPath: KEY_B });
+
+      expect(a).not.toBe(b);
+      expect(pool.size).toBe(2);
+      pool.release(a);
+      pool.release(b);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("DOES reuse the connection when the same key is presented twice", async () => {
+    const pool = new ConnectionPool();
+    try {
+      const a = await pool.acquire({ host: "keyed.test", privateKeyPath: KEY_A });
+      pool.release(a);
+      const b = await pool.acquire({ host: "keyed.test", privateKeyPath: KEY_A });
+
+      expect(b).toBe(a);
+      expect(mockedConnect).toHaveBeenCalledTimes(1);
+      pool.release(b);
+    } finally {
+      pool.drain();
+    }
   });
 });

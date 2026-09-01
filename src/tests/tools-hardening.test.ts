@@ -822,3 +822,49 @@ describe("the env-prefix docs describe the key check, not just value quoting", (
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Branches v8 coverage showed were never executed. Small, but each is a line an
+// operator actually reads, and none had a single test through the handler.
+// ---------------------------------------------------------------------------
+
+describe("ssh_exec renders a stderr block when the remote wrote to stderr", () => {
+  it("labels stderr rather than blending it into stdout", async () => {
+    // A command that writes to BOTH streams is the normal shape of a partial
+    // failure; without the label the agent cannot tell which half is which.
+    execSpy.mockImplementationOnce(async () => ({ stdout: "some output", stderr: "warning: deprecated flag", code: 0 }));
+    const { handler } = getTool("ssh_exec");
+    const result = (await handler({ ...baseConn, command: "build" })) as { content: { text: string }[] };
+
+    expect(result.content[0].text).toBe("some output\n[stderr]\nwarning: deprecated flag\n[exit code: 0]");
+  });
+
+  it("omits the stderr block entirely when stderr is empty", async () => {
+    execSpy.mockImplementationOnce(async () => ({ stdout: "clean", stderr: "", code: 0 }));
+    const { handler } = getTool("ssh_exec");
+    const result = (await handler({ ...baseConn, command: "build" })) as { content: { text: string }[] };
+
+    expect(result.content[0].text).not.toContain("[stderr]");
+  });
+});
+
+describe("ssh_mkdir defaults `recursive` to false rather than passing undefined", () => {
+  it("passes false through to makeDir when the caller omits it", async () => {
+    // makeDir's own default is `false` too, but the handler's `?? false` is what
+    // stops `undefined` reaching it -- and undefined is what an MCP caller sends
+    // when it omits an optional field.
+    makeDirSpy.mockClear();
+    const { handler } = getTool("ssh_mkdir");
+    await handler({ ...baseConn, path: "/tmp/new" });
+
+    expect(makeDirSpy).toHaveBeenCalledWith(expect.anything(), "/tmp/new", false);
+  });
+
+  it("passes an explicit true straight through", async () => {
+    makeDirSpy.mockClear();
+    const { handler } = getTool("ssh_mkdir");
+    await handler({ ...baseConn, path: "/tmp/a/b/c", recursive: true });
+
+    expect(makeDirSpy).toHaveBeenCalledWith(expect.anything(), "/tmp/a/b/c", true);
+  });
+});
