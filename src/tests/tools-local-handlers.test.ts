@@ -1,6 +1,9 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Client } from "ssh2";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { AgentResult, ConfigLookupResult, KeyInfo } from "../env.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { AgentResult, ConfigLookupResult, KeyInfo, SshKeyListing } from "../env.js";
 import { ConnectionPool } from "../pool.js";
 import type { SSHConfig } from "../ssh.js";
 import { registerTools } from "../tools.js";
@@ -26,7 +29,7 @@ import { registerTools } from "../tools.js";
 //   ssh_known_hosts_fix  result.status === "error"
 //   ssh_test             result.status === "error"
 //   ssh_git_check        result.status === "error"
-//   ssh_key_list         never set at all
+//   ssh_key_list         listing.status === "unreadable"  (NOT "zero keys")
 //
 // Boundary: the REAL registered handlers run. ../env.js and ../diagnose.js are mocked at
 // the MODULE boundary so nothing shells out to ssh / ssh-add / ssh-keygen / ssh-keyscan
@@ -39,11 +42,14 @@ import { registerTools } from "../tools.js";
 type ToolResult = { content: { type: string; text: string }[]; isError?: boolean };
 type ToolHandler = (args: Record<string, unknown>) => Promise<ToolResult>;
 type ToolRegistration = { description: string; schema: Record<string, unknown>; handler: ToolHandler };
+/** Just enough of a zod schema to exercise one declared parameter directly. The fake server
+ *  below captures the raw shape object, so each value is the real zod type tools.ts built. */
+type ZodLike = { safeParse: (v: unknown) => { success: boolean; error?: unknown } };
 
 const {
   diagnoseSpy,
   ensureAgentSpy,
-  listSshKeysSpy,
+  listSshKeysDetailedSpy,
   loadKeySpy,
   configLookupSpy,
   fixKnownHostsSpy,
@@ -52,7 +58,7 @@ const {
 } = vi.hoisted(() => ({
   diagnoseSpy: vi.fn(),
   ensureAgentSpy: vi.fn(),
-  listSshKeysSpy: vi.fn(),
+  listSshKeysDetailedSpy: vi.fn(),
   loadKeySpy: vi.fn(),
   configLookupSpy: vi.fn(),
   fixKnownHostsSpy: vi.fn(),
@@ -70,7 +76,7 @@ vi.mock("../env.js", async (importOriginal) => {
   return {
     ...actual,
     ensureAgent: ensureAgentSpy as unknown as typeof actual.ensureAgent,
-    listSshKeys: listSshKeysSpy as unknown as typeof actual.listSshKeys,
+    listSshKeysDetailed: listSshKeysDetailedSpy as unknown as typeof actual.listSshKeysDetailed,
     loadKey: loadKeySpy as unknown as typeof actual.loadKey,
     configLookup: configLookupSpy as unknown as typeof actual.configLookup,
     fixKnownHosts: fixKnownHostsSpy as unknown as typeof actual.fixKnownHosts,
@@ -117,7 +123,7 @@ beforeEach(() => {
   for (const spy of [
     diagnoseSpy,
     ensureAgentSpy,
-    listSshKeysSpy,
+    listSshKeysDetailedSpy,
     loadKeySpy,
     configLookupSpy,
     fixKnownHostsSpy,
@@ -439,7 +445,11 @@ describe("ssh_agent_ensure renders the AgentResult", () => {
 // ssh_key_list
 // ---------------------------------------------------------------------------
 
-describe("ssh_key_list renders KeyInfo[]", () => {
+describe("ssh_key_list renders a SshKeyListing", () => {
+  const SSH_DIR = "/home/jeff/.ssh";
+  /** The "the directory was read" listing -- the only status that carries keys. */
+  const ok = (keys: KeyInfo[]): SshKeyListing => ({ status: "ok", dir: SSH_DIR, keys });
+
   const keys: KeyInfo[] = [
     {
       name: "id_ed25519",
@@ -458,7 +468,7 @@ describe("ssh_key_list renders KeyInfo[]", () => {
   ];
 
   it("renders the count, then name/type/marker + path + fingerprint per key", async () => {
-    listSshKeysSpy.mockReturnValue(keys);
+    listSshKeysDetailedSpy.mockReturnValue(ok(keys));
     expect(await textOf("ssh_key_list")).toBe(
       [
         "Found 2 SSH key(s):",
@@ -478,58 +488,206 @@ describe("ssh_key_list renders KeyInfo[]", () => {
   it("the LOADED / not loaded marker is driven by loadedInAgent", async () => {
     // This marker is the entire point of the tool -- it is what tells the caller whether
     // to follow up with ssh_key_load. Flipping it would be silent otherwise.
-    listSshKeysSpy.mockReturnValue([{ ...keys[0], loadedInAgent: false }]);
+    listSshKeysDetailedSpy.mockReturnValue(ok([{ ...keys[0], loadedInAgent: false }]));
     expect(await textOf("ssh_key_list")).toContain("id_ed25519 (ed25519) [not loaded]");
-    listSshKeysSpy.mockReturnValue([{ ...keys[1], loadedInAgent: true }]);
+    listSshKeysDetailedSpy.mockReturnValue(ok([{ ...keys[1], loadedInAgent: true }]));
     expect(await textOf("ssh_key_list")).toContain("id_rsa (rsa) [LOADED]");
   });
 
   it("omits the Fingerprint line when ssh-keygen could not produce one", async () => {
-    // listSshKeys leaves `fingerprint` undefined when `ssh-keygen -lf` fails, and such a
-    // key is then reported as not-loaded regardless of the agent.
-    listSshKeysSpy.mockReturnValue([
-      { name: "legacy_key", path: "/home/jeff/.ssh/legacy_key", type: "unknown", loadedInAgent: false },
-    ] satisfies KeyInfo[]);
+    // listSshKeysDetailed leaves `fingerprint` undefined when `ssh-keygen -lf` fails, and
+    // such a key is then reported as not-loaded regardless of the agent.
+    listSshKeysDetailedSpy.mockReturnValue(
+      ok([{ name: "legacy_key", path: "/home/jeff/.ssh/legacy_key", type: "unknown", loadedInAgent: false }]),
+    );
     const text = await textOf("ssh_key_list");
     expect(text).toBe("Found 1 SSH key(s):\n\nlegacy_key (unknown) [not loaded]\n  Path: /home/jeff/.ssh/legacy_key\n");
     expect(text).not.toContain("Fingerprint");
   });
 
   it("the count in the header tracks the array length", async () => {
-    listSshKeysSpy.mockReturnValue([keys[0]]);
+    listSshKeysDetailedSpy.mockReturnValue(ok([keys[0]]));
     expect(await textOf("ssh_key_list")).toContain("Found 1 SSH key(s):");
-    listSshKeysSpy.mockReturnValue(keys);
+    listSshKeysDetailedSpy.mockReturnValue(ok(keys));
     expect(await textOf("ssh_key_list")).toContain("Found 2 SSH key(s):");
   });
 
-  it("empty state is a DISTINCT message carrying the ssh-keygen hint", async () => {
-    // The branch a fresh machine hits. Note it is NOT the "Found 0 SSH key(s):" fall-through
-    // -- an early return with actionable remediation.
-    listSshKeysSpy.mockReturnValue([]);
+  it("a READABLE but keyless ~/.ssh is the ssh-keygen hint, and is NOT an error", async () => {
+    // status "ok" with zero keys -- the only one of the three empty results that generating
+    // a key actually fixes. Note it is NOT the "Found 0 SSH key(s):" fall-through: an early
+    // return with actionable remediation.
+    listSshKeysDetailedSpy.mockReturnValue(ok([]));
     const result = await run("ssh_key_list");
     expect(result.content[0].text).toBe(
       'No SSH private keys found in ~/.ssh/. Generate one: ssh-keygen -t ed25519 -C "your@email.com"',
     );
     expect(result.content[0].text).not.toContain("Found 0");
+    expect(result.isError).toBe(false);
   });
 
-  it("neither branch sets isError -- ssh_key_list can never report failure", async () => {
-    // Pinning ACTUAL behavior: this is the one tool of the eight that never emits the
-    // flag at all, in either branch. listSshKeys() returns [] both for "no keys" and for
-    // "~/.ssh unreadable", so the empty-state branch reports a success either way. See the
-    // note in the report accompanying this suite.
-    listSshKeysSpy.mockReturnValue(keys);
-    const populated = await run("ssh_key_list");
-    listSshKeysSpy.mockReturnValue([]);
-    const empty = await run("ssh_key_list");
-    for (const result of [populated, empty]) {
-      expect(result.isError).toBeUndefined();
-      expect("isError" in result).toBe(false);
+  it("a MISSING ~/.ssh says the directory does not exist, names it, and is still not an error", async () => {
+    // status "no-dir": a fresh machine. Same remediation as the keyless case (ssh-keygen
+    // creates the directory), but the message must not claim a directory was searched --
+    // the operator needs to know none exists yet.
+    listSshKeysDetailedSpy.mockReturnValue({ status: "no-dir", dir: SSH_DIR, keys: [] } satisfies SshKeyListing);
+    const result = await run("ssh_key_list");
+    expect(result.content[0].text).toBe(
+      `No ~/.ssh directory yet (${SSH_DIR} does not exist). Generate a key to create it: ssh-keygen -t ed25519 -C "your@email.com"`,
+    );
+    expect(result.isError).toBe(false);
+    // Distinct from the keyless-directory wording, so the two cannot be conflated again.
+    expect(result.content[0].text).not.toContain("No SSH private keys found");
+  });
+
+  it("an UNREADABLE ~/.ssh is an ERROR that names the directory and the errno reason", async () => {
+    // status "unreadable": EACCES on ~/.ssh, or a plain file where the directory should be.
+    // This is the case the old single empty-message branch reported as a success while
+    // advising ssh-keygen -- advice that cannot help, since the keys may well be right there.
+    listSshKeysDetailedSpy.mockReturnValue({
+      status: "unreadable",
+      dir: SSH_DIR,
+      keys: [],
+      reason: `EACCES: permission denied, scandir '${SSH_DIR}'`,
+    } satisfies SshKeyListing);
+    const result = await run("ssh_key_list");
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toBe(
+      `Could not read ${SSH_DIR}: EACCES: permission denied, scandir '${SSH_DIR}'. ` +
+        `This is NOT "no keys" -- the directory exists but could not be listed. ` +
+        `Check that it is a directory and that you own it: ls -ld ${SSH_DIR}, then chmod 700 ${SSH_DIR}.`,
+    );
+    // It must NOT send the operator off to generate a key: their keys may be intact and
+    // simply unreadable, and a new key would not be listable either.
+    expect(result.content[0].text).not.toContain("ssh-keygen -t ed25519");
+  });
+
+  it("an ENOTDIR ~/.ssh (a file where the directory should be) is the same error branch", async () => {
+    listSshKeysDetailedSpy.mockReturnValue({
+      status: "unreadable",
+      dir: SSH_DIR,
+      keys: [],
+      reason: `ENOTDIR: not a directory, scandir '${SSH_DIR}'`,
+    } satisfies SshKeyListing);
+    const result = await run("ssh_key_list");
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("ENOTDIR: not a directory");
+  });
+
+  it("every branch emits an EXPLICIT boolean isError, error only for the unreadable one", async () => {
+    // The three empty results used to be one message with no flag at all, so an agent could
+    // not tell a broken ~/.ssh from an empty one. Each branch is checked here in one place.
+    const cases: [listing: SshKeyListing, isError: boolean][] = [
+      [ok(keys), false],
+      [ok([]), false],
+      [{ status: "no-dir", dir: SSH_DIR, keys: [] }, false],
+      [{ status: "unreadable", dir: SSH_DIR, keys: [], reason: "EACCES: permission denied" }, true],
+    ];
+    for (const [listing, isError] of cases) {
+      listSshKeysDetailedSpy.mockReturnValue(listing);
+      const result = await run("ssh_key_list");
+      expect("isError" in result).toBe(true);
+      expect(result.isError).toBe(isError);
     }
+  });
+
+  it("reads the keys off the listing, never off a bare array", async () => {
+    // Guards the call boundary itself: the handler must go through listSshKeysDetailed (the
+    // only function that reports WHY a scan came back empty), not the KeyInfo[] wrapper.
+    listSshKeysDetailedSpy.mockReturnValue(ok(keys));
+    await run("ssh_key_list");
+    expect(listSshKeysDetailedSpy).toHaveBeenCalledTimes(1);
+    expect(listSshKeysDetailedSpy).toHaveBeenCalledWith();
   });
 
   it("takes no arguments", () => {
     expect(getTool("ssh_key_list").schema).toEqual({});
+  });
+});
+
+// ---------------------------------------------------------------------------
+// listSshKeysDetailed -- the classification the ssh_key_list handler renders
+// ---------------------------------------------------------------------------
+
+describe("listSshKeysDetailed tells the three empty results apart", () => {
+  // The handler above is mocked at the env.js boundary, so these drive the REAL function --
+  // otherwise nothing would hold the classification itself (the part that decides which of
+  // the three messages an operator gets). Hermetic: HOME / USERPROFILE are pointed at a
+  // fresh temp directory for the duration, which is what os.homedir() reads on both
+  // platforms, so the machine's own ~/.ssh is never touched.
+  const realEnv = () => vi.importActual<typeof import("../env.js")>("../env.js");
+
+  let tmpHome: string;
+  let savedHome: string | undefined;
+  let savedUserProfile: string | undefined;
+
+  beforeEach(() => {
+    tmpHome = mkdtempSync(join(tmpdir(), "ssh-mcp-keylist-"));
+    savedHome = process.env.HOME;
+    savedUserProfile = process.env.USERPROFILE;
+    process.env.HOME = tmpHome;
+    process.env.USERPROFILE = tmpHome;
+  });
+
+  afterEach(() => {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedUserProfile;
+    rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  it("no ~/.ssh at all -> status 'no-dir', with the path it looked for", async () => {
+    const { listSshKeysDetailed } = await realEnv();
+    const listing = listSshKeysDetailed();
+    expect(listing.status).toBe("no-dir");
+    expect(listing.keys).toEqual([]);
+    expect(listing.dir).toBe(join(tmpHome, ".ssh"));
+  });
+
+  it("a readable ~/.ssh holding no private keys -> status 'ok' with zero keys", async () => {
+    mkdirSync(join(tmpHome, ".ssh"));
+    const { listSshKeysDetailed } = await realEnv();
+    const listing = listSshKeysDetailed();
+    expect(listing.status).toBe("ok");
+    expect(listing.keys).toEqual([]);
+  });
+
+  it("a ~/.ssh that cannot be listed -> status 'unreadable', carrying the errno message", async () => {
+    // A plain FILE where the directory should be: existsSync says yes, readdir throws
+    // ENOTDIR. Portable stand-in for the EACCES case, which chmod cannot produce on Windows.
+    writeFileSync(join(tmpHome, ".ssh"), "not a directory");
+    const { listSshKeysDetailed } = await realEnv();
+    const listing = listSshKeysDetailed();
+    expect(listing.status).toBe("unreadable");
+    expect(listing.keys).toEqual([]);
+    // The reason is what the handler shows the operator, so it has to be the real errno text.
+    expect(listing.status === "unreadable" && listing.reason).toContain("ENOTDIR");
+  });
+
+  it("listSshKeys stays a plain KeyInfo[] for every existing caller", async () => {
+    // The wrapper is what env.test.ts / env-hardening.test.ts and server.ts still use; it
+    // must keep returning the array, empty, for all three statuses.
+    const { listSshKeys } = await realEnv();
+    expect(listSshKeys()).toEqual([]);
+    mkdirSync(join(tmpHome, ".ssh"));
+    expect(listSshKeys()).toEqual([]);
+    rmSync(join(tmpHome, ".ssh"), { recursive: true });
+    writeFileSync(join(tmpHome, ".ssh"), "not a directory");
+    expect(listSshKeys()).toEqual([]);
+  });
+
+  it("finds a real private key in a readable ~/.ssh and reports status 'ok'", async () => {
+    // The positive control for the sweep above: without it, a mutation that always returned
+    // an empty listing would still satisfy every "keys is empty" assertion.
+    mkdirSync(join(tmpHome, ".ssh"));
+    writeFileSync(
+      join(tmpHome, ".ssh", "id_test"),
+      "-----BEGIN OPENSSH PRIVATE KEY-----\nnotarealkey\n-----END OPENSSH PRIVATE KEY-----\n",
+    );
+    const { listSshKeysDetailed } = await realEnv();
+    const listing = listSshKeysDetailed();
+    expect(listing.status).toBe("ok");
+    expect(listing.keys.map((k) => k.name)).toEqual(["id_test"]);
   });
 });
 
@@ -669,6 +827,29 @@ describe("ssh_config_lookup renders ConfigLookupResult", () => {
     expect(result.content[0].text).toBe('Invalid hostname: "-oProxyCommand=evil"');
     // The success formatting is skipped entirely -- no header, no field labels.
     expect(result.content[0].text).not.toContain("SSH config for");
+  });
+
+  it("narrows on the PRESENCE of the key, not on its truthiness", async () => {
+    // `"error" in result` is the only thing keeping a failed lookup out of the success
+    // formatter. A truthiness check (`if (result.error)`) would send this one down the
+    // success path, where every field is undefined -- the caller would get
+    // "Hostname: undefined" instead of a reason.
+    configLookupSpy.mockReturnValue({ error: "" });
+    const result = await run("ssh_config_lookup", { host: "prod-web" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toBe("");
+    expect(result.content[0].text).not.toContain("undefined");
+  });
+
+  it("a result carrying BOTH an error and resolved-looking fields still takes the error branch", async () => {
+    // Guards the narrowing itself rather than the union: rewriting the check to key off a
+    // resolved field (`if (!result.hostname)`) would format this as a success and bury the
+    // reason.
+    configLookupSpy.mockReturnValue({ error: "Failed to resolve SSH config for prod-web", hostname: "10.0.0.7" });
+    const result = await run("ssh_config_lookup", { host: "prod-web" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toBe("Failed to resolve SSH config for prod-web");
+    expect(result.content[0].text).not.toContain("10.0.0.7");
   });
 
   it("an `ssh -G` failure is the same error shape", async () => {
@@ -926,13 +1107,36 @@ describe("ssh_git_check renders the git-over-SSH result", () => {
     expect(checkGitSshSpy).toHaveBeenCalledWith("github.com", "gitolite");
   });
 
-  it("an EMPTY host or user falls back to the default rather than being rejected", async () => {
-    // `host || "github.com"` is a truthiness fallback, and z.string().optional() accepts
-    // "". So `{host: ""}` silently probes github.com instead of erroring. Pinned as ACTUAL
-    // behavior -- see the note accompanying this suite.
-    checkGitSshSpy.mockReturnValue({ status: "ok", message: "ok" });
-    await run("ssh_git_check", { host: "", user: "" });
-    expect(checkGitSshSpy).toHaveBeenCalledWith("github.com", "git");
+  it("an EMPTY host or user is REJECTED by the schema, not silently defaulted", () => {
+    // The handler defaults with `host || "github.com"`, a truthiness fallback, so an
+    // explicitly-empty host would probe github.com and report on a host the caller never
+    // named -- and "" would never reach checkGitSsh, skipping the isValidHostname check
+    // every other host-taking tool routes its input through. .min(1) closes that at the
+    // schema boundary: omitting the field is how you ask for the default.
+    const schema = getTool("ssh_git_check").schema as unknown as Record<string, ZodLike>;
+    for (const field of ["host", "user"]) {
+      expect(schema[field].safeParse("").success).toBe(false);
+      // Still optional, and still accepts a real value.
+      expect(schema[field].safeParse(undefined).success).toBe(true);
+    }
+    expect(schema.host.safeParse("gitlab.example.test").success).toBe(true);
+    expect(schema.user.safeParse("gitolite").success).toBe(true);
+  });
+
+  it("the rejection message tells the caller to omit the field instead", () => {
+    const schema = getTool("ssh_git_check").schema as unknown as Record<string, ZodLike>;
+    const hostResult = schema.host.safeParse("");
+    expect(hostResult.success).toBe(false);
+    expect(JSON.stringify(hostResult.error)).toContain("host must not be empty");
+    expect(JSON.stringify(schema.user.safeParse("").error)).toContain("user must not be empty");
+  });
+
+  it("whitespace-only values are NOT rejected -- .min(1) counts characters, not content", () => {
+    // Pinned as actual behavior so the boundary is honest about where it stops. " " reaches
+    // checkGitSsh, which routes it through isValidHostname and rejects it there -- the same
+    // validator every sibling host-taking tool uses.
+    const schema = getTool("ssh_git_check").schema as unknown as Record<string, ZodLike>;
+    expect(schema.host.safeParse(" ").success).toBe(true);
   });
 });
 
@@ -959,7 +1163,7 @@ describe("none of the eight local handlers touch the connection pool", () => {
   it("runs all eight without withConnection ever being called", async () => {
     diagnoseSpy.mockReturnValue({ overall: "ok", checks: [], suggestions: [] });
     ensureAgentSpy.mockReturnValue({ running: true, reachable: true, keys: [], started: false, message: "up" });
-    listSshKeysSpy.mockReturnValue([]);
+    listSshKeysDetailedSpy.mockReturnValue({ status: "ok", dir: "/home/jeff/.ssh", keys: [] });
     loadKeySpy.mockReturnValue({ status: "ok", message: "loaded" });
     configLookupSpy.mockReturnValue({
       hostname: "h.test",
@@ -1001,7 +1205,7 @@ describe("none of the eight local handlers touch the connection pool", () => {
     for (const spy of [
       diagnoseSpy,
       ensureAgentSpy,
-      listSshKeysSpy,
+      listSshKeysDetailedSpy,
       loadKeySpy,
       configLookupSpy,
       fixKnownHostsSpy,

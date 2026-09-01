@@ -15,10 +15,19 @@ import { registerTools } from "../tools.js";
 // Everything else (zod schema construction, the handler bodies) is the shipped code.
 //
 // Every assertion below was written against OBSERVED output from these handlers, not against
-// what the formatting arguably should be. Two behaviors that look like defects are pinned
-// as-is and called out in comments rather than quietly "corrected" in the expectations:
-// ssh_ls renders an empty directory as an empty string, and ssh_stat's "symlink" label is
-// unreachable through the real statFile (which uses SFTP stat, following the link).
+// what the formatting arguably should be.
+//
+// ssh_ls used to render an empty directory as an empty text block -- indistinguishable to a
+// caller from a read that produced nothing. It now says so, the way ssh_find does; that is
+// asserted below rather than pinned as a defect.
+//
+// One defect remains pinned as-is because it cannot be fixed from tools.ts: ssh_stat's
+// "symlink" kind label is UNREACHABLE in production. statFile (src/ssh.ts) calls SFTP
+// `stat`, which follows symlinks, so isSymbolicLink is always false -- a link to a directory
+// renders "directory" and a dangling one rejects ENOENT before any formatting happens. The
+// fix is an lstat in ssh.ts (deleteFile already uses one for exactly this distinction); the
+// tests below drive statFile through a mock, so they exercise the label but cannot prove it
+// is reachable.
 
 type ToolResult = { content: { type: string; text: string }[]; isError?: boolean };
 type ToolHandler = (args: Record<string, unknown>) => Promise<ToolResult>;
@@ -26,6 +35,7 @@ type ToolRegistration = { description: string; schema: Record<string, unknown>; 
 
 const {
   findSpy,
+  multiExecSpy,
   serviceStatusSpy,
   statFileSpy,
   listDirSpy,
@@ -35,6 +45,7 @@ const {
   writeFileSpy,
 } = vi.hoisted(() => ({
   findSpy: vi.fn(),
+  multiExecSpy: vi.fn(),
   serviceStatusSpy: vi.fn(),
   statFileSpy: vi.fn(),
   listDirSpy: vi.fn(),
@@ -49,6 +60,7 @@ vi.mock("../ops.js", async (importOriginal) => {
   return {
     ...actual,
     find: findSpy as unknown as typeof actual.find,
+    multiExec: multiExecSpy as unknown as typeof actual.multiExec,
     serviceStatus: serviceStatusSpy as unknown as typeof actual.serviceStatus,
   };
 });
@@ -164,6 +176,7 @@ beforeEach(() => {
   seenConnections.length = 0;
   for (const spy of [
     findSpy,
+    multiExecSpy,
     serviceStatusSpy,
     statFileSpy,
     listDirSpy,
@@ -460,8 +473,12 @@ describe("ssh_stat kind label", () => {
   });
 
   it("resolves the ternary directory-first when several flags are set", async () => {
-    // NOTE: the real statFile (src/ssh.ts) calls SFTP `stat`, which FOLLOWS symlinks, so a
-    // link to a directory arrives with isDirectory=true. This pins which label wins.
+    // This is the shape a symlink-to-a-directory would arrive in IF statFile ever reported
+    // the link itself. It cannot today: the real statFile (src/ssh.ts) calls SFTP `stat`,
+    // which FOLLOWS symlinks, so isSymbolicLink is always false and such a link arrives as
+    // a plain isDirectory=true. Pinned so that whichever way statFile is later fixed, the
+    // label precedence here is a deliberate choice rather than an accident. Fixing the
+    // unreachability itself needs an lstat in ssh.ts -- see the header note.
     statFileSpy.mockResolvedValue(stats({ isDirectory: true, isSymbolicLink: true, isFile: true }));
     expect(textOf(await call("ssh_stat", { ...HOST, path: "/p" }))).toContain("/p: directory");
   });
@@ -469,6 +486,16 @@ describe("ssh_stat kind label", () => {
   it("prefers symlink over file when both are set", async () => {
     statFileSpy.mockResolvedValue(stats({ isSymbolicLink: true, isFile: true }));
     expect(textOf(await call("ssh_stat", { ...HOST, path: "/p" }))).toContain("/p: symlink");
+  });
+
+  it("the flags themselves are never printed -- only the single derived kind word", async () => {
+    // The tool description advertises "type flags (isFile, isDirectory, isSymbolicLink)";
+    // what the handler actually emits is one kind label per path. Pinned so the description
+    // and the output can be compared against each other.
+    statFileSpy.mockResolvedValue(stats({ isFile: true }));
+    const text = textOf(await call("ssh_stat", { ...HOST, path: "/p" }));
+    expect(text).not.toContain("isFile");
+    expect(text).not.toContain("isSymbolicLink");
   });
 
   it("echoes the requested path in the header, not a resolved one", async () => {
@@ -538,14 +565,42 @@ describe("ssh_ls rendering", () => {
     expect(textOf(await call("ssh_ls", { ...HOST, path: "/srv" }))).toBe("only.txt");
   });
 
-  it("renders an EMPTY directory as an empty string, with no message and no isError", async () => {
-    // Pinned as the shipped behavior, and flagged rather than "fixed" here: an empty text
-    // block is indistinguishable to the agent from a read that produced nothing, and it is
-    // inconsistent with ssh_find, which says "No files found." for the same situation.
+  it("says an EMPTY directory is empty, and names it, instead of returning a blank block", async () => {
+    // An empty join() is an empty text block, which a caller cannot tell apart from a read
+    // that produced nothing at all. ssh_find already says "No files found." for the same
+    // situation; this is the ssh_ls counterpart.
     listDirSpy.mockResolvedValue([]);
     const result = await call("ssh_ls", { ...HOST, path: "/empty" });
-    expect(textOf(result)).toBe("");
-    expect(Object.keys(result)).toEqual(["content"]);
+    expect(textOf(result)).toBe("Directory is empty: /empty");
+    expect(textOf(result)).not.toBe("");
+  });
+
+  it("an empty directory is NOT an error -- no isError key at all, same as ssh_find", async () => {
+    // "Nothing in here" is a legitimate answer to a listing, not a failure. Both ssh_ls
+    // branches omit the flag entirely, which is what ssh_find does for its empty result.
+    listDirSpy.mockResolvedValue([]);
+    const empty = await call("ssh_ls", { ...HOST, path: "/empty" });
+    listDirSpy.mockResolvedValue(["a.txt"]);
+    const populated = await call("ssh_ls", { ...HOST, path: "/srv" });
+    for (const result of [empty, populated]) {
+      expect(Object.keys(result)).toEqual(["content"]);
+      expect("isError" in result).toBe(false);
+    }
+  });
+
+  it("the empty message names the REQUESTED path, so two listings cannot be confused", async () => {
+    listDirSpy.mockResolvedValue([]);
+    expect(textOf(await call("ssh_ls", { ...HOST, path: "/var/spool/nothing" }))).toBe(
+      "Directory is empty: /var/spool/nothing",
+    );
+  });
+
+  it("a directory holding one EMPTY-STRING entry is not mistaken for an empty directory", async () => {
+    // The guard is on the array length, not on the joined string: joining a single
+    // empty-string entry also yields "", so a truthiness check on the rendered text would
+    // report this one-entry directory as empty.
+    listDirSpy.mockResolvedValue([""]);
+    expect(textOf(await call("ssh_ls", { ...HOST, path: "/srv" }))).toBe("");
   });
 
   it("does not annotate entries with a type or a path prefix", async () => {
@@ -678,5 +733,208 @@ describe("timeout defaulting reaches the callee", () => {
     // readyTimeout, not a per-call one. Pinned so the "defaults to 30000" claim is scoped
     // to the tools that actually have the parameter.
     expect("timeout" in getTool(name).schema).toBe(declared);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ssh_multi_exec -- the batch isError predicate
+// ---------------------------------------------------------------------------
+
+describe("ssh_multi_exec sets isError for the WHOLE batch", () => {
+  // The predicate is `results.some(r => r.error || r.code !== 0)` -- ONE host is enough to
+  // flag the batch, and a clean non-zero exit counts the same as a connection error. Nothing
+  // asserted either half before, so an inverted (`every`) or narrowed (`error`-only)
+  // predicate would ship green while telling an agent a half-failed fan-out succeeded.
+  type MultiResult = { host: string; stdout: string; stderr: string; code: number; signal?: string; error?: string };
+
+  const okHost = (host: string): MultiResult => ({ host, stdout: "up", stderr: "", code: 0 });
+  const tenHosts = Array.from({ length: 10 }, (_, i) => `web${i + 1}.test`);
+  const runBatch = (results: MultiResult[]) => {
+    multiExecSpy.mockResolvedValue(results);
+    return call("ssh_multi_exec", { hosts: results.map((r) => r.host), command: "uptime" });
+  };
+
+  it("an all-zero-exit batch is NOT an error", async () => {
+    const result = await runBatch(tenHosts.map(okHost));
+    expect(result.isError).toBe(false);
+    expect("isError" in result).toBe(true);
+  });
+
+  it("ONE unreachable host out of ten flips the batch", async () => {
+    const results = tenHosts.map(okHost);
+    results[4] = { host: "web5.test", stdout: "", stderr: "", code: -1, error: "Connection refused" };
+    const result = await runBatch(results);
+    expect(result.isError).toBe(true);
+    // ...and the nine that worked are still rendered, so the caller is not left with only
+    // the failure.
+    expect(textOf(result)).toContain("--- web1.test ---");
+    expect(textOf(result)).toContain("[ERROR] Connection refused");
+  });
+
+  it("ONE non-zero EXIT out of ten flips the batch, with no connection error anywhere", async () => {
+    // The half most likely to be lost in a rewrite: every host answered, one command just
+    // failed. `r.error` is undefined for all ten, so only the `code !== 0` term can catch it.
+    const results = tenHosts.map(okHost);
+    results[9] = { host: "web10.test", stdout: "", stderr: "no such service", code: 3 };
+    const result = await runBatch(results);
+    expect(result.isError).toBe(true);
+    expect(results.every((r) => r.error === undefined)).toBe(true);
+    expect(textOf(result)).toContain("[exit code: 3]");
+  });
+
+  it("a host carrying an `error` flags the batch even when its exit code is 0", async () => {
+    // The two terms of the predicate are not interchangeable, and this is the one that only
+    // `r.error` can catch. Today's multiExec (src/ops.ts) always pairs an error with
+    // `code: -1`, so this exact shape does not arise in production -- but the RENDERER
+    // already branches on `r.error` alone, printing "[ERROR] ..." with no exit-code line.
+    // If isError were narrowed to the exit code, this result would render as a failure and
+    // report success in the same call. Pinned so the two branches cannot drift apart.
+    const result = await runBatch([
+      okHost("web1.test"),
+      { host: "web2.test", stdout: "", stderr: "", code: 0, error: "Pool acquire failed" },
+    ]);
+    expect(textOf(result)).toContain("[ERROR] Pool acquire failed");
+    expect(result.isError).toBe(true);
+  });
+
+  it("a batch where EVERY host failed is an error too, not just a mixed one", async () => {
+    const result = await runBatch(tenHosts.map((host) => ({ host, stdout: "", stderr: "", code: 1 })));
+    expect(result.isError).toBe(true);
+  });
+
+  it("a signal-killed host (code -1) counts as a failure", async () => {
+    const result = await runBatch([
+      okHost("web1.test"),
+      { host: "web2.test", stdout: "", stderr: "", code: -1, signal: "TERM" },
+    ]);
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain("[signal: TERM]");
+    expect(textOf(result)).toContain("[exit code: -1]");
+  });
+
+  it("an EMPTY host list is not an error -- some() over [] is false", async () => {
+    // Pinned as actual behavior: nothing ran, so nothing failed.
+    multiExecSpy.mockResolvedValue([]);
+    const result = await call("ssh_multi_exec", { hosts: [], command: "uptime" });
+    expect(result.isError).toBe(false);
+    expect(textOf(result)).toBe("");
+  });
+
+  it("renders one block per host, in the order multiExec returned them", async () => {
+    const result = await runBatch([
+      { host: "web1.test", stdout: "10:00:01 up 3 days", stderr: "", code: 0 },
+      { host: "web2.test", stdout: "", stderr: "", code: 1, error: "Timed out" },
+    ]);
+    expect(textOf(result)).toBe(
+      [
+        "--- web1.test ---",
+        "10:00:01 up 3 days",
+        "[exit code: 0]",
+        "",
+        "--- web2.test ---",
+        "[ERROR] Timed out",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  it("an errored host prints [ERROR] INSTEAD of stdout/stderr/exit-code, even when they are set", async () => {
+    const result = await runBatch([
+      { host: "web1.test", stdout: "partial", stderr: "boom", code: 7, error: "Connection refused" },
+    ]);
+    const text = textOf(result);
+    expect(text).toContain("[ERROR] Connection refused");
+    expect(text).not.toContain("partial");
+    expect(text).not.toContain("[exit code: 7]");
+  });
+
+  it("defaults the batch timeout to 30000 and forwards an explicit one", async () => {
+    multiExecSpy.mockResolvedValue([]);
+    await call("ssh_multi_exec", { hosts: ["a.test"], command: "uptime" });
+    expect(lastCall(multiExecSpy)[3]).toBe(30000);
+    await call("ssh_multi_exec", { hosts: ["a.test"], command: "uptime", timeout: 4321 });
+    expect(lastCall(multiExecSpy)[3]).toBe(4321);
+  });
+
+  it("hands every host the SAME connection parameters and the same command string", async () => {
+    multiExecSpy.mockResolvedValue([]);
+    await call("ssh_multi_exec", {
+      hosts: ["a.test", "b.test"],
+      command: "uptime",
+      port: 2222,
+      username: "deploy",
+      privateKeyPath: "/k",
+      password: "p",
+    });
+    expect(lastCall(multiExecSpy)[1]).toEqual([
+      { host: "a.test", port: 2222, username: "deploy", privateKeyPath: "/k", password: "p" },
+      { host: "b.test", port: 2222, username: "deploy", privateKeyPath: "/k", password: "p" },
+    ]);
+    expect(lastCall(multiExecSpy)[2]).toBe("uptime");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Numeric schema boundaries
+// ---------------------------------------------------------------------------
+
+describe("the zod numeric boundaries are the only guard between 'omitted' and an explicit 0", () => {
+  // Every handler defaults with `x || default`, so 0 and undefined are indistinguishable by
+  // the time the body runs: a widened schema would silently turn `timeout: 0` into 30000 and
+  // `port: 0` into 22 instead of telling the caller the value is invalid. An LLM caller
+  // emitting 0 for "no limit" is realistic, which is exactly why the schema has to reject it.
+  type ZodLike = { safeParse: (v: unknown) => { success: boolean } };
+  const field = (tool: string, name: string): ZodLike => getTool(tool).schema[name] as unknown as ZodLike;
+  const toolsDeclaring = (name: string): string[] =>
+    [...getTools().entries()].filter(([, t]) => name in t.schema).map(([toolName]) => toolName);
+
+  it("every tool taking a port shares ONE schema: an integer in 1..65535", () => {
+    const named = toolsDeclaring("port");
+    // Sanity check that the sweep is actually sweeping something.
+    expect(named.length).toBeGreaterThan(5);
+    for (const tool of named) {
+      const port = field(tool, "port");
+      for (const good of [1, 22, 2222, 65535]) {
+        expect(port.safeParse(good).success, `${tool} should accept port ${good}`).toBe(true);
+      }
+      for (const bad of [0, -1, 65536, 1.5, "22", null]) {
+        expect(port.safeParse(bad).success, `${tool} should reject port ${String(bad)}`).toBe(false);
+      }
+      // Still optional -- omitting it is how you ask for 22.
+      expect(port.safeParse(undefined).success).toBe(true);
+    }
+  });
+
+  it("every tool taking a timeout shares ONE schema: a positive integer", () => {
+    const named = toolsDeclaring("timeout");
+    expect(named).toEqual(expect.arrayContaining(["ssh_exec", "ssh_multi_exec", "ssh_find", "ssh_tail"]));
+    for (const tool of named) {
+      const timeout = field(tool, "timeout");
+      for (const good of [1, 5000, 600000]) {
+        expect(timeout.safeParse(good).success, `${tool} should accept timeout ${good}`).toBe(true);
+      }
+      for (const bad of [0, -1, 1.5, "5000"]) {
+        expect(timeout.safeParse(bad).success, `${tool} should reject timeout ${String(bad)}`).toBe(false);
+      }
+      expect(timeout.safeParse(undefined).success).toBe(true);
+      // No upper bound, deliberately: a long-running command is a legitimate use.
+      expect(timeout.safeParse(86_400_000).success).toBe(true);
+    }
+  });
+
+  it("ssh_tail's `lines` is a positive integer -- 0 would silently mean 100", () => {
+    const lines = field("ssh_tail", "lines");
+    for (const good of [1, 100, 100000]) expect(lines.safeParse(good).success).toBe(true);
+    for (const bad of [0, -1, 2.5, "100"]) expect(lines.safeParse(bad).success).toBe(false);
+    expect(lines.safeParse(undefined).success).toBe(true);
+  });
+
+  it("ssh_find's `maxdepth` deliberately ALLOWS 0 -- it is a real query, not a missing value", () => {
+    // The contrast that makes the rule above meaningful: `-maxdepth 0` tests the named path
+    // itself, and find() guards with `!== undefined` rather than truthiness, so a bare
+    // z.number() is correct here.
+    const maxdepth = field("ssh_find", "maxdepth");
+    expect(maxdepth.safeParse(0).success).toBe(true);
+    expect(maxdepth.safeParse(undefined).success).toBe(true);
   });
 });

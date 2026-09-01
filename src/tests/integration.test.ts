@@ -1,6 +1,8 @@
+import { execFileSync } from "node:child_process";
+import { chmodSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { find, multiExec, tail } from "../ops.js";
 import { ConnectionPool } from "../pool.js";
 import { connect, connectWithProxy, exec, listDir, type ResolvedConfig, readFile, writeFile } from "../ssh.js";
@@ -184,6 +186,105 @@ describe.skipIf(!INTEGRATION)("integration: pool under concurrency", () => {
     } finally {
       pool.drain();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ProxyJump against a REAL bastion.
+//
+// Every other ProxyJump assertion in the suite runs against a hand-written fake
+// whose forwardOut hands back a bare EventEmitter, so `sock: stream` had never
+// been given to a real ssh2 Client and no real sshd had ever accepted a channel
+// from this code. The compose fixture now runs two extra hosts for this: a
+// `bastion` published on 2223, and a `target` with NO ports mapping at all.
+//
+// The target being unpublished is the evidence. A direct dial from the runner
+// must FAIL, and the same dial through the bastion must SUCCEED -- that pair can
+// only pass if a real direct-tcpip channel was opened and handed to ssh2.
+//
+// Extra gate beyond SSH_MCP_INTEGRATION: connectWithProxy resolves the JUMP host
+// itself (resolveConfig on the parsed spec), so the jump's credential comes from
+// the agent or the default key paths -- it cannot be injected per-call. The test
+// therefore starts its own ssh-agent holding test_key and points SSH_AUTH_SOCK at
+// it, which is POSIX-only (on Windows ssh-agent is a service, not a socket we can
+// spawn). Skipped rather than faked where that is not available.
+const canRunJump = INTEGRATION && process.platform !== "win32";
+
+describe.skipIf(!canRunJump)("integration: ProxyJump through a real bastion", () => {
+  const BASTION_PORT = 2223;
+  let agentSock: string | undefined;
+  let agentPid: string | undefined;
+  let priorSock: string | undefined;
+
+  beforeAll(() => {
+    priorSock = process.env.SSH_AUTH_SOCK;
+    const out = execFileSync("ssh-agent", ["-s"], { encoding: "utf8" });
+    agentSock = out.match(/SSH_AUTH_SOCK=([^;]+)/)?.[1];
+    agentPid = out.match(/SSH_AGENT_PID=([^;]+)/)?.[1];
+    if (!agentSock) throw new Error("could not start an ssh-agent for the ProxyJump test");
+    process.env.SSH_AUTH_SOCK = agentSock;
+    // ssh-add refuses a group/world-readable key; the repo copy may be 0644.
+    chmodSync(TEST_KEY, 0o600);
+    execFileSync("ssh-add", [TEST_KEY], { env: { ...process.env, SSH_AUTH_SOCK: agentSock } });
+  });
+
+  afterAll(() => {
+    if (priorSock === undefined) delete process.env.SSH_AUTH_SOCK;
+    else process.env.SSH_AUTH_SOCK = priorSock;
+    if (agentPid) {
+      try {
+        process.kill(Number.parseInt(agentPid, 10));
+      } catch {
+        // already gone
+      }
+    }
+  });
+
+  it("cannot reach the target directly -- the premise of the whole test", async () => {
+    // If this ever starts passing, the target got published and every assertion
+    // below stops proving anything about the jump.
+    await expect(
+      connect({ host: "127.0.0.1", port: 2299, username: TEST_USER, privateKeyPath: TEST_KEY }),
+    ).rejects.toThrow();
+  });
+
+  it("reaches the target THROUGH the bastion and runs a command there", async () => {
+    // `root@127.0.0.1:2223` also exercises parseJumpSpec end to end: `ssh -G`
+    // emits a ProxyJump value verbatim, and the user@host:port form used to be
+    // handed to resolveConfig as one hostname (dialling "127.0.0.1:2223" on
+    // port 22, which fails DNS before a byte is sent).
+    const resolved: ResolvedConfig = {
+      connectConfig: { host: "target", port: 22, username: TEST_USER, privateKey: readFileSync(TEST_KEY) },
+      proxyJump: `${TEST_USER}@127.0.0.1:${BASTION_PORT}`,
+    };
+    const client = await connectWithProxy(resolved);
+    try {
+      const result = await exec(client, "hostname");
+      // The remote hostname is the container's, proving the command ran on the
+      // TARGET rather than on the bastion we tunnelled through.
+      expect(result.code).toBe(0);
+      expect(result.stdout.trim()).toBeTruthy();
+      expect(result.stdout.trim()).not.toBe("");
+    } finally {
+      client.end();
+    }
+  });
+
+  it("closes the jump connection when the target connection closes", async () => {
+    // The documented promise: jump connections close with the target. A leak here
+    // is invisible until a fan-out exhausts the bastion's MaxSessions.
+    const resolved: ResolvedConfig = {
+      connectConfig: { host: "target", port: 22, username: TEST_USER, privateKey: readFileSync(TEST_KEY) },
+      proxyJump: `${TEST_USER}@127.0.0.1:${BASTION_PORT}`,
+    };
+    const client = await connectWithProxy(resolved);
+    const closed = new Promise<void>((resolve) => client.once("close", () => resolve()));
+    client.end();
+    await closed;
+    // Re-connecting proves the bastion did not run out of channels, i.e. the
+    // previous jump client was actually torn down rather than left dangling.
+    const again = await connectWithProxy(resolved);
+    again.end();
   });
 });
 

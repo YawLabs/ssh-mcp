@@ -1,7 +1,15 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { diagnose } from "./diagnose.js";
-import { checkGitSsh, configLookup, ensureAgent, fixKnownHosts, listSshKeys, loadKey, testConnection } from "./env.js";
+import {
+  checkGitSsh,
+  configLookup,
+  ensureAgent,
+  fixKnownHosts,
+  listSshKeysDetailed,
+  loadKey,
+  testConnection,
+} from "./env.js";
 import { find, multiExec, serviceStatus, shellQuote, tail } from "./ops.js";
 import { enforcePolicy } from "./policy.js";
 import { ConnectionPool } from "./pool.js";
@@ -218,6 +226,13 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
     async ({ path, ...conn }) => {
       return connectionPool.withConnection(conn, async (client) => {
         const files = await listDir(client, path);
+        // An empty join() is an empty text block, which a caller cannot tell apart from a
+        // read that produced nothing at all. Say so explicitly, the way ssh_find does with
+        // "No files found." -- and, like ssh_find, do NOT flag it: an empty directory is a
+        // legitimate answer to "what is in here?", not a failure.
+        if (files.length === 0) {
+          return { content: [{ type: "text", text: `Directory is empty: ${path}` }] };
+        }
         return { content: [{ type: "text", text: files.join("\n") }] };
       });
     },
@@ -351,10 +366,39 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_key_list",
-    "List all SSH private keys in ~/.ssh/ with their type, fingerprint, and whether they are loaded in the agent. Use this to find which keys are available and which ones need to be loaded.",
+    "List all SSH private keys in ~/.ssh/ with their type, fingerprint, and whether they are loaded in the agent. Use this to find which keys are available and which ones need to be loaded. Reports isError only when ~/.ssh exists but could not be read -- an absent or empty ~/.ssh is a successful answer with a ssh-keygen hint.",
     {},
     async () => {
-      const keys = listSshKeys();
+      // Three different situations all produce zero keys and only one of them is fixed by
+      // running ssh-keygen, so each gets its own message and its own isError. Telling an
+      // operator whose ~/.ssh is unreadable to "generate a key" sends them the wrong way.
+      const listing = listSshKeysDetailed();
+
+      if (listing.status === "unreadable") {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Could not read ${listing.dir}: ${listing.reason}. This is NOT "no keys" -- the directory exists but could not be listed. Check that it is a directory and that you own it: ls -ld ${listing.dir}, then chmod 700 ${listing.dir}.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      if (listing.status === "no-dir") {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No ~/.ssh directory yet (${listing.dir} does not exist). Generate a key to create it: ssh-keygen -t ed25519 -C "your@email.com"`,
+            },
+          ],
+          isError: false,
+        };
+      }
+
+      const keys = listing.keys;
       if (keys.length === 0) {
         return {
           content: [
@@ -363,6 +407,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
               text: 'No SSH private keys found in ~/.ssh/. Generate one: ssh-keygen -t ed25519 -C "your@email.com"',
             },
           ],
+          isError: false,
         };
       }
 
@@ -374,7 +419,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
         if (key.fingerprint) lines.push(`  Fingerprint: ${key.fingerprint}`);
         lines.push("");
       }
-      return { content: [{ type: "text", text: lines.join("\n") }] };
+      return { content: [{ type: "text", text: lines.join("\n") }], isError: false };
     },
   );
 
@@ -451,8 +496,21 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
     "ssh_git_check",
     "Test Git-over-SSH authentication to a hosting provider (GitHub, GitLab, Bitbucket, etc). Verifies your SSH key is registered and working. Use this when git clone/pull/push fails with SSH errors.",
     {
-      host: z.string().optional().describe('Git hosting hostname (default: "github.com")'),
-      user: z.string().optional().describe('SSH user for the git host (default: "git")'),
+      // .min(1), not a bare optional string: the handler defaults with `host || "github.com"`,
+      // so an explicitly-empty host would silently probe github.com and report on a host the
+      // caller never named -- and, because "" never reaches checkGitSsh, it would skip the
+      // isValidHostname check every other host-taking tool routes its input through. Omitting
+      // the field is the way to ask for the default; "" is rejected at the schema boundary.
+      host: z
+        .string()
+        .min(1, "host must not be empty. Omit it to use the default (github.com).")
+        .optional()
+        .describe('Git hosting hostname (default: "github.com"). Omit for the default; an empty string is rejected.'),
+      user: z
+        .string()
+        .min(1, "user must not be empty. Omit it to use the default (git).")
+        .optional()
+        .describe('SSH user for the git host (default: "git"). Omit for the default; an empty string is rejected.'),
     },
     async ({ host, user }) => {
       const result = checkGitSsh(host || "github.com", user || "git");

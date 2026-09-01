@@ -7,17 +7,27 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vites
 // ---------------------------------------------------------------------------
 // What this suite pins
 //
-// Two branches in ssh.ts that nothing else asserts, and that between them decide
+// Three branches in ssh.ts that nothing else asserts, and that between them decide
 // whether identity-file auth happens AT ALL on Windows:
 //
-//   1. isEncryptedKey()  -- the private-key format classifier.
-//   2. the resolveConfig auth block -- the agent-AND-key invariant.
+//   1. isEncryptedKey()      -- the private-key format classifier.
+//   2. looksLikePrivateKey() -- "is this file a key at all", the filter in front of
+//                               it.
+//   3. the resolveConfig auth block -- the agent-AND-key invariant, plus a walk that
+//      takes the first USABLE candidate rather than the first merely READABLE one.
 //
 // The connection path sets `agentSock` to the Windows named pipe UNCONDITIONALLY
 // (no service probe), so on Windows an agent is always "configured" and the
 // encrypted-key skip is always in force. A false "encrypted" verdict therefore
 // silently deletes identity-file auth for every Windows user; a false "plain"
 // verdict makes ssh2 throw "no passphrase given" and kills the connect outright.
+//
+// The two filters differ ON PURPOSE, and the tests below hold them apart:
+// looksLikePrivateKey rejects ALWAYS -- a `.pub` or a zero-byte file is not a
+// credential in any format, so offering it can only shadow a real key later in the
+// list. isEncryptedKey rejects only when an agent is configured, because with no
+// agent an encrypted key is still the best thing left to offer and ssh2's own
+// passphrase error is the one worth showing.
 //
 // Fixtures are REAL `ssh-keygen` output written to a temp dir. isEncryptedKey
 // parses the OpenSSH v1 container and reads its ciphername field, so a
@@ -79,6 +89,8 @@ let keygenError: unknown = null;
 const fixtures = {
   /** OpenSSH v1 container, ciphername "none". */
   ed25519Plain: "",
+  /** The PUBLIC half ssh-keygen wrote beside it -- the `IdentityFile ...id_ed25519.pub` typo. */
+  ed25519Pub: "",
   /** OpenSSH v1 container, ciphername "aes256-ctr" (ssh-keygen's default KDF cipher). */
   ed25519Encrypted: "",
   /** Same container, a DIFFERENT cipher -- proves the check is "not none", not "not aes256-ctr". */
@@ -99,6 +111,8 @@ const fixtures = {
   garbageNoMarkers: "",
   /** Zero bytes. */
   empty: "",
+  /** PuTTY's header: no PEM armor, but ssh2 has a real parser for it, so it IS a key. */
+  ppk: "",
 };
 
 try {
@@ -135,6 +149,28 @@ try {
 
   fixtures.empty = join(KEYS, "empty");
   writeFileSync(fixtures.empty, "");
+
+  // ssh-keygen already wrote the public half beside every private key above.
+  fixtures.ed25519Pub = `${fixtures.ed25519Plain}.pub`;
+
+  // Shape-only PPK -- enough of the header to answer "is a key present here", which
+  // is all looksLikePrivateKey asks. ssh2 parses this format, so it must NOT be
+  // skipped; a full valid .ppk would pin ssh2's parser, not ssh.ts's filter.
+  fixtures.ppk = join(KEYS, "putty.ppk");
+  writeFileSync(
+    fixtures.ppk,
+    [
+      "PuTTY-User-Key-File-2: ssh-rsa",
+      "Encryption: none",
+      "Comment: fixture",
+      "Public-Lines: 1",
+      "AAAA",
+      "Private-Lines: 1",
+      "AAAA",
+      "Private-MAC: 00",
+      "",
+    ].join("\n"),
+  );
 } catch (err) {
   keygenError = err;
 }
@@ -201,6 +237,12 @@ afterEach(() => {
  * `isEncryptedKey` says no. So: privateKey absent => classified ENCRYPTED,
  * privateKey present => classified PLAIN. The agent is passed explicitly, which
  * keeps this answer independent of platform and of $SSH_AUTH_SOCK.
+ *
+ * ONLY MEANINGFUL FOR A FILE THAT CARRIES PRIVATE-KEY ARMOR. The walk runs two
+ * filters now, and an absent privateKey no longer identifies which one fired: a
+ * candidate that `looksLikePrivateKey` rejects never reaches `isEncryptedKey` at
+ * all. Ask about those with `offeredKey` below, which puts the question the way the
+ * walk actually answers it.
  */
 function classifiedAsEncrypted(keyPath: string): boolean {
   clearSshConfigCache();
@@ -208,6 +250,23 @@ function classifiedAsEncrypted(keyPath: string): boolean {
   const { connectConfig } = resolveConfig({ host: HOST, agent: FAKE_SOCK });
   expect(connectConfig.agent).toBe(FAKE_SOCK); // the guard is genuinely armed
   return connectConfig.privateKey === undefined;
+}
+
+/**
+ * What the identity walk ends up OFFERING for a given identityfile list, or
+ * undefined when every candidate was skipped.
+ *
+ * `agent: false` clears BOTH agent sources ($SSH_AUTH_SOCK and the win32 pipe) so
+ * the no-agent branch is the one under test; the assertion inside keeps that from
+ * drifting silently if the fallback chain changes.
+ */
+function offeredKey(paths: string[], opts: { agent: boolean }): Buffer | string | undefined {
+  clearSshConfigCache();
+  stubIdentityFiles(paths);
+  setEnvironment({ platform: "linux", authSock: opts.agent ? FAKE_SOCK : undefined });
+  const { connectConfig } = resolveConfig({ host: HOST });
+  expect(connectConfig.agent).toBe(opts.agent ? FAKE_SOCK : undefined);
+  return connectConfig.privateKey;
 }
 
 // ---------------------------------------------------------------- gap 1
@@ -220,6 +279,12 @@ describe("private-key fixtures", () => {
     expect(readFileSync(fixtures.ed25519Plain, "utf8")).toMatch(/^-----BEGIN OPENSSH PRIVATE KEY-----/);
     expect(readFileSync(fixtures.rsaPemEncrypted, "utf8")).toContain("Proc-Type: 4,ENCRYPTED");
     expect(readFileSync(fixtures.rsaPkcs8Encrypted, "utf8")).toMatch(/^-----BEGIN ENCRYPTED PRIVATE KEY-----/);
+
+    // The premise of the `IdentityFile ...id_ed25519.pub` case: a real .pub is a
+    // one-line base64 blob with no private-key armor anywhere in it.
+    const pub = readFileSync(fixtures.ed25519Pub, "utf8");
+    expect(pub).toMatch(/^ssh-ed25519 /);
+    expect(pub).not.toContain("PRIVATE KEY");
   });
 });
 
@@ -258,27 +323,83 @@ describe("isEncryptedKey classification (via the agent-configured skip)", () => 
     expect(classifiedAsEncrypted(fixtures.truncatedContainer)).toBe(true);
   });
 
-  it("calls OpenSSH markers wrapping non-container bytes PLAIN, not encrypted", () => {
-    // The body decodes cleanly to "not-a-real-key-at-all", so nothing throws --
-    // but the openssh-key-v1 magic does not match, so the ciphername is never
-    // read and the function falls through to its trailing `return false`. The
-    // catch is reached only when the container is real and TRUNCATED (above).
-    expect(classifiedAsEncrypted(fixtures.garbageInMarkers)).toBe(false);
+  it("is conservative about OpenSSH markers wrapping non-container bytes", () => {
+    // CHANGED -- this test used to assert `false` and was labelled a pin on the
+    // trailing `return false`. That WAS the bug, and it is the one that actually
+    // fires in the field: Node's base64 decoder is LENIENT, dropping characters it
+    // does not recognise instead of throwing, so a corrupted body still decodes --
+    // just to bytes whose openssh-key-v1 magic does not match. The old code read
+    // that as "plain", folded the corrupt file in, and ssh2 died on parse. A magic
+    // mismatch is now treated exactly like the throw beneath it, which is what the
+    // "unparseable -> be conservative" comment always claimed.
+    expect(classifiedAsEncrypted(fixtures.garbageInMarkers)).toBe(true);
+
+    // Premise: the body really does decode, so this is the MISMATCH branch and not
+    // the catch. The catch still needs the truncated container from the test above.
+    const body = readFileSync(fixtures.garbageInMarkers, "utf8").match(
+      /-----BEGIN OPENSSH PRIVATE KEY-----([\s\S]+?)-----END/,
+    ) as RegExpMatchArray;
+    expect(Buffer.from(body[1].replace(/\s+/g, ""), "base64").toString("latin1")).toBe("not-a-real-key-at-all");
+  });
+});
+
+// ---------------------------------------------------------------- gap 3
+
+describe("resolveConfig identity walk -- candidates that are not keys at all", () => {
+  // CHANGED, all of it. These cases used to be pinned AS BUGS: the walk accepted the
+  // first READABLE candidate and broke out, so a zero-byte file, a `.pub`, or any
+  // stray text at the head of the identityfile list became connectConfig.privateKey
+  // and the real key behind it was never reached. `looksLikePrivateKey` now skips a
+  // candidate that carries no private-key marker -- ALWAYS, agent or not, since such
+  // a file is not a credential in any format and offering it can only cost us the
+  // key further down.
+
+  it("skips an EMPTY file and offers the real key behind it (was: offered zero bytes)", () => {
+    expect(offeredKey([fixtures.empty, fixtures.rsaPlain], { agent: true })).toEqual(readFileSync(fixtures.rsaPlain));
   });
 
-  it("calls a file with no PEM markers at all PLAIN, so it IS folded in", () => {
-    // Reported as a finding, not a fix: a non-key file at the head of the
-    // identityfile list is offered to ssh2, which then errors on parse.
-    expect(classifiedAsEncrypted(fixtures.garbageNoMarkers)).toBe(false);
+  it("skips the empty file with NO agent too -- this filter is not agent-gated", () => {
+    // Deliberately unlike the encrypted-key skip, which stays gated on `agentSock &&`
+    // because an encrypted key is at least a key. Zero bytes never are.
+    expect(offeredKey([fixtures.empty, fixtures.rsaPlain], { agent: false })).toEqual(readFileSync(fixtures.rsaPlain));
   });
 
-  it("calls an EMPTY file PLAIN, so a zero-byte key is offered", () => {
-    expect(classifiedAsEncrypted(fixtures.empty)).toBe(false);
-    clearSshConfigCache();
-    stubIdentityFiles([fixtures.empty]);
-    const { connectConfig } = resolveConfig({ host: HOST, agent: FAKE_SOCK });
-    expect(Buffer.isBuffer(connectConfig.privateKey)).toBe(true);
-    expect((connectConfig.privateKey as Buffer).length).toBe(0);
+  it("skips a .pub at the head of the list -- the `IdentityFile ...id_ed25519.pub` typo", () => {
+    // The reachable real-world case: a public key has no BEGIN/END markers, so the
+    // old walk classified it plain, loaded it, and identity auth was dead.
+    expect(offeredKey([fixtures.ed25519Pub, fixtures.ed25519Plain], { agent: true })).toEqual(
+      readFileSync(fixtures.ed25519Plain),
+    );
+  });
+
+  it("skips a non-key text file and offers the key behind it", () => {
+    expect(offeredKey([fixtures.garbageNoMarkers, fixtures.ed25519Plain], { agent: true })).toEqual(
+      readFileSync(fixtures.ed25519Plain),
+    );
+  });
+
+  it("skips markers-around-garbage when an agent is present, reaching the key behind it", () => {
+    // Armor IS present here, so looksLikePrivateKey passes it through; what rejects
+    // it is isEncryptedKey's newly conservative answer to a magic mismatch.
+    expect(offeredKey([fixtures.garbageInMarkers, fixtures.rsaPlain], { agent: true })).toEqual(
+      readFileSync(fixtures.rsaPlain),
+    );
+  });
+
+  it("leaves privateKey UNSET when every candidate is unusable, instead of offering garbage", () => {
+    // The agent is then offered alone -- the same shape as "no identity file exists".
+    // Previously the first of these three became the privateKey and ssh2 was handed
+    // bytes that could only fail to parse.
+    const junk = [fixtures.empty, fixtures.ed25519Pub, fixtures.garbageNoMarkers];
+    expect(offeredKey(junk, { agent: true })).toBeUndefined();
+    expect(offeredKey(junk, { agent: false })).toBeUndefined();
+  });
+
+  it("does NOT skip a PuTTY-format key -- ssh2 parses that format, so it is a key", () => {
+    // The predicate asks "is a key present here", not "is this PEM". Narrowing it to
+    // the PEM armor alone would silently drop a working .ppk identity, which is the
+    // exact failure mode this whole describe block exists to prevent.
+    expect(offeredKey([fixtures.ppk, fixtures.rsaPlain], { agent: true })).toEqual(readFileSync(fixtures.ppk));
   });
 });
 

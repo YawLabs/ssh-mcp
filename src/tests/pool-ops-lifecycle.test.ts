@@ -12,7 +12,7 @@ vi.mock("../ssh.js", async (importOriginal) => {
   };
 });
 
-import { type MultiExecHost, multiExec } from "../ops.js";
+import { find, type MultiExecHost, multiExec, serviceStatus } from "../ops.js";
 import { ConnectionPool } from "../pool.js";
 import { connectWithProxy } from "../ssh.js";
 
@@ -419,5 +419,377 @@ describe("ConnectionPool — idle timer release path", () => {
     } finally {
       pool.drain();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GAP 5 — eviction at capacity with a MIX of held and idle entries
+// ---------------------------------------------------------------------------
+
+describe("ConnectionPool — eviction with held and idle entries mixed", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    mockedConnect.mockReset();
+    mockedConnect.mockImplementation(async () => makeQuietClient() as never);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("picks an entry with refCount 0 and leaves the in-use one alone", async () => {
+    // The normal shape of a fan-out at capacity: one host is still mid-exec while
+    // another has finished and gone idle. Insertion order matters here -- the HELD
+    // entry is created first, so it is the first candidate the eviction loop sees.
+    // Without the `refCount === 0` guard the loop would end() the connection the
+    // live caller is holding, and that caller's next channel open would fail with an
+    // unrelated "Not connected" instead of a clean pool-full rejection.
+    const pool = new ConnectionPool({ idleTtlMs: TTL, maxPoolSize: 2 });
+    try {
+      const held = (await pool.acquire({ host: "mid-exec.example.com" })) as unknown as { endCalls: number };
+      const idle = (await pool.acquire({ host: "finished.example.com" })) as unknown as { endCalls: number };
+      pool.release(idle as never); // refCount 0, idle timer armed -> the eviction candidate
+
+      expect(pool.size).toBe(2); // at capacity
+      expect(pool.stats).toEqual({ active: 1, idle: 1 });
+      expect(vi.getTimerCount()).toBe(1);
+
+      // A third distinct host arrives. Room must come from the idle entry.
+      const newcomer = await pool.acquire({ host: "newcomer.example.com" });
+      expect(newcomer).toBeDefined();
+
+      expect(held.endCalls).toBe(0); // the load-bearing assertion
+      expect(idle.endCalls).toBe(1);
+      expect(pool.size).toBe(2);
+      expect(pool.stats).toEqual({ active: 2, idle: 0 });
+      // The evicted entry's armed idle timer is cleared as part of eviction, so it
+      // cannot fire later against a client the pool no longer tracks.
+      expect(vi.getTimerCount()).toBe(0);
+
+      // The held entry is still the pool's: re-acquiring hits the fast path, no redial.
+      const again = await pool.acquire({ host: "mid-exec.example.com" });
+      expect(again).toBe(held as unknown as typeof again);
+      expect(pool.connectCount).toBe(3);
+      expect(mockedConnect).toHaveBeenCalledTimes(3);
+
+      // Nothing fires against the already-ended client once its deadline passes.
+      vi.advanceTimersByTime(TTL * 10);
+      expect(idle.endCalls).toBe(1);
+      expect(held.endCalls).toBe(0);
+
+      pool.release(again);
+      pool.release(held as never);
+      pool.release(newcomer);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("evicts exactly ONE idle entry — the first in insertion order — and skips over the held one", async () => {
+    // Order: idle, held, idle. The first idle is the only casualty: the held entry is
+    // skipped by the refCount guard and the SECOND idle survives because the loop
+    // breaks after one eviction. Dropping that break would close a second warm
+    // connection nobody asked to close.
+    const pool = new ConnectionPool({ idleTtlMs: TTL, maxPoolSize: 3 });
+    try {
+      const idleFirst = (await pool.acquire({ host: "idle-first.example.com" })) as unknown as { endCalls: number };
+      pool.release(idleFirst as never);
+      const held = (await pool.acquire({ host: "held-middle.example.com" })) as unknown as { endCalls: number };
+      const idleLast = (await pool.acquire({ host: "idle-last.example.com" })) as unknown as { endCalls: number };
+      pool.release(idleLast as never);
+
+      expect(pool.size).toBe(3);
+      expect(pool.stats).toEqual({ active: 1, idle: 2 });
+      expect(vi.getTimerCount()).toBe(2);
+
+      const newcomer = await pool.acquire({ host: "newcomer-2.example.com" });
+
+      expect(idleFirst.endCalls).toBe(1); // first refCount-0 entry in iteration order
+      expect(held.endCalls).toBe(0);
+      expect(idleLast.endCalls).toBe(0); // the break stopped the loop
+      expect(pool.size).toBe(3);
+      expect(pool.stats).toEqual({ active: 2, idle: 1 });
+      expect(vi.getTimerCount()).toBe(1); // only idleLast's timer remains armed
+
+      // idleLast is still warm and reusable -- no fourth dial.
+      const reused = await pool.acquire({ host: "idle-last.example.com" });
+      expect(reused).toBe(idleLast as unknown as typeof reused);
+      expect(pool.connectCount).toBe(4);
+
+      pool.release(reused);
+      pool.release(held as never);
+      pool.release(newcomer);
+    } finally {
+      pool.drain();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GAP 6 — drain() while a connection is checked out
+// ---------------------------------------------------------------------------
+
+describe("ConnectionPool — drain() while a connection is checked out", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    mockedConnect.mockReset();
+    mockedConnect.mockImplementation(async () => makeQuietClient() as never);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("ends the held client, clears the map, and the later release() falls through WITHOUT throwing", async () => {
+    // index.ts drains on SIGTERM and on process exit, so a shutdown during a
+    // long-running remote command produces exactly this interleaving: drain() clears
+    // the entry out from under a caller who has not released yet.
+    const pool = new ConnectionPool({ idleTtlMs: TTL });
+    const c = (await pool.acquire({ host: "drain-midflight.example.com" })) as unknown as { endCalls: number };
+    expect(pool.stats).toEqual({ active: 1, idle: 0 });
+
+    pool.drain();
+    expect(c.endCalls).toBe(1); // drain ends a held connection too, refCount notwithstanding
+    expect(pool.size).toBe(0);
+
+    // The late release: the entry is gone, so the loop finds nothing and the
+    // unknown-client branch runs. It must not throw -- this call sits in
+    // withConnection's `finally`, where a throw would replace the caller's real error.
+    expect(() => pool.release(c as never)).not.toThrow();
+    expect(c.endCalls).toBe(2); // end() again (idempotent on a real ssh2 client)
+    expect(pool.size).toBe(0);
+    // A drained pool must not arm anything: the unknown-client branch has no timer.
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(TTL * 10);
+    expect(c.endCalls).toBe(2);
+  });
+
+  it("withConnection surfaces the callback's OWN error when drain() runs mid-flight", async () => {
+    const pool = new ConnectionPool({ idleTtlMs: TTL });
+    const boom = new Error("remote command interrupted by shutdown");
+    let seen: { endCalls: number } | undefined;
+
+    await expect(
+      pool.withConnection({ host: "sigterm.example.com" }, async (client) => {
+        seen = client as unknown as { endCalls: number };
+        pool.drain(); // the SIGTERM handler fires while the command is still running
+        throw boom; // ...and the command dies because its transport went away
+      }),
+    ).rejects.toBe(boom); // NOT an error thrown out of release() in the finally
+
+    expect(seen?.endCalls).toBe(2); // once by drain, once by the fall-through release
+    expect(pool.size).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GAP 7 — markDead is registered on "end" and "error", not only "close"
+// ---------------------------------------------------------------------------
+
+describe("ConnectionPool — markDead handler registration", () => {
+  // HONEST FRAMING: ssh2 follows both "end" and "error" with "close", and the "close"
+  // handler is already covered above ("a dead connection's markDead cancels the pending
+  // idle timer"). So these two tests do not pin a distinct real-world outcome -- they
+  // pin that all THREE registrations stay attached, so the entry is dropped on the first
+  // of the three signals rather than only on the trailing "close".
+  beforeEach(() => {
+    vi.useFakeTimers();
+    mockedConnect.mockReset();
+    mockedConnect.mockImplementation(async () => makeQuietClient() as never);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("'end' drops the entry and cancels the armed idle timer", async () => {
+    const pool = new ConnectionPool({ idleTtlMs: TTL });
+    try {
+      const c = (await pool.acquire({ host: "emits-end.example.com" })) as unknown as EventEmitter & {
+        endCalls: number;
+      };
+      pool.release(c as never);
+      expect(vi.getTimerCount()).toBe(1);
+
+      c.emit("end");
+      expect(pool.size).toBe(0);
+      expect(vi.getTimerCount()).toBe(0);
+
+      vi.advanceTimersByTime(TTL * 10);
+      expect(c.endCalls).toBe(0); // the peer hung up; the pool never had to end() it
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("'error' drops a still-held entry so the next acquire dials fresh", async () => {
+    const pool = new ConnectionPool({ idleTtlMs: TTL });
+    try {
+      const c1 = (await pool.acquire({ host: "emits-error.example.com" })) as unknown as EventEmitter & {
+        endCalls: number;
+      };
+      // Still held (refCount 1, never released) -- the transport dying mid-exec.
+      // Note the emit only survives because the pool itself attached an "error"
+      // listener; an EventEmitter with none throws the emitted error.
+      c1.emit("error", new Error("read ECONNRESET"));
+      expect(pool.size).toBe(0);
+
+      const c2 = await pool.acquire({ host: "emits-error.example.com" });
+      expect(c2).not.toBe(c1 as unknown as typeof c2);
+      expect(pool.connectCount).toBe(2);
+      expect(pool.size).toBe(1);
+
+      // Releasing the dead client afterwards is still safe.
+      expect(() => pool.release(c1 as never)).not.toThrow();
+      expect(c1.endCalls).toBe(1);
+
+      pool.release(c2);
+    } finally {
+      pool.drain();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GAP 8 — find size predicates reach the command string
+// ---------------------------------------------------------------------------
+
+/**
+ * Records the command string handed to client.exec so the assembled `find` line can be
+ * asserted verbatim. Same shape as scriptedClient above, plus the capture.
+ */
+function commandCapturingClient(script: { stdout?: string; stderr?: string; code?: number }): {
+  client: never;
+  lastCommand: () => string | undefined;
+} {
+  let last: string | undefined;
+  const client = {
+    exec: (command: string, cb: (err: Error | null, stream: unknown) => void) => {
+      last = command;
+      const stream = new EventEmitter() as EventEmitter & { stderr: EventEmitter };
+      stream.stderr = new EventEmitter();
+      cb(null, stream);
+      queueMicrotask(() => {
+        if (script.stdout) stream.emit("data", Buffer.from(script.stdout));
+        if (script.stderr) stream.stderr.emit("data", Buffer.from(script.stderr));
+        stream.emit("close", script.code ?? 0);
+      });
+    },
+  };
+  return { client: client as never, lastCommand: () => last };
+}
+
+describe("find — size predicates reach the command string", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("emits `-size +N` for minsize (files BIGGER than N)", async () => {
+    // The disk-pressure call operators actually make. `+` and `-` are opposite
+    // predicates to find, and swapping them returns the exact complement of the
+    // intended set with no error anywhere -- nothing downstream can notice.
+    const cap = commandCapturingClient({ stdout: "/var/log/huge.log\n/var/log/old.gz\n", code: 0 });
+    const results = await find(cap.client, { path: "/var/log", minsize: "100M" });
+
+    expect(cap.lastCommand()).toBe("find '/var/log' -size +100M");
+    expect(results).toEqual(["/var/log/huge.log", "/var/log/old.gz"]);
+  });
+
+  it("emits `-size -N` for maxsize (files SMALLER than N)", async () => {
+    const cap = commandCapturingClient({ stdout: "", code: 0 });
+    await find(cap.client, { path: "/tmp", maxsize: "10M" });
+    expect(cap.lastCommand()).toBe("find '/tmp' -size -10M");
+  });
+
+  it("emits both bounds, minsize first, in fixed order with the other predicates", async () => {
+    const cap = commandCapturingClient({ stdout: "", code: 0 });
+    await find(cap.client, {
+      path: "/srv",
+      maxdepth: 3,
+      type: "f",
+      name: "*.log",
+      minsize: "1M",
+      maxsize: "500M",
+      newer: "/etc/passwd",
+    });
+    expect(cap.lastCommand()).toBe(
+      "find '/srv' -maxdepth 3 -type f -name '*.log' -size +1M -size -500M -newer '/etc/passwd'",
+    );
+  });
+
+  it("passes the unit-suffixed and bare-number forms through unchanged", async () => {
+    for (const [size, expected] of [
+      ["512c", "find '/data' -size +512c"],
+      ["1024", "find '/data' -size +1024"],
+      ["5G", "find '/data' -size +5G"],
+    ] as const) {
+      const cap = commandCapturingClient({ stdout: "", code: 0 });
+      await find(cap.client, { path: "/data", minsize: size });
+      expect(cap.lastCommand()).toBe(expected);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GAP 9 — serviceStatus on crashed and masked units
+// ---------------------------------------------------------------------------
+
+describe("serviceStatus — crashed and masked units", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("reports a FAILED unit as active=false with unknown=false", async () => {
+    // `unknown` means "systemctl could not answer at all". A crashed unit answered
+    // perfectly well -- it has a parseable `Active:` line -- it just answered
+    // "failed". Reporting it as unknown would send an operator hunting for a typo'd
+    // unit name instead of reading the exit status that is right there.
+    // The fixture omits `Main PID:`, the shape systemd prints when ExecStart never
+    // became the main process (status=203/EXEC).
+    const cap = commandCapturingClient({
+      stdout: [
+        "* myapp.service - My Application",
+        "     Loaded: loaded (/etc/systemd/system/myapp.service; enabled; preset: enabled)",
+        "     Active: failed (Result: exit-code) since Wed 2025-06-04 08:12:03 UTC; 2min ago",
+        "    Process: 8123 ExecStart=/usr/local/bin/myapp --serve (code=exited, status=203/EXEC)",
+        "        CPU: 3ms",
+      ].join("\n"),
+      code: 3,
+    });
+
+    const status = await serviceStatus(cap.client, "myapp");
+
+    expect(cap.lastCommand()).toBe("systemctl status -- 'myapp' 2>&1");
+    expect(status.unknown).toBe(false); // systemctl DID answer
+    expect(status.active).toBe(false);
+    expect(status.status).toBe("failed (Result: exit-code)");
+    expect(status.description).toBe("My Application");
+    // `since` stops at the first `;`, so the trailing "2min ago" is not swept in.
+    expect(status.since).toBe("Wed 2025-06-04 08:12:03 UTC");
+    expect(status.pid).toBeUndefined(); // no `Main PID:` line in this shape
+    expect(status.name).toBe("myapp");
+    expect(status.raw).toContain("status=203/EXEC");
+  });
+
+  it("leaves description undefined for a MASKED unit whose header has no ' - '", async () => {
+    // A masked unit's header line is just the unit name -- no " - <description>".
+    // The description regex must not fall back to scraping the `Loaded: masked` line
+    // (which would report "masked (Reason: ...)" as the service's description).
+    const cap = commandCapturingClient({
+      stdout: [
+        "* postfix.service",
+        "     Loaded: masked (Reason: Unit postfix.service is masked.)",
+        "     Active: inactive (dead)",
+      ].join("\n"),
+      code: 3,
+    });
+
+    const status = await serviceStatus(cap.client, "postfix");
+
+    expect(status.description).toBeUndefined();
+    expect(status.unknown).toBe(false); // the `Active:` line parsed
+    expect(status.active).toBe(false);
+    expect(status.status).toBe("inactive (dead)");
+    expect(status.since).toBeUndefined(); // no "since ...;" in a masked unit's output
+    expect(status.pid).toBeUndefined();
+    expect(status.raw).toContain("Loaded: masked");
   });
 });

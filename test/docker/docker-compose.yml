@@ -1,7 +1,28 @@
 services:
+  # Single-host fixture used by most of the integration suite.
   sshd:
     build: .
     ports:
       - "2222:22"
+    volumes:
+      - ./test_key.pub:/root/.ssh/authorized_keys:ro
+
+  # --- ProxyJump fixture -------------------------------------------------
+  # Two hosts so the jump can be exercised for real. The bastion is published
+  # to the host; the target DELIBERATELY is not, so it is reachable ONLY from
+  # inside the compose network. That unreachability is the evidence: a direct
+  # dial from the test runner must fail, and the same dial through the bastion
+  # must succeed, which is the only way to prove a real forwarded channel was
+  # handed to ssh2 as `sock` and a real sshd accepted it.
+  bastion:
+    build: .
+    ports:
+      - "2223:22"
+    volumes:
+      - ./test_key.pub:/root/.ssh/authorized_keys:ro
+
+  target:
+    build: .
+    # No `ports:` -- unreachable from the host on purpose. See above.
     volumes:
       - ./test_key.pub:/root/.ssh/authorized_keys:ro

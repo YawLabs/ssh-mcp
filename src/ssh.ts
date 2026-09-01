@@ -403,12 +403,45 @@ function buildHostVerifier(
   };
 }
 
-// Heuristic: is this private-key file passphrase-encrypted? An encrypted key is
-// useless in a non-interactive ssh2 connect (it errors with "no passphrase given"),
-// so we must not fold one in as an agent fallback -- the common setup is an encrypted
-// key on disk with its decrypted copy held in the agent. Detects the classic PEM
-// markers (Proc-Type/DEK-Info, PKCS#8 "BEGIN ENCRYPTED PRIVATE KEY") and reads the
-// ciphername field of the OpenSSH new format ("none" => unencrypted).
+// Does this file even CLAIM to be a private key? Only the armor is inspected. An
+// empty file carries none, and neither does a `.pub` (the classic `IdentityFile
+// ~/.ssh/id_ed25519.pub` typo), a stray known_hosts, or any text file left at a
+// key's path. The identity walk skips whatever fails this WHETHER OR NOT an agent
+// is configured -- unlike the encrypted-key skip below, this one is not a heuristic
+// about which credential to prefer: such a file is not a key in any format, so
+// offering it can only shadow the real key further down the list and hand ssh2
+// bytes it must error on.
+//
+// The marker set is deliberately WIDER than what ssh2 can parse (PKCS#8 and the
+// PuTTY header included). The question here is "is a key present at all", not "will
+// ssh2 like it" -- a file that genuinely holds a key should reach ssh2 so that ITS
+// error is what the user sees, rather than vanishing behind a silent skip. A
+// zero-byte file needs no special case: it carries no marker, so it fails here like
+// any other non-key.
+const PRIVATE_KEY_MARKER = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/;
+function looksLikePrivateKey(content: Buffer): boolean {
+  const text = content.toString("utf8");
+  return PRIVATE_KEY_MARKER.test(text) || text.trimStart().startsWith("PuTTY-User-Key-File-");
+}
+
+// Heuristic: is this private-key file passphrase-encrypted -- or malformed in a way
+// that makes it unusable? An encrypted key is useless in a non-interactive ssh2
+// connect (it errors with "no passphrase given"), so we must not fold one in
+// alongside the agent -- the common setup is an encrypted key on disk with its
+// decrypted copy held in the agent. Detects the classic PEM markers (Proc-Type/
+// DEK-Info, PKCS#8 "BEGIN ENCRYPTED PRIVATE KEY") and reads the ciphername field of
+// the OpenSSH new format ("none" => unencrypted).
+//
+// A file wearing OPENSSH armor whose body is NOT a valid openssh-key-v1 container
+// answers true as well, and BOTH ways of being malformed land there. The magic
+// mismatch is the reachable one: Node's base64 decoder is LENIENT -- it drops
+// characters it does not recognise instead of throwing -- so a corrupted body still
+// decodes, just to bytes whose magic does not match. The catch needs a container
+// truncated to ~17 bytes, where the magic survives but the length field does not.
+// Answering "encrypted" for both is what makes the caller's `agentSock &&` skip keep
+// such a file away from ssh2, instead of letting it kill a connect the agent alone
+// would have completed. With no agent the caller loads it regardless and ssh2 still
+// surfaces its own parse error -- there is nothing else left to offer.
 function isEncryptedKey(content: Buffer): boolean {
   const text = content.toString("utf8");
   if (text.includes("ENCRYPTED")) return true;
@@ -417,11 +450,10 @@ function isEncryptedKey(content: Buffer): boolean {
     try {
       const raw = Buffer.from(m[1].replace(/\s+/g, ""), "base64");
       const magic = "openssh-key-v1\0";
-      if (raw.toString("latin1", 0, magic.length) === magic) {
-        const cipherLen = raw.readUInt32BE(magic.length);
-        const cipher = raw.toString("latin1", magic.length + 4, magic.length + 4 + cipherLen);
-        return cipher !== "none";
-      }
+      if (raw.toString("latin1", 0, magic.length) !== magic) return true; // malformed container
+      const cipherLen = raw.readUInt32BE(magic.length);
+      const cipher = raw.toString("latin1", magic.length + 4, magic.length + 4 + cipherLen);
+      return cipher !== "none";
     } catch {
       return true; // unparseable -> be conservative, don't fold it in
     }
@@ -503,9 +535,11 @@ export function resolveConfig(config: SSHConfig): ResolvedConfig {
   //   4. the ssh_config IdentityFile list, else
   //   5. the default key paths (~/.ssh/id_ed25519, id_rsa, id_ecdsa).
   //
-  // First-match-wins applies WITHIN 4/5 -- the first key file that exists is the
-  // one loaded -- but step 3 never suppresses them. The single exception is an
-  // encrypted key when an agent is configured; see the comment on that branch.
+  // First-match-wins applies WITHIN 4/5 -- the first USABLE key file in the list is
+  // the one loaded -- but step 3 never suppresses them. "Usable" is doing real work
+  // there: a candidate that carries no private-key armor at all is passed over, as
+  // is an encrypted or malformed one when an agent is configured. Both filters live
+  // on that branch; see the comment there.
   const home = homedir();
   if (config.privateKeyPath) {
     const keyPath = config.privateKeyPath.startsWith("~")
@@ -524,31 +558,50 @@ export function resolveConfig(config: SSHConfig): ResolvedConfig {
     }
 
     // Also load an on-disk key (SSH config identity files, else the default key
-    // paths) so the documented "agent > config identity > default keys" chain stays
-    // reachable. Previously the agent branch short-circuited this entirely -- and
-    // because the Windows named-pipe default above is always truthy, the
-    // identity-file/default-key steps were dead on Windows whenever the OpenSSH
-    // agent service was up, even with no usable key loaded in it. ssh2 offers BOTH
-    // the agent keys and this privateKey, matching OpenSSH's client behavior. When
-    // an agent is configured we only fold in an UNENCRYPTED key: an encrypted key
-    // would make ssh2 error on parse ("no passphrase given") and break the common
-    // setup of an encrypted key on disk with its decrypted copy held in the agent.
-    // With no agent we keep the prior behavior (load the first existing key
-    // regardless; ssh2 surfaces the passphrase error itself).
+    // paths) so the documented "agent + config identity + default keys" offer stays
+    // reachable. The agent branch above deliberately does NOT short-circuit this --
+    // and because the Windows named-pipe default above is always truthy, a
+    // short-circuit would leave the identity-file/default-key steps dead on Windows
+    // whenever the OpenSSH agent service is up, even with no usable key loaded in
+    // it. ssh2 offers BOTH the agent keys and this privateKey, matching OpenSSH's
+    // client behavior.
+    //
+    // The walk takes the first USABLE candidate, not merely the first READABLE one,
+    // so a junk file at the head of the list cannot shadow a good key behind it:
+    //
+    //   absent / unreadable   -> skip; the candidate simply is not there.
+    //   not key-shaped        -> skip ALWAYS, agent or not (looksLikePrivateKey).
+    //                            A zero-byte file or a `.pub` is not a key in any
+    //                            format, so offering it buys nothing and costs the
+    //                            real key further down the list.
+    //   encrypted / malformed -> skip ONLY when an agent is configured
+    //                            (isEncryptedKey). ssh2 parses `privateKey` eagerly
+    //                            and would throw "no passphrase given", breaking the
+    //                            encrypted-key-on-disk / decrypted-copy-in-the-agent
+    //                            setup. With no agent there is nothing else to
+    //                            offer, so we load it and let ssh2 surface the
+    //                            passphrase (or parse) error itself.
+    //
+    // If every candidate is skipped, privateKey stays unset and the agent -- if
+    // there is one -- is offered alone, rather than alongside bytes that can only
+    // fail. First-existing-key-wins still holds; it now holds among the candidates
+    // that survive these two filters.
     const keyPaths =
       sshConfig && sshConfig.identityFiles.length > 0
         ? sshConfig.identityFiles.map((p) => (p.startsWith("~") ? join(home, p.slice(1)) : p))
         : [join(home, ".ssh", "id_ed25519"), join(home, ".ssh", "id_rsa"), join(home, ".ssh", "id_ecdsa")];
 
     for (const keyPath of keyPaths) {
+      let keyData: Buffer;
       try {
-        const keyData = readFileSync(keyPath);
-        if (agentSock && isEncryptedKey(keyData)) continue;
-        connectConfig.privateKey = keyData;
-        break;
+        keyData = readFileSync(keyPath);
       } catch {
-        // Key doesn't exist, try next
+        continue; // Key doesn't exist, try next
       }
+      if (!looksLikePrivateKey(keyData)) continue;
+      if (agentSock && isEncryptedKey(keyData)) continue;
+      connectConfig.privateKey = keyData;
+      break;
     }
   }
 

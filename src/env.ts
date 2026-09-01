@@ -224,9 +224,37 @@ function detectKeyType(filePath: string, fileName: string): string {
   return "unknown";
 }
 
+/**
+ * Outcome of a ~/.ssh scan. An empty `keys` array on its own is ambiguous -- it is what
+ * "there is no ~/.ssh", "~/.ssh could not be read" and "~/.ssh holds no private keys" all
+ * produce -- and only the last of those is remediated by generating a key. `status` is the
+ * discriminator that tells them apart:
+ *
+ *   "ok"          the directory was read; `keys` is what it holds (possibly nothing)
+ *   "no-dir"      ~/.ssh does not exist (a fresh machine -- ssh-keygen will create it)
+ *   "unreadable"  readdir threw: permission denied, or a non-directory at that path.
+ *                 `reason` carries the underlying errno message.
+ *
+ * `keys` is always present and always empty for the two non-"ok" statuses, so a caller that
+ * only wants the keys can read it without narrowing first.
+ */
+export type SshKeyListing =
+  | { status: "ok"; dir: string; keys: KeyInfo[] }
+  | { status: "no-dir"; dir: string; keys: KeyInfo[] }
+  | { status: "unreadable"; dir: string; keys: KeyInfo[]; reason: string };
+
+/**
+ * Thin wrapper kept for every caller that only needs the keys: it discards the reason a
+ * scan came back empty. Prefer listSshKeysDetailed when an empty result has to be
+ * explained to a human or an agent -- see the type above for why.
+ */
 export function listSshKeys(): KeyInfo[] {
+  return listSshKeysDetailed().keys;
+}
+
+export function listSshKeysDetailed(): SshKeyListing {
   const sshDir = join(homedir(), ".ssh");
-  if (!existsSync(sshDir)) return [];
+  if (!existsSync(sshDir)) return { status: "no-dir", dir: sshDir, keys: [] };
 
   // Get fingerprints of keys loaded in agent
   const loadedFingerprints = new Set<string>();
@@ -243,8 +271,11 @@ export function listSshKeys(): KeyInfo[] {
   let files: string[];
   try {
     files = readdirSync(sshDir);
-  } catch {
-    return [];
+  } catch (e) {
+    // Distinct from "the directory is empty": EACCES on ~/.ssh, or a plain file sitting
+    // where the directory should be (ENOTDIR). Neither is fixed by generating a key, so
+    // the reason travels back to the caller instead of being flattened into [].
+    return { status: "unreadable", dir: sshDir, keys: [], reason: e instanceof Error ? e.message : String(e) };
   }
 
   for (const file of files) {
@@ -276,7 +307,7 @@ export function listSshKeys(): KeyInfo[] {
     }
   }
 
-  return keys;
+  return { status: "ok", dir: sshDir, keys };
 }
 
 export function loadKey(keyPath: string): { status: "ok" | "error"; message: string } {
