@@ -832,7 +832,11 @@ describe("ssh_exec renders a stderr block when the remote wrote to stderr", () =
   it("labels stderr rather than blending it into stdout", async () => {
     // A command that writes to BOTH streams is the normal shape of a partial
     // failure; without the label the agent cannot tell which half is which.
-    execSpy.mockImplementationOnce(async () => ({ stdout: "some output", stderr: "warning: deprecated flag", code: 0 }));
+    execSpy.mockImplementationOnce(async () => ({
+      stdout: "some output",
+      stderr: "warning: deprecated flag",
+      code: 0,
+    }));
     const { handler } = getTool("ssh_exec");
     const result = (await handler({ ...baseConn, command: "build" })) as { content: { text: string }[] };
 

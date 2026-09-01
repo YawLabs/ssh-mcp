@@ -1,6 +1,6 @@
-import { AddressInfo } from "node:net";
-import { describe, expect, it } from "vitest";
+import type { AddressInfo } from "node:net";
 import { Server, utils } from "ssh2";
+import { describe, expect, it } from "vitest";
 import { connectWithProxy, exec, type ResolvedConfig } from "../ssh.js";
 
 // ---------------------------------------------------------------------------
@@ -67,7 +67,9 @@ function startEchoServer(banner: string): Promise<{ port: number; close: () => P
  * for a ProxyJump hop. `forwards` records every destination asked for, which is
  * how a test proves the jump was actually used.
  */
-function startBastion(forwards: { host: string; port: number }[]): Promise<{ port: number; close: () => Promise<void> }> {
+function startBastion(
+  forwards: { host: string; port: number }[],
+): Promise<{ port: number; close: () => Promise<void> }> {
   const server = new Server({ hostKeys: [HOST_KEY] }, (client) => {
     acceptAnyAuth(client);
     client.on("ready", () => {
