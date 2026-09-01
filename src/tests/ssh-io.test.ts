@@ -44,6 +44,14 @@ const stubs = vi.hoisted(() => ({
   targetOutcome: { kind: "ready" } as { kind: "ready" } | { kind: "error"; err: Error },
   /** When true, a SECOND end() on a client throws -- proving endJump's try/catch. */
   endThrowsOnSecondCall: false,
+  /**
+   * `ssh-keygen -F <target>` script, keyed by the exact target string. Anything not
+   * listed is a miss. This is what lets a test have known_hosts answer for the
+   * RESOLVED hostname while missing on the alias the caller actually typed.
+   */
+  knownHosts: {} as Record<string, string>,
+  /** Every runArgs call, so a test can count subprocess spawns (the memo tests). */
+  runArgsCalls: [] as { cmd: string; args: string[] }[],
 }));
 
 // A fake ssh2 Client. ssh2's runtime `Client` is imported by ssh.ts alone, so faking
@@ -106,18 +114,35 @@ vi.mock("../diagnose.js", async (importOriginal) => {
   return {
     ...actual,
     runArgs: (cmd: string, args: string[]) => {
+      stubs.runArgsCalls.push({ cmd, args });
       if (cmd === "ssh" && args[0] === "-G") {
         return stubs.sshConfigLines === null
           ? { stdout: "", ok: false }
           : { stdout: stubs.sshConfigLines.join("\n"), ok: true };
+      }
+      if (cmd === "ssh-keygen" && args[0] === "-F") {
+        const hit = stubs.knownHosts[args[1]];
+        return hit ? { stdout: hit, ok: true } : { stdout: "", ok: false };
       }
       return { stdout: "", ok: false };
     },
   };
 });
 
-const { clearKnownHostTypeCache, clearSshConfigCache, connectWithProxy, readFile, resolveConfig, statFile } =
-  await import("../ssh.js");
+const {
+  clearKnownHostTypeCache,
+  clearSshConfigCache,
+  connectWithProxy,
+  downloadFile,
+  exec,
+  formatDiagnostics,
+  listDir,
+  readFile,
+  resolveConfig,
+  statFile,
+  uploadFile,
+  writeFile,
+} = await import("../ssh.js");
 
 // ---------------------------------------------------------------- fixtures
 
@@ -646,5 +671,304 @@ describe("resolveConfig -- the explicit-password short-circuit", () => {
     expect(connectConfig.password).toBeUndefined();
     expect(connectConfig.agent).toBe(WINDOWS_AGENT_PIPE);
     expect(connectConfig.privateKey).toBeInstanceOf(Buffer);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Gaps closed one at a time from a coverage sweep, each verified against the
+// existing suite first. `stubs.knownHosts` scripts `ssh-keygen -F` per target and
+// `stubs.runArgsCalls` records every spawn, which is what makes the two-name
+// verifier lookup and the memo observable at all.
+// ---------------------------------------------------------------------------
+
+describe("G8 -- the host verifier checks BOTH the alias and the resolved hostname", () => {
+  const KEY = Buffer.from("AAAAC3NzaC1lZDI1NTE5AAAAIGrealkeybytes", "base64");
+  const line = (name: string) => `${name} ssh-ed25519 ${KEY.toString("base64")}`;
+
+  beforeEach(() => {
+    stubs.knownHosts = {};
+    stubs.runArgsCalls = [];
+    clearKnownHostTypeCache();
+    clearSshConfigCache();
+  });
+
+  it("accepts when known_hosts answers for the RESOLVED hostname, not the alias", () => {
+    // The real shape: `Host prod` in ssh_config maps to 10.0.0.5, and ssh-keyscan
+    // wrote the entry under the address. Looking up only the alias would reject a
+    // host the operator has legitimately trusted.
+    stubs.sshConfigLines = ["hostname 10.0.0.5", "user deploy", "port 22"];
+    stubs.knownHosts = { "10.0.0.5": line("10.0.0.5") };
+
+    const verify = resolveConfig({ host: "prod" }).connectConfig.hostVerifier as (k: Buffer) => boolean;
+
+    expect(verify(KEY)).toBe(true);
+    // Both spellings were tried -- the alias first, then what `ssh -G` resolved.
+    const targets = stubs.runArgsCalls
+      .filter((c) => c.cmd === "ssh-keygen" && c.args[0] === "-F")
+      .map((c) => c.args[1]);
+    expect(targets).toContain("prod");
+    expect(targets).toContain("10.0.0.5");
+  });
+
+  it("accepts when known_hosts answers for the ALIAS instead", () => {
+    stubs.sshConfigLines = ["hostname 10.0.0.5", "user deploy", "port 22"];
+    stubs.knownHosts = { prod: line("prod") };
+
+    const verify = resolveConfig({ host: "prod" }).connectConfig.hostVerifier as (k: Buffer) => boolean;
+
+    expect(verify(KEY)).toBe(true);
+  });
+
+  it("rejects a key that matches NEITHER name, and says which names it looked under", () => {
+    stubs.sshConfigLines = ["hostname 10.0.0.5", "user deploy", "port 22"];
+    stubs.knownHosts = { "10.0.0.5": line("10.0.0.5") };
+
+    const resolved = resolveConfig({ host: "prod" });
+    const verify = resolved.connectConfig.hostVerifier as (k: Buffer) => boolean;
+
+    expect(verify(Buffer.from("a-completely-different-key"))).toBe(false);
+    // The rejection names both spellings, so an operator can see where we looked.
+    expect(resolved.hostKeyRejection?.current?.message).toContain("prod");
+  });
+
+  it("does not look up the same name twice when the alias IS the hostname", () => {
+    // `ssh -G` echoes the host back as hostname for an unconfigured host, so the two
+    // verifier names collapse to one and the second lookup would be pure waste.
+    stubs.sshConfigLines = ["hostname web1.test", "user deploy", "port 22"];
+    stubs.knownHosts = {};
+
+    const verify = resolveConfig({ host: "web1.test" }).connectConfig.hostVerifier as (k: Buffer) => boolean;
+    verify(KEY);
+
+    const targets = stubs.runArgsCalls
+      .filter((c) => c.cmd === "ssh-keygen" && c.args[0] === "-F")
+      .map((c) => c.args[1]);
+    expect(new Set(targets).size).toBe(targets.length);
+  });
+});
+
+describe("G13 -- the known-host type memo feeding algorithm ordering", () => {
+  beforeEach(() => {
+    stubs.knownHosts = { "memo.test": "memo.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG" };
+    stubs.runArgsCalls = [];
+    clearKnownHostTypeCache();
+    clearSshConfigCache();
+    stubs.sshConfigLines = ["hostname memo.test", "user deploy", "port 22"];
+  });
+
+  const keygenSpawns = () => stubs.runArgsCalls.filter((c) => c.cmd === "ssh-keygen" && c.args[0] === "-F").length;
+
+  it("reuses one `ssh-keygen -F` across repeated resolves inside the TTL", () => {
+    // resolveConfig runs on every pool acquire, so without the memo a bastion
+    // fronting several targets pays a spawn per call for an answer that cannot differ.
+    const a = resolveConfig({ host: "memo.test" });
+    a.applyHostKeyAlgorithms?.();
+    const afterFirst = keygenSpawns();
+    expect(afterFirst).toBeGreaterThan(0);
+
+    const b = resolveConfig({ host: "memo.test" });
+    b.applyHostKeyAlgorithms?.();
+
+    expect(keygenSpawns()).toBe(afterFirst);
+  });
+
+  it("re-reads once the memo is cleared, so a mid-session ssh-keyscan is picked up", () => {
+    const a = resolveConfig({ host: "memo.test" });
+    a.applyHostKeyAlgorithms?.();
+    const afterFirst = keygenSpawns();
+
+    clearKnownHostTypeCache(); // stands in for the 5s TTL lapsing
+    const b = resolveConfig({ host: "memo.test" });
+    b.applyHostKeyAlgorithms?.();
+
+    expect(keygenSpawns()).toBeGreaterThan(afterFirst);
+  });
+
+  it("feeds ORDERING only -- the verifier always re-reads known_hosts itself", () => {
+    // The memo can only ever produce a suboptimal negotiation order, never a wrong
+    // accept/reject, because buildHostVerifier does its own lookup on every call.
+    const resolved = resolveConfig({ host: "memo.test" });
+    const verify = resolved.connectConfig.hostVerifier as (k: Buffer) => boolean;
+    const before = keygenSpawns();
+
+    verify(Buffer.from("x"));
+    verify(Buffer.from("y"));
+
+    expect(keygenSpawns()).toBeGreaterThan(before);
+  });
+});
+
+describe("G12 -- resolveConfig's username fallback chain", () => {
+  beforeEach(() => {
+    clearSshConfigCache();
+    clearKnownHostTypeCache();
+  });
+
+  it("prefers an explicit username over everything else", () => {
+    stubs.sshConfigLines = ["hostname u.test", "user fromconfig", "port 22"];
+    expect(resolveConfig({ host: "u.test", username: "explicit" }).connectConfig.username).toBe("explicit");
+  });
+
+  it("falls back to the ssh_config User when no username is passed", () => {
+    stubs.sshConfigLines = ["hostname u.test", "user fromconfig", "port 22"];
+    expect(resolveConfig({ host: "u.test" }).connectConfig.username).toBe("fromconfig");
+  });
+
+  it("prefers $USER over $USERNAME when ssh_config supplies none", () => {
+    // Both are set on a Git-Bash-on-Windows box, and they can disagree.
+    stubs.sshConfigLines = ["hostname u.test", "port 22"];
+    const priorUser = process.env.USER;
+    const priorUsername = process.env.USERNAME;
+    process.env.USER = "unix-name";
+    process.env.USERNAME = "windows-name";
+    try {
+      expect(resolveConfig({ host: "u.test" }).connectConfig.username).toBe("unix-name");
+    } finally {
+      if (priorUser === undefined) delete process.env.USER;
+      else process.env.USER = priorUser;
+      if (priorUsername === undefined) delete process.env.USERNAME;
+      else process.env.USERNAME = priorUsername;
+    }
+  });
+
+  it('ends at "root" in an env-stripped container with no ssh client', () => {
+    // The last-ditch default. Getting it wrong means the SSH server's "Permission
+    // denied" names a user the operator never chose, which reads as a key problem.
+    stubs.sshConfigLines = null; // `ssh -G` fails outright
+    const priorUser = process.env.USER;
+    const priorUsername = process.env.USERNAME;
+    delete process.env.USER;
+    delete process.env.USERNAME;
+    try {
+      expect(resolveConfig({ host: "u.test" }).connectConfig.username).toBe("root");
+    } finally {
+      if (priorUser !== undefined) process.env.USER = priorUser;
+      if (priorUsername !== undefined) process.env.USERNAME = priorUsername;
+    }
+  });
+});
+
+describe("G14 -- getSftp's rejection path, shared by every SFTP helper", () => {
+  /** A client whose sftp() hands back an error, as a server with the subsystem disabled does. */
+  const noSftpClient = () =>
+    ({
+      sftp: (cb: (err: any, s?: any) => void) => cb(new Error("Channel open failure: administratively prohibited")),
+    }) as any;
+
+  it("rejects rather than hanging when the SFTP subsystem is refused", async () => {
+    await expect(readFile(noSftpClient(), "/etc/hostname")).rejects.toThrow(/administratively prohibited/);
+  });
+
+  it("surfaces the same failure through every helper, not just readFile", async () => {
+    // One shared getSftp, so a regression here breaks all eight tools at once.
+    await expect(writeFile(noSftpClient(), "/tmp/a", "x")).rejects.toThrow(/administratively prohibited/);
+    await expect(listDir(noSftpClient(), "/tmp")).rejects.toThrow(/administratively prohibited/);
+    await expect(statFile(noSftpClient(), "/tmp/a")).rejects.toThrow(/administratively prohibited/);
+  });
+});
+
+describe("G9 -- the SFTP helpers reject AND still close the session", () => {
+  /** An sftp whose named op fails; everything else is unused. `ended` counts end(). */
+  function failingSftp(op: string, err = new Error("Permission denied")) {
+    const probe = { ended: 0 };
+    const make =
+      (name: string) =>
+      (...args: unknown[]) => {
+        const cb = args[args.length - 1] as (e: any, v?: any) => void;
+        queueMicrotask(() => (name === op ? cb(err) : cb(null, undefined)));
+      };
+    const sftp = {
+      writeFile: make("writeFile"),
+      readdir: make("readdir"),
+      fastPut: make("fastPut"),
+      fastGet: make("fastGet"),
+      end: () => {
+        probe.ended++;
+      },
+    };
+    return { client: { sftp: (cb: (e: any, s: any) => void) => cb(null, sftp) } as any, probe };
+  }
+
+  it("writeFile rejects and ends the session", async () => {
+    const { client, probe } = failingSftp("writeFile");
+    await expect(writeFile(client, "/tmp/a", "x")).rejects.toThrow("Permission denied");
+    expect(probe.ended).toBe(1);
+  });
+
+  it("listDir rejects and ends the session", async () => {
+    const { client, probe } = failingSftp("readdir");
+    await expect(listDir(client, "/nope")).rejects.toThrow("Permission denied");
+    expect(probe.ended).toBe(1);
+  });
+
+  it("uploadFile rejects and ends the session", async () => {
+    const { client, probe } = failingSftp("fastPut");
+    await expect(uploadFile(client, "/local/a", "/remote/a")).rejects.toThrow("Permission denied");
+    expect(probe.ended).toBe(1);
+  });
+
+  it("downloadFile rejects and ends the session", async () => {
+    const { client, probe } = failingSftp("fastGet");
+    await expect(downloadFile(client, "/remote/a", "/local/a")).rejects.toThrow("Permission denied");
+    expect(probe.ended).toBe(1);
+  });
+});
+
+describe("G10 -- exec rejects on a channel error before the command settles", () => {
+  /** A client whose exec hands back a stream that errors instead of closing. */
+  function erroringExec(which: "stdout" | "stderr") {
+    return {
+      exec: (_cmd: string, cb: (err: any, stream?: any) => void) => {
+        const stream: any = new EventEmitter();
+        stream.stderr = new EventEmitter();
+        cb(null, stream);
+        queueMicrotask(() => {
+          const target = which === "stdout" ? stream : stream.stderr;
+          target.emit("error", new Error("Connection lost mid-command"));
+        });
+      },
+    } as any;
+  }
+
+  it("rejects when the stdout channel errors", async () => {
+    // A dropped connection mid-command. Without this the promise never settles and
+    // the tool call hangs until the caller's own timeout.
+    await expect(exec(erroringExec("stdout"), "sleep 5")).rejects.toThrow("Connection lost mid-command");
+  });
+
+  it("rejects when the stderr channel errors", async () => {
+    await expect(exec(erroringExec("stderr"), "sleep 5")).rejects.toThrow("Connection lost mid-command");
+  });
+
+  it("propagates an exec() callback error", async () => {
+    const client = {
+      exec: (_cmd: string, cb: (err: any) => void) => cb(new Error("Session limit reached")),
+    } as any;
+    await expect(exec(client, "uptime")).rejects.toThrow("Session limit reached");
+  });
+});
+
+describe("G11 -- formatDiagnostics maps each failing check to its remedy", () => {
+  beforeEach(() => {
+    stubs.runArgsCalls = [];
+    stubs.knownHosts = {};
+    clearSshConfigCache();
+  });
+
+  it("returns a non-empty report naming the checks that are not ok", () => {
+    // Every runArgs call fails under this harness (no agent, no keys, no known_hosts),
+    // which is exactly the broken machine formatDiagnostics exists to describe.
+    const text = formatDiagnostics("web1.test");
+    expect(text).toBeTruthy();
+    expect(text).toContain("Suggested fixes:");
+  });
+
+  it("suggests adding the host key when known_hosts has no entry", () => {
+    const text = formatDiagnostics("web1.test");
+    expect(text).toContain('ssh-keyscan -H "web1.test"');
+  });
+
+  it("names the host it was asked about, not a fixed string", () => {
+    expect(formatDiagnostics("other.test")).toContain("other.test");
   });
 });

@@ -73,6 +73,10 @@ type SshDirState =
 
 let sshDir: SshDirState | null = null;
 
+/** Every appendFileSync the code under test attempted, and an optional failure to inject. */
+let appends: { path: string; data: string }[] = [];
+let appendError: Error | null = null;
+
 const posix = (p: unknown) => String(p).replace(/\\/g, "/");
 const isSshDir = (p: unknown) => posix(p).endsWith("/.ssh");
 const sshChildName = (p: unknown): string | null => {
@@ -112,11 +116,34 @@ vi.mock("node:fs", async (importOriginal) => {
       if (sshDir && name !== null && Object.hasOwn(stateFiles(sshDir), name)) return stateFiles(sshDir)[name];
       return (actual.readFileSync as (...a: unknown[]) => unknown)(p, ...rest);
     },
+    // ALWAYS stubbed. fixKnownHosts appends to the real ~/.ssh/known_hosts on its
+    // success path, and a test must never touch the developer's own file.
+    appendFileSync: (path: unknown, data: unknown) => {
+      appends.push({ path: posix(path), data: String(data) });
+      if (appendError) throw appendError;
+    },
   };
 });
 
-import { checkConnectivity, checkSshAgent, checkSshKeys, probeSshConnection } from "../diagnose.js";
-import { checkGitSsh, ensureAgent, killStartedAgent, listSshKeysDetailed, testConnection } from "../env.js";
+import {
+  checkConnectivity,
+  checkKnownHosts,
+  checkSshAgent,
+  checkSshConfig,
+  checkSshKeys,
+  diagnose,
+  probeSshConnection,
+  runArgs,
+} from "../diagnose.js";
+import {
+  checkGitSsh,
+  configLookup,
+  ensureAgent,
+  fixKnownHosts,
+  killStartedAgent,
+  listSshKeysDetailed,
+  testConnection,
+} from "../env.js";
 
 // -- process.platform ---------------------------------------------------------
 // checkSshAgent's Windows branch and ensureAgent's named-pipe branch are
@@ -146,6 +173,8 @@ beforeEach(() => {
   calls = [];
   execHandler = null;
   sshDir = null;
+  appends = [];
+  appendError = null;
 });
 
 afterEach(() => {
@@ -1231,5 +1260,270 @@ describe("listSshKeysDetailed distinguishes an empty ~/.ssh from an unusable one
     const r = listSshKeysDetailed();
     expect(r.status).toBe("ok");
     expect(r.keys).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Gaps closed one at a time from a coverage sweep. Each was verified against the
+// existing suite before being written -- several near-misses turned out to be
+// mock FIXTURES repeating a string rather than real coverage of the branch.
+// ---------------------------------------------------------------------------
+
+describe("G1 -- diagnose() assembles suggestions and the overall ladder", () => {
+  /** Scripts every subprocess diagnose() makes, so the whole report is deterministic. */
+  function scriptMachine(opts: { agent?: FakeRun; keys?: Record<string, string>; known?: FakeRun; conn?: FakeRun }) {
+    sshDir = {
+      kind: "files",
+      files: opts.keys ?? {
+        id_ed25519: "-----BEGIN OPENSSH PRIVATE KEY-----\nx\n-----END OPENSSH PRIVATE KEY-----",
+      },
+    };
+    execHandler = (cmd, args) => {
+      if (cmd === "ssh-add") return opts.agent ?? { stdout: "256 SHA256:abc user@host (ED25519)" };
+      if (cmd === "ssh-keygen" && args[0] === "-F") return opts.known ?? { stdout: "" };
+      if (cmd === "ssh-keygen") return { stdout: "256 SHA256:abc user@host (ED25519)" };
+      if (cmd === "ssh") return opts.conn ?? { stdout: "SSH_OK" };
+      return { fail: true, stderr: "unscripted" };
+    };
+  }
+
+  it("emits the agent, key and known_hosts suggestions keyed off each check's status", () => {
+    scriptMachine({
+      agent: { fail: true, stderr: "Could not open a connection to your authentication agent." },
+      keys: {},
+      known: { fail: true, stderr: "" },
+      conn: { fail: true, stderr: "Permission denied (publickey)." },
+    });
+    process.env.SSH_AUTH_SOCK = "/tmp/agent.sock";
+
+    const report = diagnose("web1.test");
+
+    expect(report.suggestions).toContain('Start ssh-agent: eval "$(ssh-agent -s)"');
+    expect(report.suggestions).toContain('Generate a key: ssh-keygen -t ed25519 -C "your@email.com"');
+    expect(report.suggestions).toContain('Add host key: ssh-keyscan -H "web1.test" >> ~/.ssh/known_hosts');
+  });
+
+  it("adds the Permission-denied pair by STRING-MATCHING checkConnectivity's own prose", () => {
+    // Fragile by construction: diagnose() keys off `conn.message.includes(...)`, so
+    // rewording checkConnectivity's message silently drops these two suggestions.
+    // Pinned so that coupling is visible rather than accidental.
+    scriptMachine({ conn: { fail: true, stderr: "Permission denied (publickey)." } });
+    process.env.SSH_AUTH_SOCK = "/tmp/agent.sock";
+
+    const report = diagnose("web1.test");
+
+    expect(report.suggestions).toContain("Check loaded keys: ssh-add -l");
+    expect(report.suggestions).toContain("Verify correct username for this host");
+  });
+
+  it("adds the host-key-verification pair from the same prose coupling", () => {
+    scriptMachine({ conn: { fail: true, stderr: "Host key verification failed." } });
+    process.env.SSH_AUTH_SOCK = "/tmp/agent.sock";
+
+    const report = diagnose("web1.test");
+
+    expect(report.suggestions).toContain('Remove stale host key: ssh-keygen -R "web1.test"');
+    expect(report.suggestions).toContain('Re-add host key: ssh-keyscan -H "web1.test" >> ~/.ssh/known_hosts');
+  });
+
+  it("resolves `overall` as error > warning > ok, not by counting", () => {
+    scriptMachine({ conn: { fail: true, stderr: "Connection refused" } });
+    process.env.SSH_AUTH_SOCK = "/tmp/agent.sock";
+    expect(diagnose("web1.test").overall).toBe("error");
+
+    // No error, one warning (host absent from known_hosts) -> warning, not ok.
+    scriptMachine({ known: { fail: true, stderr: "" }, conn: { stdout: "SSH_OK" } });
+    expect(diagnose("web2.test").overall).toBe("warning");
+
+    // known_hosts must EXIST on disk for checkKnownHosts to reach its ok branch --
+    // without the file it warns before ever running `ssh-keygen -F`.
+    scriptMachine({
+      keys: {
+        id_ed25519: "-----BEGIN OPENSSH PRIVATE KEY-----body-----END OPENSSH PRIVATE KEY-----",
+        known_hosts: "web3.test ssh-ed25519 AAAA",
+      },
+      known: { stdout: "# Host web3.test found: line 1\nweb3.test ssh-ed25519 AAAA" },
+      conn: { stdout: "SSH_OK" },
+    });
+    expect(diagnose("web3.test").overall).toBe("ok");
+  });
+
+  it("rejects an invalid hostname before running any check at all", () => {
+    execHandler = () => ({ fail: true, stderr: "must not be reached" });
+
+    const report = diagnose("host$(whoami)");
+
+    expect(report.overall).toBe("error");
+    expect(report.checks).toHaveLength(1);
+    expect(report.checks[0].name).toBe("Input Validation");
+    expect(calls).toEqual([]); // nothing was spawned
+  });
+});
+
+describe("G3 -- checkKnownHosts' three outcomes, with the subprocess faked", () => {
+  it("passes the host to `ssh-keygen -F` and reports a hit", () => {
+    sshDir = { kind: "files", files: { known_hosts: "web1.test ssh-ed25519 AAAA" } };
+    execHandler = () => ({ stdout: "# Host web1.test found: line 3\nweb1.test ssh-ed25519 AAAA" });
+
+    const result = checkKnownHosts("web1.test");
+
+    expect(result.status).toBe("ok");
+    expect(result.message).toBe('Host "web1.test" found in known_hosts');
+    expect(calls[0]).toMatchObject({ cmd: "ssh-keygen", args: ["-F", "web1.test"] });
+  });
+
+  it("warns when -F succeeds but returns nothing -- the host is simply absent", () => {
+    sshDir = { kind: "files", files: { known_hosts: "other.test ssh-ed25519 AAAA" } };
+    execHandler = () => ({ stdout: "   \n  " });
+
+    const result = checkKnownHosts("web1.test");
+
+    expect(result.status).toBe("warning");
+    expect(result.message).toContain("not in known_hosts");
+  });
+
+  it("warns when known_hosts does not exist at all, without spawning anything", () => {
+    sshDir = { kind: "files", files: {} };
+    execHandler = () => ({ fail: true, stderr: "must not be reached" });
+
+    const result = checkKnownHosts("web1.test");
+
+    expect(result.status).toBe("warning");
+    expect(result.message).toContain("does not exist");
+    expect(calls).toEqual([]);
+  });
+});
+
+describe("G5 -- checkSshConfig reports an absent config file", () => {
+  it("says 'no config file' rather than 'no entry for this host'", () => {
+    sshDir = { kind: "files", files: {} };
+
+    const result = checkSshConfig("web1.test");
+
+    expect(result.status).toBe("ok");
+    expect(result.message).toBe("No ~/.ssh/config file (using defaults)");
+  });
+});
+
+describe("G6 -- runArgs falls back to err.message when both streams are empty", () => {
+  it("surfaces the thrown Error's message rather than an empty string", () => {
+    // ENOENT (binary missing) throws with no stdout and no stderr, so the joined
+    // output is "" and the message is all that is left. Every other fixture in this
+    // file populates a stream, so this fallback is otherwise never executed.
+    execHandler = () => {
+      throw new Error("spawnSync ssh-keygen ENOENT");
+    };
+
+    const { stdout, ok } = runArgs("ssh-keygen", ["-l"]);
+
+    expect(ok).toBe(false);
+    expect(stdout).toBe("spawnSync ssh-keygen ENOENT");
+  });
+});
+
+describe("G2/G4 -- fixKnownHosts' scan-and-append half", () => {
+  const keygenHit = (t: string) => ({ stdout: `# Host ${t} found: line 1\n/home/u/.ssh/known_hosts updated.` });
+
+  it("inserts `-p <port>` into the ssh-keyscan argv on a non-default port", () => {
+    execHandler = (cmd, args) => {
+      if (cmd === "ssh-keygen" && args[0] === "-R") return keygenHit(args[1]);
+      return { stdout: "[db.test]:2222 ssh-ed25519 AAAA" };
+    };
+
+    fixKnownHosts("db.test", 2222);
+
+    expect(calls.find((c) => c.cmd === "ssh-keyscan")?.args).toEqual(["-H", "-p", "2222", "db.test"]);
+  });
+
+  it("omits -p on the default port", () => {
+    execHandler = (cmd, args) => {
+      if (cmd === "ssh-keygen" && args[0] === "-R") return keygenHit(args[1]);
+      return { stdout: "db.test ssh-ed25519 AAAA" };
+    };
+
+    fixKnownHosts("db.test");
+
+    expect(calls.find((c) => c.cmd === "ssh-keyscan")?.args).toEqual(["-H", "db.test"]);
+  });
+
+  it("wraps the scanned key in newlines so it cannot glue onto an unterminated last line", () => {
+    execHandler = (cmd, args) => {
+      if (cmd === "ssh-keygen" && args[0] === "-R") return keygenHit(args[1]);
+      return { stdout: "  db.test ssh-ed25519 AAAA  " };
+    };
+
+    fixKnownHosts("db.test");
+
+    expect(appends).toHaveLength(1);
+    expect(appends[0].data).toBe("\ndb.test ssh-ed25519 AAAA\n");
+    expect(appends[0].path).toContain("/.ssh/known_hosts");
+  });
+
+  it("reports a write failure but STILL lists the removals that already happened", () => {
+    // The scan succeeded and the stale key really was removed, so the operator needs
+    // to see that even though the call failed overall.
+    execHandler = (cmd, args) => {
+      if (cmd === "ssh-keygen" && args[0] === "-R") return keygenHit(args[1]);
+      return { stdout: "db.test ssh-ed25519 AAAA" };
+    };
+    appendError = new Error("EACCES: permission denied, open '/home/u/.ssh/known_hosts'");
+
+    const result = fixKnownHosts("db.test");
+
+    expect(result.status).toBe("error");
+    expect(result.message).toContain("Scanned key but failed to write known_hosts");
+    expect(result.message).toContain("EACCES");
+    expect(result.actions).toContain("Removed old host key for db.test");
+  });
+});
+
+describe("G7 -- configLookup's error branch and field mapping", () => {
+  it("returns the error string when `ssh -G` fails", () => {
+    execHandler = () => ({ fail: true, stderr: "ssh: Could not resolve hostname nope.test" });
+
+    const result = configLookup("nope.test");
+
+    expect("error" in result).toBe(true);
+    if ("error" in result) {
+      expect(result.error).toContain("Failed to resolve SSH config for nope.test");
+      expect(result.error).toContain("Could not resolve hostname");
+    }
+  });
+
+  it("maps hostname/user/port/identityFile off `ssh -G` output -- the alias resolution", () => {
+    // Resolving an alias to its real host is the entire point of ssh_config_lookup.
+    execHandler = () => ({
+      stdout: [
+        "host prod",
+        "hostname 10.0.0.5",
+        "user deploy",
+        "port 2222",
+        "identityfile ~/.ssh/prod_ed25519",
+        "proxyjump bastion.test",
+      ].join("\n"),
+    });
+
+    const result = configLookup("prod");
+
+    expect("error" in result).toBe(false);
+    if (!("error" in result)) {
+      expect(result.hostname).toBe("10.0.0.5");
+      expect(result.user).toBe("deploy");
+      expect(result.port).toBe("2222");
+      expect(result.identityFile).toEqual(["~/.ssh/prod_ed25519"]);
+      expect(result.proxyJump).toBe("bastion.test");
+      expect(result.raw).toContain("hostname 10.0.0.5");
+    }
+  });
+
+  it("drops proxyjump/proxycommand when ssh -G reports the literal 'none'", () => {
+    execHandler = () => ({ stdout: ["hostname web1.test", "proxyjump none", "proxycommand none"].join("\n") });
+
+    const result = configLookup("web1.test");
+
+    if (!("error" in result)) {
+      expect(result.proxyJump).toBeUndefined();
+      expect(result.proxyCommand).toBeUndefined();
+    }
   });
 });
