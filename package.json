@@ -20,7 +20,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsup",
+    "build": "tsup && tsc -p tsconfig.build.json --emitDeclarationOnly",
     "dev": "tsup --watch",
     "lint": "biome check src/",
     "lint:fix": "biome check --write src/",
