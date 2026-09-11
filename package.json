@@ -22,8 +22,8 @@
   "scripts": {
     "build": "tsup && tsc -p tsconfig.build.json --emitDeclarationOnly",
     "dev": "tsup --watch",
-    "lint": "biome check src/",
-    "lint:fix": "biome check --write src/",
+    "lint": "node scripts/lint.mjs check src/",
+    "lint:fix": "node scripts/lint.mjs check --write src/",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:integration": "docker compose -f test/docker/docker-compose.yml up -d --build --wait && SSH_MCP_INTEGRATION=1 vitest run src/tests/integration.test.ts; docker compose -f test/docker/docker-compose.yml down",
