@@ -2,7 +2,7 @@
   "name": "@yawlabs/ssh-mcp",
   "version": "0.15.0",
   "mcpName": "io.github.YawLabs/ssh-mcp",
-  "description": "MCP server for SSH operations with built-in diagnostics",
+  "description": "SSH MCP server: run remote commands, transfer files over SFTP, manage ssh-agent keys and known_hosts, and auto-diagnose SSH failures.",
   "type": "module",
   "bin": {
     "ssh-mcp": "bin/ssh-mcp.mjs"
@@ -31,12 +31,22 @@
     "prepublishOnly": "npm run build"
   },
   "keywords": [
-    "mcp",
     "ssh",
-    "remote",
+    "mcp",
     "model-context-protocol",
+    "mcp-server",
+    "sftp",
+    "ssh-agent",
+    "ssh-keys",
+    "known-hosts",
+    "ssh-config",
+    "proxyjump",
+    "remote",
+    "remote-execution",
+    "diagnostics",
+    "devops",
     "ai",
-    "devops"
+    "ai-agents"
   ],
   "author": "Yaw Labs <contact@yaw.sh>",
   "license": "MIT",
@@ -65,5 +75,6 @@
   },
   "overrides": {
     "esbuild": "^0.28.1"
-  }
+  },
+  "homepage": "https://yaw.sh/mcp-servers/ssh-mcp/"
 }
