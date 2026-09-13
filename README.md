@@ -315,7 +315,7 @@ Two environment variables control the choice; set them in your MCP client's `env
   - `node` — always Node. The launcher does not look for oam, and `OAM_BIN` is ignored.
 - `OAM_BIN` — path to an oam binary to use in preference to discovery, when it is 0.15.2 or newer. If it does not exist, is older, or will not run, the launcher says so on stderr and carries on with discovery.
 
-Discovery looks in `%LOCALAPPDATA%\oam\bin` (Windows only), then `~/.oam/bin`, then every directory on `PATH`; asks every oam binary it finds for its version; and uses the newest one at 0.15.2 or newer. On a tie the one found first wins, so an installed copy beats one on `PATH`. On Windows only `oam.exe` counts: an `oam.cmd`/`oam.bat` shim on `PATH` is named on stderr but never run.
+Discovery looks in `%LOCALAPPDATA%\oam\bin` (Windows only), then `~/.oam/bin`, then every directory on `PATH`; asks every oam binary it finds for its version; and uses the newest one at 0.15.2 or newer. On a tie the one found first wins, so an installed copy beats one on `PATH`. On Windows only `oam.exe` counts: an `oam.cmd`/`oam.bat` shim on `PATH` is never run, and is named on stderr when no usable oam is found.
 
 By default an unusable oam is not an error: in `auto` mode the launcher falls back to Node — silently when there was nothing to find, or with a note on stderr naming each oam (and `OAM_BIN`) it passed over and why: older than 0.15.2, not runnable, or a shim. With `SSH_MCP_RUNTIME=oam`, each of these cases exits with status 1 instead.
 

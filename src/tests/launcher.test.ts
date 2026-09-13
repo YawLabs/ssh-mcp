@@ -111,6 +111,8 @@ interface RunOpts {
    * paths without needing a real oam on the box that runs the suite.
    */
   hostOam?: string;
+  /** More ESM source to preload, after the `hostOam` pose. */
+  preload?: string;
 }
 
 function run(layout: string, opts: RunOpts = {}) {
@@ -132,15 +134,12 @@ function run(layout: string, opts: RunOpts = {}) {
   env.LOCALAPPDATA = join(layout, "home");
   if (opts.oamBin) env.OAM_BIN = opts.oamBin;
 
-  const preload =
+  const posing =
     opts.hostOam === undefined
-      ? []
-      : [
-          "--import",
-          `data:text/javascript,${encodeURIComponent(
-            `Object.defineProperty(process.versions, "oam", { value: ${JSON.stringify(opts.hostOam)}, enumerable: true });`,
-          )}`,
-        ];
+      ? ""
+      : `Object.defineProperty(process.versions, "oam", { value: ${JSON.stringify(opts.hostOam)}, enumerable: true });`;
+  const source = `${posing}${opts.preload ?? ""}`;
+  const preload = source ? ["--import", `data:text/javascript,${encodeURIComponent(source)}`] : [];
 
   const r = spawnSync(process.execPath, [...preload, join(layout, "bin", "ssh-mcp.mjs"), ...(opts.args ?? [])], {
     env,
@@ -286,16 +285,17 @@ describe("launcher: a bad OAM_BIN is named, and discovery carries on", () => {
     expect(r.stderr).toMatch(/Point OAM_BIN at an existing oam binary/);
   });
 
-  it.skipIf(!isWin)("still discovers an oam on PATH past an OAM_BIN that does not exist", () => {
-    // The discovered oam.exe is an empty file, so it cannot run either -- but the
-    // message naming it proves discovery was reached. The old launcher stopped at
-    // OAM_BIN and never looked.
+  it("still discovers an oam on PATH past an OAM_BIN that does not exist", () => {
+    // The discovered oam is an empty file, so it cannot run either (no exec bit
+    // on POSIX, not a PE image on Windows) -- but the message naming it proves
+    // discovery was reached. The old launcher stopped at OAM_BIN and never looked.
     const layout = makeLayout();
-    const exeDir = dirWith(layout, "oam.exe", "");
+    const name = isWin ? "oam.exe" : "oam";
+    const exeDir = dirWith(layout, name, "");
     const r = run(layout, { mode: "oam", oamBin: missing(layout), pathDirs: [exeDir] });
     expect(r.status).toBe(1);
     expect(r.stderr).toMatch(/OAM_BIN=.*does not exist/);
-    expect(r.stderr).toContain(join(exeDir, "oam.exe"));
+    expect(r.stderr).toContain(`${join(exeDir, name)} could not be run`);
   });
 });
 
@@ -558,6 +558,45 @@ describe("launcher: an oam host below the floor never serves", () => {
       expect(r.status, JSON.stringify(r)).toBe(1);
       expect(r.stdout).not.toContain(MARKER);
       expect(r.stderr).toMatch(/SSH_MCP_RUNTIME=oam but no usable oam/);
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "still falls back to Node when the chosen oam fails to spawn",
+    () => {
+      // The chosen binary passed its --version probe and then could not be
+      // spawned (deleted or replaced in between). A failed spawn emits 'error'
+      // and then 'close' with the negative errno -- never 'exit' -- and a handoff
+      // from an oam host waits for 'close', so an unguarded close handler exited
+      // the launcher mid-fallback and nothing served. The preload makes the
+      // FIRST spawn target a path that does not exist; the Node fallback, the
+      // second spawn, runs for real.
+      const failFirstSpawn = [
+        'import childProcess from "node:child_process";',
+        'import { syncBuiltinESMExports } from "node:module";',
+        "const realSpawn = childProcess.spawn;",
+        "let failed = false;",
+        "childProcess.spawn = function (cmd, args, opts) {",
+        "  if (failed) return realSpawn.call(this, cmd, args, opts);",
+        "  failed = true;",
+        '  return realSpawn.call(this, cmd + ".does-not-exist", args, opts);',
+        "};",
+        "syncBuiltinESMExports();",
+      ].join("\n");
+      const layout = makeLayout();
+      const r = run(layout, {
+        mode: "auto",
+        hostOam: "0.9.0",
+        oamBin: process.execPath,
+        pathDirs: [nodeDir(layout)],
+        preload: failFirstSpawn,
+      });
+      expect(r.status, JSON.stringify(r)).toBe(0);
+      expect(r.stderr).toMatch(/^ssh-mcp: failed to launch oam at .*; using Node instead\.$/m);
+      const payload = stubPayload(r.stdout);
+      expect(payload.pid, "the Node fallback must still serve, in a child").not.toBe(r.pid);
+      expect(payload.oam).toBeNull();
     },
     TIMEOUT_MS,
   );
