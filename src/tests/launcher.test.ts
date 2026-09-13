@@ -19,6 +19,10 @@ import { afterAll, describe, expect, it } from "vitest";
 // `dist/` has been built, and lets them assert WHICH path ran: the stub prints a
 // marker, so its presence means the in-process fallback was taken and its
 // absence means oam was spawned instead.
+//
+// One pure decision, runtimePlan(), is ALSO evaluated straight from its source
+// text, because its input matrix is too wide to pay a process per case. The
+// execution tests next to it are what prove the launcher actually wires it.
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, "..", "..");
@@ -67,6 +71,13 @@ interface RunOpts {
   pathDirs?: string[];
   oamBin?: string;
   args?: string[];
+  /**
+   * Pose as an oam host by preloading a `process.versions.oam` key before the
+   * launcher runs. oam publishes that key and Node does not, and it is the one
+   * fact the launcher branches on, so this reaches the "already running on oam"
+   * path without needing a real oam on the box that runs the suite.
+   */
+  hostOam?: string;
 }
 
 function run(layout: string, opts: RunOpts = {}) {
@@ -88,7 +99,17 @@ function run(layout: string, opts: RunOpts = {}) {
   env.LOCALAPPDATA = join(layout, "home");
   if (opts.oamBin) env.OAM_BIN = opts.oamBin;
 
-  const r = spawnSync(process.execPath, [join(layout, "bin", "ssh-mcp.mjs"), ...(opts.args ?? [])], {
+  const preload =
+    opts.hostOam === undefined
+      ? []
+      : [
+          "--import",
+          `data:text/javascript,${encodeURIComponent(
+            `Object.defineProperty(process.versions, "oam", { value: ${JSON.stringify(opts.hostOam)}, enumerable: true });`,
+          )}`,
+        ];
+
+  const r = spawnSync(process.execPath, [...preload, join(layout, "bin", "ssh-mcp.mjs"), ...(opts.args ?? [])], {
     env,
     encoding: "utf8",
   });
@@ -197,6 +218,140 @@ describe("launcher: spawning oam", () => {
     expect(r.stdout).not.toContain(MARKER);
     expect(r.status).not.toBe(0);
   });
+});
+
+type Plan = "in-process" | "discover";
+type RuntimePlan = (ctx: { mode: string; hostOam: string | undefined }) => Plan;
+
+/**
+ * Evaluate the REAL `runtimePlan` source, together with the declarations it
+ * closes over, without executing the launcher.
+ *
+ * Extracting the text exercises the shipped logic rather than a copy that can
+ * drift, and a failed extraction is a loud assertion, not a silent skip -- the
+ * same contract as the OAM_MIN patch in makeLayout.
+ */
+function loadRuntimePlan(): RuntimePlan {
+  const source = readFileSync(LAUNCHER_SRC, "utf8");
+  const pieces = [
+    /const OAM_MIN = \[[^\]]*\];/,
+    /function parseVersion\(text\) \{[\s\S]*?\n\}/,
+    /function atLeast\(v, min\) \{[\s\S]*?\n\}/,
+    /function runtimePlan\(\{ mode, hostOam \}\) \{[\s\S]*?\n\}/,
+  ].map((pattern) => {
+    const match = source.match(pattern);
+    if (!match) throw new Error(`could not extract ${pattern} from bin/ssh-mcp.mjs -- renamed or reformatted?`);
+    return match[0];
+  });
+  return new Function(`${pieces.join("\n")}\nreturn runtimePlan;`)() as RuntimePlan;
+}
+
+describe("launcher: runtimePlan()", () => {
+  const runtimePlan = loadRuntimePlan();
+
+  it("serves in-process when already hosted on an oam at or above the floor", () => {
+    // The bug this exists for: a host that launches `oam run bin/ssh-mcp.mjs`
+    // got a SECOND oam, because the launcher discovered and spawned one without
+    // asking what it was already running on. `auto` and `oam` both have to take
+    // the shortcut -- `oam` demands oam, and the host already is one.
+    //
+    // 0.9.0 pins the floor as inclusive (it IS the supported release), and
+    // 0.10.0 pins a numeric compare: it sorts BEFORE 0.9.0 as a string, so a
+    // compare over the raw text would spawn a nested oam on every 0.10+ host.
+    for (const mode of ["auto", "oam"]) {
+      for (const hostOam of ["0.9.0", "0.10.0", "0.15.1", "1.0.0", "0.16.0-dev"]) {
+        expect(runtimePlan({ mode, hostOam }), `mode=${mode} hostOam=${hostOam}`).toBe("in-process");
+      }
+    }
+  });
+
+  it("leaves a host oam below the floor on the discovery path", () => {
+    // Same floor as a discovered binary. Below it, behaviour is exactly what it
+    // was before the shortcut existed.
+    for (const mode of ["auto", "oam"]) {
+      for (const hostOam of ["0.8.9", "0.8.2", "0.0.1"]) {
+        expect(runtimePlan({ mode, hostOam }), `mode=${mode} hostOam=${hostOam}`).toBe("discover");
+      }
+    }
+  });
+
+  it("discovers as before on Node, where process.versions has no oam key", () => {
+    // An unreadable value must not count as "new enough" either: that would
+    // skip discovery on a host that never proved it is a supported oam.
+    for (const mode of ["auto", "oam"]) {
+      for (const hostOam of [undefined, "", "dev"]) {
+        expect(runtimePlan({ mode, hostOam }), `mode=${mode} hostOam=${hostOam}`).toBe("discover");
+      }
+    }
+  });
+
+  it("runs SSH_MCP_RUNTIME=node in-process whatever the host is", () => {
+    for (const hostOam of [undefined, "0.8.2", "0.15.1"]) {
+      expect(runtimePlan({ mode: "node", hostOam }), `hostOam=${hostOam}`).toBe("in-process");
+    }
+  });
+});
+
+describe("launcher: already hosted on oam", () => {
+  // The unit tests above prove the decision; these prove the launcher WIRES it
+  // -- that the call site actually reads `process.versions.oam` -- which no
+  // amount of testing runtimePlan in isolation can.
+  //
+  // OAM_BIN is pinned to the Node running this suite, exactly as in "spawns a
+  // usable oam instead of running the server in-process" above, which is the
+  // control for these: same layout, same OAM_BIN, no preload, and the stub must
+  // NOT run. With the preload the only thing that changed is the host, so a
+  // stub that runs here was served in-process rather than by a nested runtime.
+  //
+  // Each case boots one or two Node processes, and a bare Node start has been
+  // measured in whole seconds on a contended Windows box.
+  const TIMEOUT_MS = 45_000;
+
+  for (const mode of ["auto", "oam"] as const) {
+    it(
+      `serves in-process instead of spawning a nested oam (SSH_MCP_RUNTIME=${mode})`,
+      () => {
+        const layout = makeLayout();
+        const r = run(layout, { mode, hostOam: "0.15.1", oamBin: process.execPath, args: ["--version", "extra"] });
+        expect(r.status, JSON.stringify(r)).toBe(0);
+        const payload = stubPayload(r.stdout);
+        // Same entry-point repoint and argv passthrough as the Node fallback:
+        // it is the same runInProcess, not a second copy of it.
+        expect(payload.argv1).toBe(join(layout, "dist", "index.js"));
+        expect(payload.args).toEqual(["--version", "extra"]);
+        // No discovery ran, so there is no discovery diagnostic.
+        expect(r.stderr).toBe("");
+      },
+      TIMEOUT_MS,
+    );
+  }
+
+  it(
+    "treats SSH_MCP_RUNTIME=oam as satisfied by the host, with no oam binary to discover",
+    () => {
+      // PATH, OAM_BIN and every installed location are empty, which on Node is
+      // the "no runnable oam binary was found" hard failure. On an oam host that
+      // requirement is already met.
+      const r = run(makeLayout(), { mode: "oam", hostOam: "0.15.1" });
+      expect(r.status, JSON.stringify(r)).toBe(0);
+      expect(r.stdout).toContain(MARKER);
+      expect(r.stderr).not.toMatch(/no runnable oam binary was found/);
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "still discovers and spawns when the host oam is below the floor",
+    () => {
+      const r = run(makeLayout(), { mode: "auto", hostOam: "0.8.9", oamBin: process.execPath });
+      expect(r.stdout, `a below-floor host must not shortcut, got ${JSON.stringify(r)}`).not.toContain(MARKER);
+      expect(r.status).not.toBe(0);
+      // The spawned child failed, not the launcher: every launcher diagnostic
+      // starts with `ssh-mcp: `.
+      expect(r.stderr).not.toMatch(/^ssh-mcp: /m);
+    },
+    TIMEOUT_MS,
+  );
 });
 
 describe("launcher: Windows PATH discovery", () => {
