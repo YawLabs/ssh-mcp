@@ -2,42 +2,70 @@
 /**
  * Runtime launcher for @yawlabs/ssh-mcp.
  *
- * Prefers the oam runtime (https://oamjs.org) and falls back to the Node
- * process already running this file.
+ * Prefers the newest usable oam runtime (https://oamjs.org) and falls back to
+ * Node. It never serves on an oam older than the floor below.
  *
  *
  * WHY THE FALLBACK COSTS NOTHING
  * npm has already started Node to run this launcher, so falling back is a
  * plain `import()` of the server into THIS process: no extra spawn, no extra
- * startup, byte-identical to invoking dist/index.js directly. Discovery is
- * stat-only -- never a subprocess -- so the miss case stays sub-millisecond.
+ * startup, byte-identical to invoking dist/index.js directly. Finding the
+ * candidates is stat-only, so a machine without oam never pays for a
+ * subprocess.
  *
  * WHAT THE OAM PATH COSTS
- * Reaching oam through an npm `bin` means Node boots first and oam boots
- * second, so the launcher is slower than either runtime alone. Measured on
+ * Reaching oam through an npm `bin` means Node boots first, every oam binary
+ * found is asked for its version, and then oam boots to serve -- so the
+ * launcher is slower than pointing a host at oam directly. Measured on
  * npmjs-mcp (windows-arm64, n=12 medians, spawn to first MCP initialize):
- * oam 116ms, node 172ms, launcher 243ms. oam is the fastest runtime and the
- * launcher is the slowest path -- it exists for `npx` convenience.
+ * oam 116ms, node 172ms, launcher 243ms. It exists for `npx` convenience.
+ *
+ * One `oam --version` probe measured 26ms median (n=12, windows-arm64). It is
+ * paid once per oam binary found, on every launch that runs discovery and finds
+ * one -- including the launches that go on to fall back to Node.
  *
  * For an MCP host config, point straight at oam and skip this file:
  *   { "command": "oam", "args": ["run", "<abs>/dist/index.js"] }
+ *
+ * WHICH OAM
+ * OAM_BIN, when set and usable, is used as given. Otherwise every oam binary
+ * discovery can see -- the installed locations, then PATH -- is asked for its
+ * version, and the NEWEST one at or above the floor wins; a tie keeps search
+ * order. Taking the first binary found instead let a stale copy early in the
+ * search order hide a current one later: with oam 0.9.0 installed in ~/.oam/bin
+ * and 0.15.2 on PATH, the launcher bound to 0.9.0 because installed locations
+ * are searched first.
+ *
+ * An OAM_BIN that does not exist, is below the floor, or will not run is named
+ * on stderr and discovery carries on. It used to stop everything: a typo in
+ * OAM_BIN meant Node, with no hint why.
  *
  * ALREADY RUNNING ON OAM
  * A host can resolve this package's `bin` and launch `oam run <this file>`
  * instead of `node <this file>` -- Yaw MCP does, and so does oam's sidecar
  * regression matrix. This launcher used to discover oam and spawn it anyway,
  * so one server cost two runtime boots: measured on Windows, oam.exe with a
- * NESTED oam.exe + conhost.exe underneath it. Now, when `process.versions.oam`
- * clears the same MINIMUM OAM VERSION a discovered binary has to, the server is
- * imported into THIS process exactly as the Node fallback is -- no discovery,
- * no `oam --version` probe, no second oam. OAM_BIN is a discovery input, so it
- * is not consulted on that path: the host has already chosen which oam runs.
+ * NESTED oam.exe + conhost.exe underneath it. When `process.versions.oam`
+ * clears the floor, the server is imported into THIS process exactly as the
+ * Node fallback is -- no discovery, no `oam --version` probe, no second oam.
+ * OAM_BIN is a discovery input, so it is not consulted on that path: the host
+ * has already chosen which oam runs.
  *
- * A host oam below the floor still takes the discovery path exactly as it
- * always did. Nothing else has to keep spawning on oam: the spawn below passes
- * oam no runtime flags -- there is no `--permission` sandbox to apply, see NO
- * SANDBOX HERE -- so serving in-process drops nothing a fresh oam would have
- * applied.
+ * Nothing forces a re-spawn on a supported host: the spawn below passes oam no
+ * runtime flags -- there is no `--permission` sandbox to apply, see NO SANDBOX
+ * HERE -- so serving in-process drops nothing a fresh oam would have applied.
+ *
+ * A host oam BELOW the floor never serves. It used to, whenever discovery came
+ * up empty or found nothing usable. It now hands the server off to the newest
+ * usable oam, or to Node found on PATH, or exits with an error when there is
+ * neither.
+ *
+ * That handoff PIPES stdio rather than inheriting it. Before 0.9.0 oam treated
+ * `stdio: 'inherit'` as `'pipe'`, so an inherited handoff from such a host
+ * connected the child to pipes nobody reads: measured with a real oam 0.8.2
+ * host on aws-mcp's launcher, which this one shares, the MCP handshake never
+ * answered. Piping the streams explicitly completes it, to both oam and Node. A
+ * Node host keeps `inherit`, which hands over the same fds untouched.
  *
  * NO SANDBOX HERE -- DELIBERATELY
  * The purpose of this server is to open outbound SSH to hosts the caller names
@@ -47,31 +75,40 @@
  * wired up here.
  *
  * MINIMUM OAM VERSION
- * 0.9.0. Below it `child_process.execFile` ran its arguments through a SHELL,
- * `exec` accepted `timeout` and ignored it, `spawnSync` truncated at
- * `maxBuffer` while reporting success, and `stdio: 'inherit'`/`'ignore'` both
- * behaved as `'pipe'`. This server shells out to a CLI on its
- * main paths, so those were reachable bugs rather than theoretical ones: an
- * argument containing shell metacharacters was re-split and executed.
- * An older oam is not an error: the launcher falls back to Node and says so on
- * stderr. Pinning the floor here is what makes that fallback automatic.
+ * The latest oam release, 0.15.2 -- bump OAM_MIN when oam ships a newer one.
+ * Only the current oam is used and verified; an older one is passed over.
+ * The floor is not cosmetic: before 0.9.0 `child_process.execFile` ran its
+ * arguments through a SHELL, `exec` accepted `timeout` and ignored it,
+ * `spawnSync` truncated at `maxBuffer` while reporting success, and
+ * `stdio: 'inherit'`/`'ignore'` both behaved as `'pipe'`. This server shells
+ * out to a CLI on its main paths, so those were reachable bugs rather than
+ * theoretical ones: an argument containing shell metacharacters was re-split
+ * and executed.
  *
  * SELECTION
- *   SSH_MCP_RUNTIME=oam    require oam; fail loudly if it is missing
- *                            (already running on oam satisfies it)
- *   SSH_MCP_RUNTIME=node   never spawn oam; run on whatever started this file
- *   SSH_MCP_RUNTIME=auto   prefer oam, silently fall back (default)
- *   OAM_BIN=/path/to/oam     explicit binary, checked before any discovery
+ *   SSH_MCP_RUNTIME=auto   newest usable oam, else Node (default)
+ *   SSH_MCP_RUNTIME=oam    newest usable oam, else exit with an error
+ *                          (already running on oam at the floor satisfies it)
+ *   SSH_MCP_RUNTIME=node   Node: in THIS process on Node, handed off to Node
+ *                          on PATH when THIS process is oam
+ *   OAM_BIN=/path/to/oam   use this oam when it is usable, before discovery
+ * The value is case-insensitive; anything else behaves like `auto`.
  */
 
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { constants, homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** Oldest oam whose `child_process` matches Node. See MINIMUM OAM VERSION above. */
-const OAM_MIN = [0, 9, 0];
+const OAM_MIN = [0, 15, 2];
+
+/**
+ * Bound on each `oam --version` probe. A healthy oam answers in milliseconds;
+ * the bound only exists so a wedged binary on PATH cannot hang the launch.
+ */
+const VERSION_PROBE_TIMEOUT_MS = 5_000;
 
 // Two forms, deliberately. `import()` on Windows REJECTS a bare `C:\...` path
 // with ERR_UNSUPPORTED_ESM_URL_SCHEME (it reads `c:` as a protocol), so the
@@ -81,74 +118,55 @@ const SERVER_ENTRY = fileURLToPath(SERVER_URL);
 const isWin = process.platform === "win32";
 const exe = isWin ? "oam.exe" : "oam";
 
-/**
- * Locate an oam binary. Returns `{ path, shim }`:
- *   path -- an oam this launcher can actually execute, or null
- *   shim -- an oam-named `.cmd`/`.bat` seen on PATH and SKIPPED, or null
- *
- * The shim is reported rather than silently dropped: "no oam binary was found"
- * is the wrong thing to tell someone who has one installed in a shape we cannot
- * spawn. Every branch is a stat, never a subprocess.
- */
-function findOam() {
-  // 1. Explicit override wins and is never second-guessed -- including a .cmd.
-  //    If it cannot be executed the version gate reports that specifically,
-  //    which is better than second-guessing an explicit instruction here.
-  const override = process.env.OAM_BIN;
-  if (override) return { path: existsSync(override) ? override : null, shim: null };
+/** Identity for de-duplicating paths: resolved, and case-folded on Windows. */
+function pathKey(p) {
+  let key = p;
+  try {
+    key = realpathSync(p);
+  } catch {
+    // Unresolvable: fall back to the literal path.
+  }
+  return isWin ? key.toLowerCase() : key;
+}
 
-  // 2. Installed locations, BEFORE PATH. Someone who develops oam itself
-  //    usually has oam/target/release on PATH, and a build directory is the
-  //    wrong thing for a user-facing launcher to bind to: cargo replaces the
-  //    binary underneath running processes, and the dev build is not the
-  //    release the user installed. Preferring the installed copy makes the
-  //    default path "what a normal user has", and OAM_BIN remains the way to
-  //    point deliberately at a dev build.
-  //
-  //    Both forms are checked on Windows: the installer defaults to
-  //    %LOCALAPPDATA%\oam\bin there, but oam's docs name ~/.oam/bin first and
-  //    OAM_INSTALL_DIR can pick either, so checking one silently misses a real
-  //    install.
+/**
+ * Every oam binary discovery can see, in search order, de-duplicated. Stat-only,
+ * never a subprocess -- PATH is resolved manually rather than by spawning
+ * `which`/`where`.
+ *
+ * Installed locations come BEFORE PATH, so when two binaries report the same
+ * version the installed copy wins the tie. Someone who develops oam itself
+ * usually has oam/target/release on PATH, and cargo replaces that binary
+ * underneath running processes; the installed copy is the release the user
+ * actually installed. Both forms are checked on Windows: the installer defaults
+ * to %LOCALAPPDATA%\oam\bin there, but oam's docs name ~/.oam/bin first and
+ * OAM_INSTALL_DIR can pick either.
+ *
+ * Windows: `.exe` ONLY -- deliberately narrower than PATHEXT. Node refuses to
+ * run a .cmd/.bat through execFile/spawn without `shell: true` (EINVAL, and for
+ * spawn it throws SYNCHRONOUSLY rather than emitting 'error'), so walking the
+ * full PATHEXT list would hand back a path this launcher cannot execute. A
+ * skipped shim is still reported -- see findOamShim.
+ */
+function discoverOamPaths() {
   const installed = [join(homedir(), ".oam", "bin", exe)];
   if (isWin) {
     installed.unshift(join(process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local"), "oam", "bin", exe));
   }
-  for (const candidate of installed) {
-    if (existsSync(candidate)) return { path: candidate, shim: null };
+  const onPath = (process.env.PATH ?? "")
+    .split(delimiter)
+    .filter(Boolean)
+    .map((dir) => join(dir, exe));
+  const seen = new Set();
+  const found = [];
+  for (const candidate of [...installed, ...onPath]) {
+    if (!existsSync(candidate)) continue;
+    const key = pathKey(candidate);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    found.push(candidate);
   }
-
-  // 3. PATH, resolved manually rather than by spawning `which`/`where`, which
-  //    would cost a subprocess on every launch just to decide whether to spawn.
-  //
-  //    Windows: only `.exe` is RETURNED -- deliberately narrower than PATHEXT.
-  //    Node refuses to run a `.cmd`/`.bat` through execFile/spawn without
-  //    `shell: true` (EINVAL, and for spawn it throws SYNCHRONOUSLY rather than
-  //    emitting 'error'), so returning one would hand back a path this launcher
-  //    cannot execute -- discovery has to agree with execution. `exe` is also
-  //    what the installed-location checks above look for, so both discovery
-  //    paths accept exactly the same shapes.
-  //
-  //    A shim is still NOTED, though. An npm-style install puts `oam.cmd` on
-  //    PATH, and staying silent about it means auto mode degrades with no
-  //    explanation and `SSH_MCP_RUNTIME=oam` claims nothing was found -- both
-  //    of which send someone to reinstall an oam they already have.
-  let shim = null;
-  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
-    if (!dir) continue;
-    const candidate = join(dir, exe);
-    if (existsSync(candidate)) return { path: candidate, shim: null };
-    if (isWin && shim === null) {
-      for (const ext of [".cmd", ".bat"]) {
-        const alt = join(dir, `oam${ext}`);
-        if (existsSync(alt)) {
-          shim = alt;
-          break;
-        }
-      }
-    }
-  }
-
-  return { path: null, shim };
+  return found;
 }
 
 /**
@@ -195,10 +213,12 @@ function oamVersion(cmd) {
     const out = execFileSync(cmd, ["--version"], {
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "ignore"],
+      timeout: VERSION_PROBE_TIMEOUT_MS,
+      windowsHide: true,
     });
     return parseVersion(out);
   } catch {
-    // Not executable, wrong arch, or deleted since the stat. Caller degrades.
+    // Not executable, wrong arch, wedged, or deleted since the stat. Caller degrades.
     return null;
   }
 }
@@ -214,24 +234,144 @@ function atLeast(v, min) {
 }
 
 /**
- * Where the server runs, decided BEFORE any discovery:
- *   "in-process"  import it into THIS process
- *   "discover"    find an oam binary, gate its version, spawn it -- or fall
- *                 back to Node in-process when that fails
+ * The newest candidate at or above the floor, or null. `candidates` is
+ * `{ path, version }[]` in search order, `version` null when unreadable.
+ * Strictly-greater replaces, so a tie keeps the earlier candidate.
  *
- * `hostOam` is `process.versions.oam`: oam's own key, absent on Node, so on
- * Node every mode but `node` is the discovery path it always was. The floor is
- * OAM_MIN itself, not a parameter, so a host oam and a discovered one can never
- * be held to different minimums. There is no sandbox input because this
- * launcher has no sandbox; see ALREADY RUNNING ON OAM above for why nothing
- * else forces a spawn.
+ * Pure on purpose, like runtimePlan: the choice is testable without binaries.
+ */
+function pickNewest(candidates) {
+  let best = null;
+  for (const candidate of candidates) {
+    if (!atLeast(candidate.version, OAM_MIN)) continue;
+    if (!best || !atLeast(best.version, candidate.version)) best = candidate;
+  }
+  return best;
+}
+
+/**
+ * Where the server runs, decided BEFORE any discovery:
+ *   "in-process"   import it into THIS process
+ *   "discover"     choose an oam and spawn it, or fall back to Node
+ *   "handoff-node" hand it off to Node on PATH: THIS process is an oam, and
+ *                  Node was asked for
+ *
+ * `hostOam` is `process.versions.oam`: oam's own key, absent on Node. An oam
+ * host whose version cannot be read is treated as below the floor -- it never
+ * proved it is a supported oam -- and a host below the floor takes the
+ * discovery path, whose every outcome on an oam host is a spawn or an error
+ * exit, never an in-process serve. The floor is OAM_MIN itself, not a parameter, so a host oam
+ * and a discovered one can never be held to different minimums. There is no
+ * sandbox input because this launcher has no sandbox; see ALREADY RUNNING ON
+ * OAM above for why nothing else forces a spawn.
  *
  * Pure on purpose: every input is passed in, so the whole decision is testable
  * without booting a runtime.
  */
 function runtimePlan({ mode, hostOam }) {
-  if (mode === "node") return "in-process";
+  const onOam = hostOam !== undefined;
+  if (mode === "node") return onOam ? "handoff-node" : "in-process";
   return atLeast(parseVersion(hostOam ?? ""), OAM_MIN) ? "in-process" : "discover";
+}
+
+/**
+ * An oam-named .cmd/.bat on PATH: a real install in a shape this launcher
+ * cannot spawn. Reported rather than ignored, because "no oam binary was found"
+ * reads as "install oam" -- the one thing that will not help. An npm-style
+ * install puts `oam.cmd` on PATH, and staying silent about it sends someone to
+ * reinstall an oam they already have. Windows only; there is no such shim
+ * concept on POSIX.
+ */
+function findOamShim() {
+  if (!isWin) return null;
+  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
+    if (!dir) continue;
+    for (const ext of [".cmd", ".bat"]) {
+      const candidate = join(dir, `oam${ext}`);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+/** A Node binary on PATH, or null. Stat-only; used only when THIS process is oam. */
+function findNodeOnPath() {
+  const name = isWin ? "node.exe" : "node";
+  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
+    if (!dir) continue;
+    const candidate = join(dir, name);
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
+ * Why a candidate was passed over, for stderr.
+ *
+ * Two different causes, and they need different remedies. A null `version` is
+ * NOT "old": oamVersion returns null when the binary could not be run at all
+ * (not executable, wrong arch, wedged, deleted between the stat and the probe)
+ * or when its --version output did not parse. Telling that user to
+ * `oam self-update` sends them after the one cause it definitely is not, so the
+ * wording splits here, and so does the remedy in `remedyFor`.
+ */
+function unusableReason(path, version, label = path) {
+  const min = OAM_MIN.join(".");
+  return version
+    ? `${label} is oam ${version.join(".")}, older than ${min}`
+    : `${label} could not be run, or did not report a version this launcher understands`;
+}
+
+/**
+ * Choose the oam to spawn: a usable OAM_BIN, else the newest usable discovered
+ * binary. Returns the choice (or null) plus what stderr needs:
+ *   overrideNote  why OAM_BIN was passed over, or null
+ *   skipped       why each discovered binary was passed over, when none was chosen
+ *   passedOver    the `version` of every existing binary rejected (OAM_BIN
+ *                 included), so a hard failure can name the right remedy
+ *   overrideMissing  OAM_BIN was set to a path that does not exist
+ */
+function chooseOam() {
+  const override = process.env.OAM_BIN;
+  let overrideNote = null;
+  let overrideMissing = false;
+  const passedOver = [];
+  if (override) {
+    if (!existsSync(override)) {
+      overrideNote = `OAM_BIN=${override} does not exist`;
+      overrideMissing = true;
+    } else {
+      const version = oamVersion(override);
+      if (atLeast(version, OAM_MIN)) {
+        return { chosen: { path: override, version }, overrideNote, skipped: [], passedOver, overrideMissing };
+      }
+      overrideNote = unusableReason(override, version, `OAM_BIN=${override}`);
+      passedOver.push(version);
+    }
+  }
+  const overrideKey = override ? pathKey(override) : null;
+  const candidates = discoverOamPaths()
+    .filter((path) => pathKey(path) !== overrideKey)
+    .map((path) => ({ path, version: oamVersion(path) }));
+  const chosen = pickNewest(candidates);
+  const skipped = chosen ? [] : candidates.map((c) => unusableReason(c.path, c.version));
+  if (!chosen) passedOver.push(...candidates.map((c) => c.version));
+  return { chosen, overrideNote, skipped, passedOver, overrideMissing };
+}
+
+/** What would fix "no usable oam", one line per cause that was actually seen. */
+function remedyFor({ passedOver, overrideMissing, shim }) {
+  const lines = [];
+  if (passedOver.some((v) => v !== null)) {
+    lines.push(`Run \`oam self-update\` to get oam ${OAM_MIN.join(".")} or newer.\n`);
+  }
+  if (passedOver.some((v) => v === null)) {
+    lines.push("Check that it is an executable oam binary for this platform.\n");
+  }
+  if (overrideMissing) lines.push("Point OAM_BIN at an existing oam binary, or unset it.\n");
+  if (lines.length === 0 && !shim) lines.push("Install oam from https://oamjs.org, or set OAM_BIN=/path/to/oam.\n");
+  lines.push("Or use SSH_MCP_RUNTIME=node to run on Node.\n");
+  return lines.join("");
 }
 
 /** Run the server in THIS process. The zero-overhead fallback. */
@@ -250,207 +390,238 @@ async function runInProcess() {
   await import(SERVER_URL.href);
 }
 
+// ONE reporter for every failed in-process fallback, so the sync-throw path and
+// the 'error'-event path in launchChild cannot drift apart. runInProcess() is a
+// bare import() that rejects when dist/index.js is missing or throws at load,
+// and at ESM top level an unhandled rejection is an uncaught exception -- it
+// kills the process and replaces this launcher's diagnostic with a raw stack
+// trace, which is the exact failure this handling exists to prevent.
+const fallbackFailed = (e) => {
+  process.stderr.write(`ssh-mcp: fallback to Node failed (${e?.message ?? e})\n`);
+  process.exitCode = 1;
+};
+
+/**
+ * Spawn the server in a child runtime and mirror its lifetime.
+ *
+ * `onLaunchFailed(err)` runs when the child could not be started at all; it is
+ * never called once the child is running, which would double-start the server
+ * on the same stdio. Every "could not be executed" outcome lands there: the
+ * synchronous throw from spawn() and the async 'error' event mean the same
+ * thing and must degrade the same way.
+ */
+async function launchChild(cmd, args, onLaunchFailed) {
+  // THIS process being an oam means one below the floor (a supported oam host
+  // serves in-process) or any oam under SSH_MCP_RUNTIME=node, and an old oam's
+  // `stdio: 'inherit'` does not hand over the fds. Pipe explicitly from every
+  // oam host; see ALREADY RUNNING ON OAM.
+  const piped = process.versions.oam !== undefined;
+  let child = null;
+  try {
+    child = spawn(cmd, args, {
+      // inherit keeps the SAME fds, so MCP's newline-delimited JSON framing on
+      // stdin/stdout is untouched and the host's stdin-close still reaches the
+      // server's shutdown path. Piping preserves both as well: bytes are copied
+      // unchanged, and stdin's end propagates to the child.
+      stdio: piped ? ["pipe", "pipe", "pipe"] : "inherit",
+      env: process.env,
+      windowsHide: true,
+    });
+  } catch (err) {
+    // spawn() THROWS for some failures instead of emitting 'error', and the
+    // 'error' listener is registered AFTER this call, so it can never observe
+    // one -- an uncaught throw here kills the launcher with a raw stack trace
+    // instead of falling back.
+    //
+    // Belt-and-braces, deliberately: an oam reaching this line already answered
+    // a version probe, so the shapes that throw synchronously (a .cmd/.bat Node
+    // refuses with EINVAL) were diverted by the version gate -- and a Node
+    // handoff only ever names node.exe, never a shim. A deleted binary (ENOENT)
+    // or a permission failure (EACCES) is routed to the async 'error' event
+    // instead. What is left is a genuine TOCTOU: the binary
+    // replaced between the probe and the spawn. Cheap to keep, and the
+    // alternative is a stack trace in a stdio server.
+    await onLaunchFailed(err).catch(fallbackFailed);
+    return;
+  }
+
+  if (piped) {
+    process.stdin.pipe(child.stdin);
+    child.stdout.pipe(process.stdout);
+    child.stderr.pipe(process.stderr);
+    // A child that exits before reading everything closes its stdin; the
+    // resulting EPIPE is not worth crashing over.
+    child.stdin.on("error", () => {});
+  }
+
+  // If the runtime cannot be executed at all (deleted between the stat and the
+  // spawn, wrong arch, permission), fall back rather than failing the whole
+  // server. `spawned` prevents falling back AFTER the child started.
+  let spawned = false;
+  child.on("spawn", () => {
+    spawned = true;
+  });
+  child.on("error", (err) => {
+    if (spawned) return;
+    // Handle the rejection instead of discarding the promise: a failing
+    // fallback used to escape as an unhandled rejection, replacing this
+    // launcher's diagnostic with a raw stack trace.
+    onLaunchFailed(err).catch(fallbackFailed);
+  });
+
+  // Forward termination so the server's own shutdown path runs in the child
+  // rather than the child being orphaned.
+  //
+  // Registering ANY handler for these suppresses Node's default
+  // terminate-on-signal, so the parent's exit has to be arranged explicitly.
+  // `child.killed` only records that kill() was CALLED, never that the child
+  // is gone, so gating on it swallows every signal after the first and wedges
+  // the launcher with no escape hatch.
+  //
+  // Escalation is driven by a TIMER, not by counting signals, and not by
+  // comparing timestamps. Counting is ambiguous: a supervisor routinely sends
+  // SIGINT then SIGTERM milliseconds apart, and a terminal Ctrl-C reaches the
+  // whole process group, so the child usually gets its own copy alongside ours
+  // -- reading "a second signal" as impatience hard-kills a child that is
+  // already shutting down cleanly. A timer makes the count irrelevant: ONE
+  // press is enough, and a wedged child dies on schedule without the user
+  // having to guess how many times to press. It also sidesteps the wall clock
+  // -- setTimeout is monotonic, so a clock step cannot mis-gate the window in
+  // either direction.
+  //
+  // POSIX vs Windows, and why we do not forward on Windows.
+  // On POSIX child.kill(sig) delivers a real, catchable signal, so forwarding
+  // is what lets the child run its shutdown. On Windows there are no POSIX
+  // signals: child.kill IGNORES the name and calls TerminateProcess -- an
+  // immediate hard kill (verified: a child with a SIGTERM handler never runs it
+  // and dies with code=null). Forwarding there would ABORT the graceful
+  // shutdown the console's own Ctrl-C just started, skipping the child's
+  // process.on("exit") backstop -- which is what reaps an ssh-agent this server
+  // spawned (killStartedAgent, src/env.ts) -- and leak the daemon. The console
+  // has already notified the child, so on Windows the timer below is the only
+  // kill we issue.
+  //
+  // The window comfortably exceeds the child's own shutdown budget
+  // (server.close -> pool.drain -> killStartedAgent -> ~100ms FIN grace).
+  const ESCALATE_AFTER_MS = 2000;
+  let escalation = null;
+  for (const sig of ["SIGINT", "SIGTERM"]) {
+    process.on(sig, () => {
+      // No try/catch: kill() on an already-exited child returns false, it does
+      // not throw. It throws only for a signal the platform does not know,
+      // which SIGINT/SIGTERM/SIGKILL never are.
+      if (!isWin) child.kill(sig);
+      if (escalation) return; // already counting down; further signals are noise
+      escalation = setTimeout(() => {
+        // Still here after its grace window. Stop waiting on it.
+        child.kill("SIGKILL");
+        process.exit(128 + (constants.signals[sig] ?? 15));
+      }, ESCALATE_AFTER_MS);
+    });
+  }
+
+  // Piped: wait for 'close', so the child's last stdout bytes are copied out
+  // before this process exits. Inherited: 'exit' is enough, the fds were never
+  // ours to drain.
+  child.on(piped ? "close" : "exit", (code, signal) => {
+    if (escalation) clearTimeout(escalation);
+    // Mirror the child's fate: a signal death becomes 128+n so callers see a
+    // conventional shell exit status rather than a bare 0.
+    if (signal) {
+      process.exit(128 + (constants.signals[signal] ?? 15));
+    }
+    process.exit(code ?? 0);
+  });
+}
+
+/**
+ * Hand the server to Node on PATH. Only reachable when THIS process is oam --
+ * one below the floor, or any oam under SSH_MCP_RUNTIME=node -- so there is no
+ * in-process option left.
+ */
+async function handOffToNode(reason) {
+  const node = findNodeOnPath();
+  if (!node) {
+    // Two ways here, two remedies: an oam below the floor is fixed by updating
+    // it, while SSH_MCP_RUNTIME=node on a supported oam asked for Node outright.
+    const remedy = reason
+      ? `Run \`oam self-update\` to get oam ${OAM_MIN.join(".")} or newer, or launch this command with node.\n`
+      : "Put Node on PATH, or unset SSH_MCP_RUNTIME to serve on this oam.\n";
+    await errSync(
+      `ssh-mcp: ${reason || `SSH_MCP_RUNTIME=node on oam ${process.versions.oam}`}, and no Node was found on PATH to run the server instead.\n${remedy}`,
+    );
+    process.exit(1);
+  }
+  if (reason) await errSync(`ssh-mcp: ${reason}; running on ${node} instead.\n`);
+  await launchChild(node, [SERVER_ENTRY, ...process.argv.slice(2)], async (err) => {
+    await errSync(`ssh-mcp: failed to launch Node at ${node} (${err?.message ?? err})\n`);
+    process.exit(1);
+  });
+}
+
+/** No usable oam, under a mode that allows Node. */
+async function fallBackToNode(hostOam) {
+  if (hostOam === undefined) {
+    await runInProcess();
+    return;
+  }
+  await handOffToNode(`this process is oam ${hostOam}, older than ${OAM_MIN.join(".")}, and no newer oam was found`);
+}
+
 const mode = (process.env.SSH_MCP_RUNTIME ?? "auto").toLowerCase();
-const plan = runtimePlan({ mode, hostOam: process.versions.oam });
+const hostOam = process.versions.oam;
+const plan = runtimePlan({ mode, hostOam });
 
 if (plan === "in-process") {
   await runInProcess();
+} else if (plan === "handoff-node") {
+  const belowFloor = !atLeast(parseVersion(hostOam), OAM_MIN);
+  await handOffToNode(belowFloor ? `this process is oam ${hostOam}, older than ${OAM_MIN.join(".")}` : "");
 } else {
-  const { path: oam, shim: oamShim } = findOam();
-  // Read the version ONCE, and only when discovery found something: the gate
-  // below has to tell "too old" apart from "could not be read at all", and
-  // re-probing inside the branch would cost a second subprocess.
-  //
-  // Discovery itself stays stat-only; this is the first subprocess. It is paid
-  // on every launch that finds an oam -- including the ones that go on to fall
-  // back to Node -- not only the ones that end up spawning it. Measured 26ms
-  // median (n=12, windows-arm64), once per MCP session.
-  const found = oam ? oamVersion(oam) : null;
+  const { chosen, overrideNote, skipped, passedOver, overrideMissing } = chooseOam();
 
-  if (!oam) {
-    // An oam-named .cmd/.bat on PATH is a real install in a shape this launcher
-    // cannot spawn. Naming it turns "no oam binary was found" -- which reads as
-    // "install oam", the one thing that will not help -- into something the user
-    // can act on.
-    const shimNote = oamShim
-      ? `Found ${oamShim}, but Node cannot execute a .cmd/.bat directly.\n` +
-        "Install the native oam binary, or point OAM_BIN at one.\n"
-      : "";
+  if (chosen) {
+    if (overrideNote)
+      await errSync(`ssh-mcp: ${overrideNote}; using ${chosen.path} (oam ${chosen.version.join(".")}).\n`);
+    // `--` separates oam's own flags from the script's argv, so `ssh-mcp
+    // --version` and any host-supplied flags survive the hop unchanged.
+    await launchChild(chosen.path, ["run", SERVER_ENTRY, "--", ...process.argv.slice(2)], async (err) => {
+      if (mode === "oam") {
+        await errSync(`ssh-mcp: failed to launch oam at ${chosen.path} (${err?.message ?? err})\n`);
+        process.exit(1);
+      }
+      await errSync(`ssh-mcp: failed to launch oam at ${chosen.path} (${err?.message ?? err}); using Node instead.\n`);
+      await fallBackToNode(hostOam);
+    });
+  } else {
+    const shim = findOamShim();
+    const notes = [
+      ...(overrideNote ? [overrideNote] : []),
+      ...skipped,
+      ...(shim
+        ? [
+            `found ${shim}, but Node cannot execute a .cmd/.bat directly -- install the native oam binary, or point OAM_BIN at one`,
+          ]
+        : []),
+    ];
     if (mode === "oam") {
       // Explicitly demanded, so this is a real misconfiguration.
       await errSync(
-        `ssh-mcp: SSH_MCP_RUNTIME=oam but no runnable oam binary was found.\n${shimNote}` +
-          "Install from https://oamjs.org, set OAM_BIN=/path/to/oam, or use SSH_MCP_RUNTIME=node.\n",
+        `ssh-mcp: SSH_MCP_RUNTIME=oam but no usable oam (${OAM_MIN.join(".")} or newer) was found.\n` +
+          notes.map((note) => `  ${note}\n`).join("") +
+          remedyFor({ passedOver, overrideMissing, shim }),
       );
       process.exit(1);
     }
     // auto: falling back is correct, but silence is how someone never learns
-    // their oam install is a shape this launcher skips. Only worth saying when
-    // there was actually something to skip.
-    if (oamShim) await errSync(`ssh-mcp: ${shimNote}Using Node instead.\n`);
-    await runInProcess();
-  } else if (!atLeast(found, OAM_MIN)) {
-    const min = OAM_MIN.join(".");
-    // Two different causes reach this branch and they need different remedies.
-    // `found === null` is NOT "old": oamVersion returns null when the binary
-    // could not be run at all (not executable, wrong arch, a .cmd/.bat Node
-    // refuses, deleted between the stat and the probe) or when its --version
-    // output did not parse. Telling that user to `oam self-update` sends them
-    // after the one cause it definitely is not, so the wording splits here.
-    const detail = found
-      ? `${oam} is oam ${found.join(".")}, older than ${min}`
-      : `${oam} could not be run, or did not report a version this launcher understands`;
-    const remedy = found
-      ? "Run `oam self-update`, or use SSH_MCP_RUNTIME=node.\n"
-      : "Check that it is an executable oam binary for this platform, or use SSH_MCP_RUNTIME=node.\n";
-    if (mode === "oam") {
-      await errSync(`ssh-mcp: SSH_MCP_RUNTIME=oam but ${detail}.\n${remedy}`);
-      process.exit(1);
-    }
-    // auto: neither cause is worth failing over -- prefer Node. Say so, because
-    // a silent downgrade is how someone keeps running an oam they meant to
-    // update, or never learns their oam is unexecutable. stdout carries the MCP
-    // frames, so stderr is the only safe channel.
+    // their OAM_BIN is wrong, their oam is too old to use, or their install is a
+    // shape this launcher skips. Only worth saying when something was skipped.
     //
     // errSync, not process.stderr.write: an exit DOES follow, just indirectly.
     // runInProcess() imports dist/index.js, whose top level answers `--version`
     // with console.log + process.exit(0) (src/index.ts) -- and that exit
     // truncates a pending async stderr write on Windows TTYs and pipes.
-    await errSync(`ssh-mcp: ${detail}; using Node instead.\n`);
-    await runInProcess();
-  } else {
-    // Every "oam could not be executed" outcome lands here: the synchronous
-    // throw from spawn() and the async 'error' event both mean the same thing
-    // and must degrade the same way, so the handling lives in one place.
-    // errSync rather than process.stderr.write because stderr is async for
-    // TTYs and pipes on Windows and the process.exit below truncates pending
-    // writes -- the same reason the two branches above use it.
-    const launchFailed = async (err) => {
-      if (mode === "oam") {
-        await errSync(`ssh-mcp: failed to launch oam (${err?.message ?? err})\n`);
-        process.exit(1);
-      }
-      await runInProcess();
-    };
-
-    // ONE reporter shared by both launchFailed call sites below, so the
-    // sync-throw path and the 'error'-event path cannot drift apart. Either can
-    // reject: in auto mode launchFailed awaits runInProcess(), a bare import()
-    // that rejects whenever dist/index.js is missing or throws at load. At ESM
-    // top level an unhandled rejection is an uncaught exception -- it kills the
-    // process and replaces this launcher's diagnostic with a raw stack trace,
-    // which is the exact failure this handling exists to prevent.
-    const fallbackFailed = (e) => {
-      process.stderr.write(`ssh-mcp: fallback to Node failed (${e?.message ?? e})\n`);
-      process.exitCode = 1;
-    };
-
-    // `--` separates oam's own flags from the script's argv, so `ssh-mcp
-    // --version` and any host-supplied flags survive the hop unchanged.
-    let child = null;
-    try {
-      child = spawn(oam, ["run", SERVER_ENTRY, "--", ...process.argv.slice(2)], {
-        // inherit keeps the SAME fds, so MCP's newline-delimited JSON framing on
-        // stdin/stdout is untouched and the host's stdin-close still reaches the
-        // server's shutdown path.
-        stdio: "inherit",
-        env: process.env,
-        windowsHide: true,
-      });
-    } catch (err) {
-      // spawn() THROWS for some failures instead of emitting 'error', and the
-      // 'error' listener is registered AFTER this call, so it can never observe
-      // one -- an uncaught throw here kills the launcher with a raw stack trace
-      // instead of falling back to Node.
-      //
-      // Belt-and-braces, deliberately: reaching this line already means
-      // execFileSync ran this same binary and read a version from it, so the
-      // shapes that throw synchronously (a .cmd/.bat Node refuses with EINVAL)
-      // have been diverted by the version gate above, and the ones the comments
-      // below name -- deleted (ENOENT), permission (EACCES) -- are among the
-      // errnos Node routes to the async 'error' event instead. What is left is
-      // a genuine TOCTOU: the binary replaced between the probe and the spawn.
-      // Cheap to keep, and the alternative is a stack trace in a stdio server.
-      await launchFailed(err).catch(fallbackFailed);
-    }
-
-    if (child) {
-      // If oam cannot be executed at all (deleted between the stat and the spawn,
-      // wrong arch, permission), fall back rather than failing the whole server.
-      // `spawned` prevents falling back AFTER the child started, which would
-      // double-start the server on the same stdio.
-      let spawned = false;
-      child.on("spawn", () => {
-        spawned = true;
-      });
-      child.on("error", (err) => {
-        if (spawned) return;
-        // Handle the rejection instead of discarding the promise: a failing
-        // runInProcess() used to escape as an unhandled rejection, replacing
-        // this launcher's diagnostic with a raw stack trace.
-        launchFailed(err).catch(fallbackFailed);
-      });
-
-      // Forward termination so the server's own shutdown path runs in the child
-      // rather than the child being orphaned.
-      //
-      // Registering ANY handler for these suppresses Node's default
-      // terminate-on-signal, so the parent's exit has to be arranged
-      // explicitly. `child.killed` only records that kill() was CALLED, never
-      // that the child is gone, so gating on it swallows every signal after the
-      // first and wedges the launcher with no escape hatch.
-      //
-      // Escalation is driven by a TIMER, not by counting signals, and not by
-      // comparing timestamps. Counting is ambiguous: a supervisor routinely
-      // sends SIGINT then SIGTERM milliseconds apart, and a terminal Ctrl-C
-      // reaches the whole process group, so the child usually gets its own copy
-      // alongside ours -- reading "a second signal" as impatience hard-kills a
-      // child that is already shutting down cleanly. A timer makes the count
-      // irrelevant: ONE press is enough, and a wedged child dies on schedule
-      // without the user having to guess how many times to press. It also
-      // sidesteps the wall clock -- setTimeout is monotonic, so a clock step
-      // cannot mis-gate the window in either direction.
-      //
-      // POSIX vs Windows, and why we do not forward on Windows.
-      // On POSIX child.kill(sig) delivers a real, catchable signal, so
-      // forwarding is what lets the child run its shutdown. On Windows there
-      // are no POSIX signals: child.kill IGNORES the name and calls
-      // TerminateProcess -- an immediate hard kill (verified: a child with a
-      // SIGTERM handler never runs it and dies with code=null). Forwarding
-      // there would ABORT the graceful shutdown the console's own Ctrl-C just
-      // started, skipping the child's process.on("exit") backstop -- which is
-      // what reaps an ssh-agent this server spawned (killStartedAgent,
-      // src/env.ts) -- and leak the daemon. The console has already notified
-      // the child, so on Windows the timer below is the only kill we issue.
-      //
-      // The window comfortably exceeds the child's own shutdown budget
-      // (server.close -> pool.drain -> killStartedAgent -> ~100ms FIN grace).
-      const ESCALATE_AFTER_MS = 2000;
-      let escalation = null;
-      for (const sig of ["SIGINT", "SIGTERM"]) {
-        process.on(sig, () => {
-          // No try/catch: kill() on an already-exited child returns false, it
-          // does not throw. It throws only for a signal the platform does not
-          // know, which SIGINT/SIGTERM/SIGKILL never are.
-          if (!isWin) child.kill(sig);
-          if (escalation) return; // already counting down; further signals are noise
-          escalation = setTimeout(() => {
-            // Still here after its grace window. Stop waiting on it.
-            child.kill("SIGKILL");
-            process.exit(128 + (constants.signals[sig] ?? 15));
-          }, ESCALATE_AFTER_MS);
-        });
-      }
-
-      child.on("exit", (code, signal) => {
-        if (escalation) clearTimeout(escalation);
-        // Mirror the child's fate: a signal death becomes 128+n so callers see a
-        // conventional shell exit status rather than a bare 0.
-        if (signal) {
-          process.exit(128 + (constants.signals[signal] ?? 15));
-        }
-        process.exit(code ?? 0);
-      });
-    }
+    if (notes.length > 0) await errSync(`ssh-mcp: ${notes.join("; ")}; using Node instead.\n`);
+    await fallBackToNode(hostOam).catch(fallbackFailed);
   }
 }

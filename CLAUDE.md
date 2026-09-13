@@ -14,7 +14,7 @@ MCP server that makes SSH work for AI tools. 21 tools across 4 categories: SSH e
 - `src/env.ts` — SSH environment management (ensureAgent, listSshKeys, loadKey, configLookup, fixKnownHosts, checkGitSsh, testConnection). Handles Windows OpenSSH agent service.
 - `src/policy.ts` — Optional command allow/deny policy for the exec tools, configured via `SSH_MCP_COMMAND_WHITELIST` / `SSH_MCP_COMMAND_BLACKLIST`.
 - `src/ssh-config.ts` — Pure parser for `ssh -G` output, shared by `resolveConfig` (ssh.ts) and `configLookup` (env.ts).
-- `bin/ssh-mcp.mjs` — Runtime launcher. Prefers an `oam` binary (>= 0.9.0), falls back to running the server in-process. Owns signal forwarding and escalation.
+- `bin/ssh-mcp.mjs` — Runtime launcher. Prefers the newest `oam` binary it finds at or above `OAM_MIN` (the latest oam release, 0.15.2), falls back to running the server in-process on Node. An oam host below the floor never serves: it hands off, with piped stdio, to a newer oam or Node. Owns signal forwarding and escalation.
 
 ## Build
 
