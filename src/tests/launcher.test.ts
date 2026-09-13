@@ -1,5 +1,14 @@
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,22 +26,26 @@ import { afterAll, describe, expect, it } from "vitest";
 // The launcher resolves its server as `new URL("../dist/index.js", import.meta.url)`,
 // so the copy finds the stub. That keeps these tests independent of whether
 // `dist/` has been built, and lets them assert WHICH path ran: the stub prints a
-// marker, so its presence means the in-process fallback was taken and its
-// absence means oam was spawned instead.
+// marker, so its presence means the server ran and its absence means oam was
+// spawned instead. The stub also reports its own pid and `process.versions.oam`,
+// which is how a test tells "served in the launcher's process" apart from
+// "handed off to a Node child that printed the same marker".
 //
-// One pure decision, runtimePlan(), is ALSO evaluated straight from its source
-// text, because its input matrix is too wide to pay a process per case. The
-// execution tests next to it are what prove the launcher actually wires it.
+// Two pure decisions, runtimePlan() and pickNewest(), are ALSO evaluated straight
+// from their source text, because their input matrices are too wide to pay a
+// process per case. The execution tests next to them are what prove the
+// launcher actually wires them.
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, "..", "..");
 const LAUNCHER_SRC = join(REPO_ROOT, "bin", "ssh-mcp.mjs");
+const isWin = process.platform === "win32";
 
 const MARKER = "STUB_SERVER";
 // argv1 pins the entry-point fix: the launcher must repoint process.argv[1] at
 // the server before importing it, or a server that gates its bootstrap on being
 // the process entry point loads and then never serves.
-const STUB_SERVER = `console.log(${JSON.stringify(MARKER)} + " " + JSON.stringify({ argv1: process.argv[1], args: process.argv.slice(2) }));\n`;
+const STUB_SERVER = `console.log(${JSON.stringify(MARKER)} + " " + JSON.stringify({ argv1: process.argv[1], args: process.argv.slice(2), pid: process.pid, oam: process.versions.oam ?? null }));\n`;
 
 const layouts: string[] = [];
 afterAll(() => {
@@ -66,8 +79,28 @@ function dirWith(layout: string, name: string, contents = ""): string {
   return dir;
 }
 
+/**
+ * A PATH directory holding a runnable `node`: a hard link to the Node running
+ * this suite, copied when a link cannot be made (another volume, or a
+ * hardlink-protected file). A directory of its own rather than
+ * dirname(process.execPath), which could also hold an oam this suite must not
+ * discover.
+ */
+function nodeDir(layout: string): string {
+  const dir = mkdtempSync(join(layout, "nodedir-"));
+  const target = join(dir, isWin ? "node.exe" : "node");
+  try {
+    linkSync(process.execPath, target);
+  } catch {
+    copyFileSync(process.execPath, target);
+    chmodSync(target, 0o755);
+  }
+  return dir;
+}
+
 interface RunOpts {
-  mode?: "auto" | "oam" | "node";
+  /** SSH_MCP_RUNTIME, passed through verbatim -- case included. */
+  mode?: string;
   pathDirs?: string[];
   oamBin?: string;
   args?: string[];
@@ -75,9 +108,11 @@ interface RunOpts {
    * Pose as an oam host by preloading a `process.versions.oam` key before the
    * launcher runs. oam publishes that key and Node does not, and it is the one
    * fact the launcher branches on, so this reaches the "already running on oam"
-   * path without needing a real oam on the box that runs the suite.
+   * paths without needing a real oam on the box that runs the suite.
    */
   hostOam?: string;
+  /** More ESM source to preload, after the `hostOam` pose. */
+  preload?: string;
 }
 
 function run(layout: string, opts: RunOpts = {}) {
@@ -99,34 +134,43 @@ function run(layout: string, opts: RunOpts = {}) {
   env.LOCALAPPDATA = join(layout, "home");
   if (opts.oamBin) env.OAM_BIN = opts.oamBin;
 
-  const preload =
+  const posing =
     opts.hostOam === undefined
-      ? []
-      : [
-          "--import",
-          `data:text/javascript,${encodeURIComponent(
-            `Object.defineProperty(process.versions, "oam", { value: ${JSON.stringify(opts.hostOam)}, enumerable: true });`,
-          )}`,
-        ];
+      ? ""
+      : `Object.defineProperty(process.versions, "oam", { value: ${JSON.stringify(opts.hostOam)}, enumerable: true });`;
+  const source = `${posing}${opts.preload ?? ""}`;
+  const preload = source ? ["--import", `data:text/javascript,${encodeURIComponent(source)}`] : [];
 
   const r = spawnSync(process.execPath, [...preload, join(layout, "bin", "ssh-mcp.mjs"), ...(opts.args ?? [])], {
     env,
     encoding: "utf8",
   });
-  return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+  return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "", pid: r.pid };
 }
 
-function stubPayload(stdout: string): { argv1: string; args: string[] } {
+interface StubPayload {
+  argv1: string;
+  args: string[];
+  pid: number;
+  oam: string | null;
+}
+
+function stubPayload(stdout: string): StubPayload {
   const line = stdout.split("\n").find((l) => l.startsWith(MARKER));
   expect(line, `expected the stub server to run; stdout was: ${JSON.stringify(stdout)}`).toBeTruthy();
   return JSON.parse((line as string).slice(MARKER.length + 1));
+}
+
+/** A path that does not exist, for OAM_BIN. */
+function missing(layout: string): string {
+  return join(layout, "no-such-dir", isWin ? "oam.exe" : "oam");
 }
 
 describe("launcher: in-process fallback", () => {
   it("runs the server in this process when SSH_MCP_RUNTIME=node", () => {
     const r = run(makeLayout(), { mode: "node" });
     expect(r.status).toBe(0);
-    expect(r.stdout).toContain(MARKER);
+    expect(stubPayload(r.stdout).pid, "a Node host serves node mode in its own process").toBe(r.pid);
     expect(r.stderr).toBe("");
   });
 
@@ -148,6 +192,14 @@ describe("launcher: in-process fallback", () => {
     // Nothing was skipped, so there is nothing worth saying.
     expect(r.stderr).toBe("");
   });
+
+  it("reads SSH_MCP_RUNTIME case-insensitively", () => {
+    // OAM_BIN is usable, so an `auto` reading would spawn it and the stub would
+    // never run. Only a `node` reading of "NODE" serves in-process.
+    const r = run(makeLayout(), { mode: "NODE", oamBin: process.execPath });
+    expect(r.status, JSON.stringify(r)).toBe(0);
+    expect(stubPayload(r.stdout).pid).toBe(r.pid);
+  });
 });
 
 describe("launcher: oam mode is a hard requirement", () => {
@@ -155,7 +207,14 @@ describe("launcher: oam mode is a hard requirement", () => {
     const r = run(makeLayout(), { mode: "oam" });
     expect(r.status).toBe(1);
     expect(r.stdout).not.toContain(MARKER);
-    expect(r.stderr).toMatch(/no runnable oam binary was found/);
+    expect(r.stderr).toMatch(/no usable oam \(0\.15\.2 or newer\) was found/);
+    expect(r.stderr).toMatch(/Install oam from https:\/\/oamjs\.org/);
+  });
+
+  it("is case-insensitive too", () => {
+    const r = run(makeLayout(), { mode: "OAM" });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/SSH_MCP_RUNTIME=oam but no usable oam/);
   });
 });
 
@@ -209,6 +268,37 @@ describe("launcher: version gate distinguishes unreadable from old", () => {
   });
 });
 
+describe("launcher: a bad OAM_BIN is named, and discovery carries on", () => {
+  it("names an OAM_BIN that does not exist instead of falling back silently", () => {
+    const layout = makeLayout();
+    const r = run(layout, { mode: "auto", oamBin: missing(layout) });
+    expect(r.status, JSON.stringify(r)).toBe(0);
+    expect(r.stdout).toContain(MARKER);
+    expect(r.stderr).toMatch(/^ssh-mcp: OAM_BIN=.*does not exist; using Node instead\.$/m);
+  });
+
+  it("gives a missing OAM_BIN its own remedy in oam mode", () => {
+    const layout = makeLayout();
+    const r = run(layout, { mode: "oam", oamBin: missing(layout) });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/OAM_BIN=.*does not exist/);
+    expect(r.stderr).toMatch(/Point OAM_BIN at an existing oam binary/);
+  });
+
+  it("still discovers an oam on PATH past an OAM_BIN that does not exist", () => {
+    // The discovered oam is an empty file, so it cannot run either (no exec bit
+    // on POSIX, not a PE image on Windows) -- but the message naming it proves
+    // discovery was reached. The old launcher stopped at OAM_BIN and never looked.
+    const layout = makeLayout();
+    const name = isWin ? "oam.exe" : "oam";
+    const exeDir = dirWith(layout, name, "");
+    const r = run(layout, { mode: "oam", oamBin: missing(layout), pathDirs: [exeDir] });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/OAM_BIN=.*does not exist/);
+    expect(r.stderr).toContain(`${join(exeDir, name)} could not be run`);
+  });
+});
+
 describe("launcher: spawning oam", () => {
   it("spawns a usable oam instead of running the server in-process", () => {
     // process.execPath passes the version gate, so the launcher spawns it as
@@ -220,30 +310,49 @@ describe("launcher: spawning oam", () => {
   });
 });
 
-type Plan = "in-process" | "discover";
+type Plan = "in-process" | "discover" | "handoff-node";
 type RuntimePlan = (ctx: { mode: string; hostOam: string | undefined }) => Plan;
+type Candidate = { path: string; version: number[] | null };
+type PickNewest = (candidates: Candidate[]) => Candidate | null;
 
 /**
- * Evaluate the REAL `runtimePlan` source, together with the declarations it
- * closes over, without executing the launcher.
+ * Pull named declarations out of the launcher source and evaluate them, without
+ * executing the launcher.
  *
  * Extracting the text exercises the shipped logic rather than a copy that can
  * drift, and a failed extraction is a loud assertion, not a silent skip -- the
  * same contract as the OAM_MIN patch in makeLayout.
  */
-function loadRuntimePlan(): RuntimePlan {
+function extract(patterns: RegExp[]): string {
   const source = readFileSync(LAUNCHER_SRC, "utf8");
-  const pieces = [
-    /const OAM_MIN = \[[^\]]*\];/,
+  return patterns
+    .map((pattern) => {
+      const match = source.match(pattern);
+      if (!match) throw new Error(`could not extract ${pattern} from bin/ssh-mcp.mjs -- renamed or reformatted?`);
+      return match[0];
+    })
+    .join("\n");
+}
+
+const OAM_MIN_DECL = /const OAM_MIN = \[[^\]]*\];/;
+const ATLEAST_DECL = /function atLeast\(v, min\) \{[\s\S]*?\n\}/;
+
+function loadRuntimePlan(): RuntimePlan {
+  const pieces = extract([
+    OAM_MIN_DECL,
     /function parseVersion\(text\) \{[\s\S]*?\n\}/,
-    /function atLeast\(v, min\) \{[\s\S]*?\n\}/,
+    ATLEAST_DECL,
     /function runtimePlan\(\{ mode, hostOam \}\) \{[\s\S]*?\n\}/,
-  ].map((pattern) => {
-    const match = source.match(pattern);
-    if (!match) throw new Error(`could not extract ${pattern} from bin/ssh-mcp.mjs -- renamed or reformatted?`);
-    return match[0];
-  });
-  return new Function(`${pieces.join("\n")}\nreturn runtimePlan;`)() as RuntimePlan;
+  ]);
+  return new Function(`${pieces}\nreturn runtimePlan;`)() as RuntimePlan;
+}
+
+function loadPickNewest(): { pickNewest: PickNewest; floor: number[] } {
+  const pieces = extract([OAM_MIN_DECL, ATLEAST_DECL, /function pickNewest\(candidates\) \{[\s\S]*?\n\}/]);
+  return new Function(`${pieces}\nreturn { pickNewest, floor: OAM_MIN };`)() as {
+    pickNewest: PickNewest;
+    floor: number[];
+  };
 }
 
 describe("launcher: runtimePlan()", () => {
@@ -255,21 +364,23 @@ describe("launcher: runtimePlan()", () => {
     // asking what it was already running on. `auto` and `oam` both have to take
     // the shortcut -- `oam` demands oam, and the host already is one.
     //
-    // 0.9.0 pins the floor as inclusive (it IS the supported release), and
-    // 0.10.0 pins a numeric compare: it sorts BEFORE 0.9.0 as a string, so a
-    // compare over the raw text would spawn a nested oam on every 0.10+ host.
+    // 0.15.2 pins the floor as inclusive (it IS the supported release), and
+    // 0.100.0 pins a numeric compare: it sorts BEFORE 0.15.2 as a string, so a
+    // compare over the raw text would treat a newer oam as too old.
     for (const mode of ["auto", "oam"]) {
-      for (const hostOam of ["0.9.0", "0.10.0", "0.15.1", "1.0.0", "0.16.0-dev"]) {
+      for (const hostOam of ["0.15.2", "0.16.0", "0.100.0", "1.0.0", "0.16.0-dev"]) {
         expect(runtimePlan({ mode, hostOam }), `mode=${mode} hostOam=${hostOam}`).toBe("in-process");
       }
     }
   });
 
-  it("leaves a host oam below the floor on the discovery path", () => {
-    // Same floor as a discovered binary. Below it, behaviour is exactly what it
-    // was before the shortcut existed.
+  it("never serves in-process on a host oam below the floor", () => {
+    // Below the floor the host must hand off. Serving there was the bug: an oam
+    // older than 0.9.0 runs this server's CLI arguments through a shell, and
+    // anything older than the latest release is not what the server is
+    // verified on.
     for (const mode of ["auto", "oam"]) {
-      for (const hostOam of ["0.8.9", "0.8.2", "0.0.1"]) {
+      for (const hostOam of ["0.15.1", "0.9.0", "0.8.2", "0.0.1"]) {
         expect(runtimePlan({ mode, hostOam }), `mode=${mode} hostOam=${hostOam}`).toBe("discover");
       }
     }
@@ -285,10 +396,39 @@ describe("launcher: runtimePlan()", () => {
     }
   });
 
-  it("runs SSH_MCP_RUNTIME=node in-process whatever the host is", () => {
-    for (const hostOam of [undefined, "0.8.2", "0.15.1"]) {
-      expect(runtimePlan({ mode: "node", hostOam }), `hostOam=${hostOam}`).toBe("in-process");
+  it("runs SSH_MCP_RUNTIME=node on Node: in-process on a Node host, handed off from any oam host", () => {
+    expect(runtimePlan({ mode: "node", hostOam: undefined })).toBe("in-process");
+    for (const hostOam of ["0.8.2", "0.15.2", "1.0.0", "dev"]) {
+      expect(runtimePlan({ mode: "node", hostOam }), `hostOam=${hostOam}`).toBe("handoff-node");
     }
+  });
+});
+
+describe("launcher: pickNewest()", () => {
+  const { pickNewest, floor } = loadPickNewest();
+  const at = (path: string, version: number[] | null): Candidate => ({ path, version });
+
+  it("pins the floor to the latest oam release", () => {
+    expect(floor).toEqual([0, 15, 2]);
+  });
+
+  it("takes the newest usable oam, not the first one found", () => {
+    // The bug: discovery stopped at the first binary that existed, so an older
+    // copy in an earlier location (the installed dir is searched before PATH)
+    // hid a newer one later.
+    const chosen = pickNewest([at("installed", [0, 15, 2]), at("path-a", [0, 16, 0]), at("path-b", [0, 15, 9])]);
+    expect(chosen?.path).toBe("path-a");
+  });
+
+  it("compares numerically and keeps search order on a tie", () => {
+    expect(pickNewest([at("a", [0, 16, 0]), at("b", [0, 100, 0])])?.path).toBe("b");
+    expect(pickNewest([at("first", [0, 15, 2]), at("second", [0, 15, 2])])?.path).toBe("first");
+  });
+
+  it("skips binaries below the floor or with no readable version", () => {
+    expect(pickNewest([at("old", [0, 9, 0]), at("broken", null), at("good", [0, 15, 2])])?.path).toBe("good");
+    expect(pickNewest([at("old", [0, 15, 1]), at("broken", null)])).toBeNull();
+    expect(pickNewest([])).toBeNull();
   });
 });
 
@@ -312,13 +452,15 @@ describe("launcher: already hosted on oam", () => {
       `serves in-process instead of spawning a nested oam (SSH_MCP_RUNTIME=${mode})`,
       () => {
         const layout = makeLayout();
-        const r = run(layout, { mode, hostOam: "0.15.1", oamBin: process.execPath, args: ["--version", "extra"] });
+        const r = run(layout, { mode, hostOam: "0.15.2", oamBin: process.execPath, args: ["--version", "extra"] });
         expect(r.status, JSON.stringify(r)).toBe(0);
         const payload = stubPayload(r.stdout);
         // Same entry-point repoint and argv passthrough as the Node fallback:
         // it is the same runInProcess, not a second copy of it.
         expect(payload.argv1).toBe(join(layout, "dist", "index.js"));
         expect(payload.args).toEqual(["--version", "extra"]);
+        expect(payload.pid).toBe(r.pid);
+        expect(payload.oam).toBe("0.15.2");
         // No discovery ran, so there is no discovery diagnostic.
         expect(r.stderr).toBe("");
       },
@@ -330,12 +472,12 @@ describe("launcher: already hosted on oam", () => {
     "treats SSH_MCP_RUNTIME=oam as satisfied by the host, with no oam binary to discover",
     () => {
       // PATH, OAM_BIN and every installed location are empty, which on Node is
-      // the "no runnable oam binary was found" hard failure. On an oam host that
+      // the "no usable oam" hard failure. On an oam host at the floor that
       // requirement is already met.
-      const r = run(makeLayout(), { mode: "oam", hostOam: "0.15.1" });
+      const r = run(makeLayout(), { mode: "oam", hostOam: "0.15.2" });
       expect(r.status, JSON.stringify(r)).toBe(0);
       expect(r.stdout).toContain(MARKER);
-      expect(r.stderr).not.toMatch(/no runnable oam binary was found/);
+      expect(r.stderr).not.toMatch(/no usable oam/);
     },
     TIMEOUT_MS,
   );
@@ -343,7 +485,7 @@ describe("launcher: already hosted on oam", () => {
   it(
     "still discovers and spawns when the host oam is below the floor",
     () => {
-      const r = run(makeLayout(), { mode: "auto", hostOam: "0.8.9", oamBin: process.execPath });
+      const r = run(makeLayout(), { mode: "auto", hostOam: "0.15.1", oamBin: process.execPath });
       expect(r.stdout, `a below-floor host must not shortcut, got ${JSON.stringify(r)}`).not.toContain(MARKER);
       expect(r.status).not.toBe(0);
       // The spawned child failed, not the launcher: every launcher diagnostic
@@ -354,10 +496,153 @@ describe("launcher: already hosted on oam", () => {
   );
 });
 
-describe("launcher: Windows PATH discovery", () => {
-  const onWindows = process.platform === "win32";
+describe("launcher: an oam host below the floor never serves", () => {
+  // Each of these used to serve the server on the old host itself. A handoff to
+  // Node is visible in the stub's payload: a different pid from the launcher,
+  // and no `process.versions.oam` (the pose is a preload on the launcher only).
+  const TIMEOUT_MS = 45_000;
 
-  it.skipIf(!onWindows)("skips a .cmd shim on PATH but names it in oam mode", () => {
+  it(
+    "hands off to Node on PATH when no oam is found at all",
+    () => {
+      const layout = makeLayout();
+      const r = run(layout, { mode: "auto", hostOam: "0.9.0", oamBin: missing(layout), pathDirs: [nodeDir(layout)] });
+      expect(r.status, JSON.stringify(r)).toBe(0);
+      const payload = stubPayload(r.stdout);
+      expect(payload.pid, "served by a child, not on the old host").not.toBe(r.pid);
+      expect(payload.oam).toBeNull();
+      expect(r.stderr).toMatch(
+        /this process is oam 0\.9\.0, older than 0\.15\.2, and no newer oam was found; running on .*node(\.exe)? instead/,
+      );
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "hands off to Node when the only oam found is also too old",
+    () => {
+      // The floor raised above the Node running the suite makes OAM_BIN a real,
+      // runnable, too-old oam -- and makes the posed host too old as well.
+      const layout = makeLayout({ oamMin: "[99, 0, 0]" });
+      const r = run(layout, {
+        mode: "auto",
+        hostOam: "1.0.0",
+        oamBin: process.execPath,
+        pathDirs: [nodeDir(layout)],
+      });
+      expect(r.status, JSON.stringify(r)).toBe(0);
+      expect(stubPayload(r.stdout).pid).not.toBe(r.pid);
+      expect(r.stderr).toMatch(/is oam \d+\.\d+\.\d+, older than 99\.0\.0/);
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "refuses to serve when there is no Node on PATH either",
+    () => {
+      const layout = makeLayout();
+      const r = run(layout, { mode: "auto", hostOam: "0.9.0", oamBin: missing(layout) });
+      expect(r.status, JSON.stringify(r)).toBe(1);
+      expect(r.stdout, "nothing may be served").not.toContain(MARKER);
+      expect(r.stderr).toMatch(/no Node was found on PATH/);
+      expect(r.stderr).toMatch(/oam self-update/);
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "exits 1 under SSH_MCP_RUNTIME=oam rather than handing off to Node",
+    () => {
+      const layout = makeLayout();
+      const r = run(layout, { mode: "oam", hostOam: "0.9.0", pathDirs: [nodeDir(layout)] });
+      expect(r.status, JSON.stringify(r)).toBe(1);
+      expect(r.stdout).not.toContain(MARKER);
+      expect(r.stderr).toMatch(/SSH_MCP_RUNTIME=oam but no usable oam/);
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "still falls back to Node when the chosen oam fails to spawn",
+    () => {
+      // The chosen binary passed its --version probe and then could not be
+      // spawned (deleted or replaced in between). A failed spawn emits 'error'
+      // and then 'close' with the negative errno -- never 'exit' -- and a handoff
+      // from an oam host waits for 'close', so an unguarded close handler exited
+      // the launcher mid-fallback and nothing served. The preload makes the
+      // FIRST spawn target a path that does not exist; the Node fallback, the
+      // second spawn, runs for real.
+      const failFirstSpawn = [
+        'import childProcess from "node:child_process";',
+        'import { syncBuiltinESMExports } from "node:module";',
+        "const realSpawn = childProcess.spawn;",
+        "let failed = false;",
+        "childProcess.spawn = function (cmd, args, opts) {",
+        "  if (failed) return realSpawn.call(this, cmd, args, opts);",
+        "  failed = true;",
+        '  return realSpawn.call(this, cmd + ".does-not-exist", args, opts);',
+        "};",
+        "syncBuiltinESMExports();",
+      ].join("\n");
+      const layout = makeLayout();
+      const r = run(layout, {
+        mode: "auto",
+        hostOam: "0.9.0",
+        oamBin: process.execPath,
+        pathDirs: [nodeDir(layout)],
+        preload: failFirstSpawn,
+      });
+      expect(r.status, JSON.stringify(r)).toBe(0);
+      expect(r.stderr).toMatch(/^ssh-mcp: failed to launch oam at .*; using Node instead\.$/m);
+      // A newer oam WAS found; it just would not start. The handoff note must
+      // not then claim that nothing was found.
+      expect(r.stderr).toMatch(
+        /older than 0\.15\.2, and the newer oam would not start; running on .*node(\.exe)? instead/,
+      );
+      expect(r.stderr).not.toMatch(/no newer oam was found/);
+      const payload = stubPayload(r.stdout);
+      expect(payload.pid, "the Node fallback must still serve, in a child").not.toBe(r.pid);
+      expect(payload.oam).toBeNull();
+    },
+    TIMEOUT_MS,
+  );
+});
+
+describe("launcher: SSH_MCP_RUNTIME=node always means Node", () => {
+  const TIMEOUT_MS = 45_000;
+
+  it(
+    "hands off to Node even on a supported oam host",
+    () => {
+      const layout = makeLayout();
+      const r = run(layout, { mode: "node", hostOam: "0.15.2", pathDirs: [nodeDir(layout)], args: ["extra"] });
+      expect(r.status, JSON.stringify(r)).toBe(0);
+      const payload = stubPayload(r.stdout);
+      expect(payload.pid).not.toBe(r.pid);
+      expect(payload.oam).toBeNull();
+      expect(payload.args).toEqual(["extra"]);
+      // Asked for outright, so there is nothing to explain.
+      expect(r.stderr).toBe("");
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "exits 1 with a Node remedy when there is no Node on PATH",
+    () => {
+      const r = run(makeLayout(), { mode: "node", hostOam: "0.15.2" });
+      expect(r.status, JSON.stringify(r)).toBe(1);
+      expect(r.stdout).not.toContain(MARKER);
+      expect(r.stderr).toMatch(/SSH_MCP_RUNTIME=node on oam 0\.15\.2, and no Node was found on PATH/);
+      expect(r.stderr).toMatch(/Put Node on PATH/);
+      expect(r.stderr).not.toMatch(/self-update/);
+    },
+    TIMEOUT_MS,
+  );
+});
+
+describe("launcher: Windows PATH discovery", () => {
+  it.skipIf(!isWin)("skips a .cmd shim on PATH but names it in oam mode", () => {
     const layout = makeLayout();
     const shimDir = dirWith(layout, "oam.cmd", "@echo off\r\n");
     const r = run(layout, { mode: "oam", pathDirs: [shimDir] });
@@ -366,7 +651,7 @@ describe("launcher: Windows PATH discovery", () => {
     expect(r.stderr).toMatch(/cannot execute a \.cmd\/\.bat directly/);
   });
 
-  it.skipIf(!onWindows)("names the skipped shim in auto mode, then falls back", () => {
+  it.skipIf(!isWin)("names the skipped shim in auto mode, then falls back", () => {
     const layout = makeLayout();
     const shimDir = dirWith(layout, "oam.cmd", "@echo off\r\n");
     const r = run(layout, { mode: "auto", pathDirs: [shimDir] });
@@ -376,23 +661,26 @@ describe("launcher: Windows PATH discovery", () => {
     expect(r.stderr).toMatch(/oam\.cmd/);
   });
 
-  it.skipIf(!onWindows)("prefers an .exe later on PATH over an earlier .cmd shim", () => {
+  it.skipIf(!isWin)("probes an .exe later on PATH and never treats an earlier .cmd shim as a candidate", () => {
     const layout = makeLayout();
     const shimDir = dirWith(layout, "oam.cmd", "@echo off\r\n");
     const exeDir = dirWith(layout, "oam.exe", "");
     const r = run(layout, { mode: "oam", pathDirs: [shimDir, exeDir] });
-    // The .exe is empty so it cannot actually run, but the message naming it
-    // proves discovery chose it over the shim that came first.
-    expect(r.stderr).toMatch(/oam\.exe/);
-    expect(r.stderr).not.toMatch(/oam\.cmd/);
+    expect(r.status).toBe(1);
+    // The .exe is empty so it cannot actually run, but the message naming it as
+    // a probed candidate proves discovery reached it past the shim that came
+    // first. The shim is only ever named as a shape Node cannot execute.
+    expect(r.stderr).toContain(`${join(exeDir, "oam.exe")} could not be run`);
+    expect(r.stderr).not.toMatch(/oam\.cmd could not be run/);
+    expect(r.stderr).toMatch(/oam\.cmd, but Node cannot execute a \.cmd\/\.bat directly/);
   });
 
-  it.skipIf(onWindows)("has no shim concept on POSIX -- a bare `oam` is what is looked for", () => {
+  it.skipIf(isWin)("has no shim concept on POSIX -- a bare `oam` is what is looked for", () => {
     const layout = makeLayout();
     const shimDir = dirWith(layout, "oam.cmd", "");
     const r = run(layout, { mode: "oam", pathDirs: [shimDir] });
     expect(r.status).toBe(1);
-    expect(r.stderr).toMatch(/no runnable oam binary was found/);
+    expect(r.stderr).toMatch(/no usable oam/);
     expect(r.stderr).not.toMatch(/\.cmd/);
   });
 });
@@ -407,12 +695,12 @@ describe("launcher: signal handling (POSIX only)", () => {
   // Verified out-of-band against node 18 under WSL before these were written:
   //   graceful child -> exit 0,   child caught SIGINT,  no SIGKILL
   //   wedged child   -> exit 130, ~2s after ONE signal (the timer, not a second press)
-  const posix = process.platform !== "win32";
+  const posix = !isWin;
 
   const OAM_SH = [
     "#!/bin/sh",
     // The launcher probes `--version` first; answer at the floor so the gate passes.
-    'case "$1" in --version) echo "oam 0.9.0"; exit 0;; esac',
+    'case "$1" in --version) echo "oam 0.15.2"; exit 0;; esac',
     "shift", // drop the leading "run"
     'exec node "$OAM_CHILD"',
     "",

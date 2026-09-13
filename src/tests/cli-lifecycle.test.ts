@@ -1,5 +1,14 @@
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,8 +26,8 @@ import { afterAll, describe, expect, it } from "vitest";
 //   * the process.on("exit") backstop, the ONLY thing that reaps a self-spawned
 //     ssh-agent when the host closes the pipe -- which fires neither SIGINT nor
 //     SIGTERM
-//   * the launcher preferring an INSTALLED oam over one on PATH
-//   * the exact argv the launcher hands oam, `--` included
+//   * the launcher asking EVERY oam it finds, an installed copy winning a tie
+//   * the exact argv and stdio the launcher hands oam, `--` included
 //   * the launcher mirroring the child's exit status back to the MCP host
 //
 // Both harnesses execute a COPY of the real file in a throwaway layout, the
@@ -243,34 +252,58 @@ const MARKER = "STUB_SERVER";
 const STUB_DIST = `console.log(${JSON.stringify(MARKER)});\n`;
 
 // Intercepts child_process.spawn inside the launcher's own process, recording
-// the argv it built and standing in for the child so a test can choose how that
-// child dies. A real oam cannot be fabricated here: the launcher refuses a
-// .cmd/.bat on Windows by design, and a POSIX shell script cannot report an
-// exit signal it never received. process.execPath -- launcher.test.ts's
+// the argv and stdio it built and standing in for the child so a test can choose
+// how that child dies. A real oam cannot be fabricated here: the launcher
+// refuses a .cmd/.bat on Windows by design, and a POSIX shell script cannot
+// report an exit signal it never received. process.execPath -- launcher.test.ts's
 // stand-in -- exits before it can be asked to exit any particular way.
 //
 // Patching the builtin from a --require preload is enough: Node builds the ESM
 // facade for node:child_process on first import, which happens after preloads
 // run, so the launcher's `import { spawn }` sees the replacement. execFileSync
-// is deliberately left alone, so the version gate stays the real one.
+// is left alone, so the version gate stays the real one -- except for the exact
+// paths a test lists in FAKE_OAM_VERSIONS, whose `--version` it answers. That is
+// the one way to get two binaries reporting DIFFERENT versions on every
+// platform: a Windows oam must be a real .exe, and every runnable .exe this
+// suite can plant is a link to the same node.exe, which always ties.
+//
+// A piped spawn (the launcher's handoff from an oam host) gets real streams to
+// pipe into and out of, and the stand-in emits 'close' after 'exit', because a
+// piped launcher waits for 'close' so the child's last output is copied out.
 const SPAWN_SPY = [
   'const cp = require("node:child_process");',
   'const { EventEmitter } = require("node:events");',
   'const { appendFileSync } = require("node:fs");',
+  'const { PassThrough } = require("node:stream");',
   "cp.spawn = (cmd, args, opts) => {",
   // biome-ignore lint/suspicious/noTemplateCurlyInString: SOURCE TEXT for a preload stub, not a string this file evaluates -- the placeholder must reach that file verbatim.
   "  appendFileSync(process.env.SPAWN_LOG, `${JSON.stringify({ cmd, args, stdio: opts && opts.stdio })}\\n`);",
   "  const child = new EventEmitter();",
   "  child.kill = () => true;",
+  "  if (Array.isArray(opts && opts.stdio)) {",
+  "    child.stdin = new PassThrough();",
+  "    child.stdout = new PassThrough();",
+  "    child.stderr = new PassThrough();",
+  "  }",
   "  setImmediate(() => {",
   '    child.emit("spawn");',
   "    setImmediate(() => {",
   "      const sig = process.env.FAKE_SIGNAL || null;",
   '      const code = sig ? null : Number(process.env.FAKE_CODE ?? "0");',
   '      child.emit("exit", code, sig);',
+  '      child.emit("close", code, sig);',
   "    });",
   "  });",
   "  return child;",
+  "};",
+  'const fakeVersions = JSON.parse(process.env.FAKE_OAM_VERSIONS || "{}");',
+  "const realExecFileSync = cp.execFileSync;",
+  "cp.execFileSync = function (file, args, opts) {",
+  '  if (Array.isArray(args) && args[0] === "--version" && Object.hasOwn(fakeVersions, file)) {',
+  // biome-ignore lint/suspicious/noTemplateCurlyInString: SOURCE TEXT for a preload stub, not a string this file evaluates -- the placeholder must reach that file verbatim.
+  "    return `oam ${fakeVersions[file]}\\n`;",
+  "  }",
+  "  return realExecFileSync.call(this, file, args, opts);",
   "};",
   "",
 ].join("\n");
@@ -307,11 +340,33 @@ function makeLauncherLayout(): LauncherLayout {
   };
 }
 
-/** Plant a fake oam install and return its path. Empty: it only has to EXIST. */
+/**
+ * Plant an UNRUNNABLE oam install and return its path. Empty: it exists, so
+ * discovery finds it, but its version probe fails.
+ */
 function plantOam(dir: string): string {
   mkdirSync(dir, { recursive: true });
   const p = join(dir, OAM_EXE);
   writeFileSync(p, "");
+  return p;
+}
+
+/**
+ * Plant a RUNNABLE oam install and return its path: a hard link to the Node
+ * running this suite, whose `--version` (v18 or newer) clears the floor. Copied
+ * when a link cannot be made (another volume, or a hardlink-protected file).
+ * Two of these are the same version, which is exactly a tie. The spy stands in
+ * for the spawn, so the link is only ever asked for its version.
+ */
+function plantRunnableOam(dir: string): string {
+  mkdirSync(dir, { recursive: true });
+  const p = join(dir, OAM_EXE);
+  try {
+    linkSync(process.execPath, p);
+  } catch {
+    copyFileSync(process.execPath, p);
+    chmodSync(p, 0o755);
+  }
   return p;
 }
 
@@ -323,6 +378,10 @@ interface LauncherOpts {
   spy?: boolean;
   fakeCode?: string;
   fakeSignal?: string;
+  /** Pose as this oam version via a `process.versions.oam` preload. */
+  hostOam?: string;
+  /** path -> the version the spy answers for that exact path's `--version`. */
+  fakeVersions?: Record<string, string>;
 }
 
 function runLauncher(layout: LauncherLayout, opts: LauncherOpts = {}) {
@@ -332,7 +391,11 @@ function runLauncher(layout: LauncherLayout, opts: LauncherOpts = {}) {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (typeof v !== "string") continue;
-    if (/^(path|oam_bin|ssh_mcp_runtime|userprofile|home|localappdata|spawn_log|fake_code|fake_signal)$/i.test(k)) {
+    if (
+      /^(path|oam_bin|ssh_mcp_runtime|userprofile|home|localappdata|spawn_log|fake_code|fake_signal|fake_oam_versions)$/i.test(
+        k,
+      )
+    ) {
       continue;
     }
     env[k] = v;
@@ -348,8 +411,17 @@ function runLauncher(layout: LauncherLayout, opts: LauncherOpts = {}) {
   if (opts.oamBin) env.OAM_BIN = opts.oamBin;
   if (opts.fakeCode !== undefined) env.FAKE_CODE = opts.fakeCode;
   if (opts.fakeSignal) env.FAKE_SIGNAL = opts.fakeSignal;
+  if (opts.fakeVersions) env.FAKE_OAM_VERSIONS = JSON.stringify(opts.fakeVersions);
 
   const nodeArgs = opts.spy ? ["--require", layout.spy] : [];
+  if (opts.hostOam !== undefined) {
+    nodeArgs.push(
+      "--import",
+      `data:text/javascript,${encodeURIComponent(
+        `Object.defineProperty(process.versions, "oam", { value: ${JSON.stringify(opts.hostOam)}, enumerable: true });`,
+      )}`,
+    );
+  }
   const r = spawnSync(process.execPath, [...nodeArgs, layout.entry, ...(opts.args ?? [])], {
     env,
     encoding: "utf8",
@@ -357,60 +429,127 @@ function runLauncher(layout: LauncherLayout, opts: LauncherOpts = {}) {
   return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
 
-/** The one spawn the launcher made. */
-function spawnedWith(layout: LauncherLayout): { cmd: string; args: string[]; stdio: string } {
-  const lines = readFileSync(layout.spawnLog, "utf8").split("\n").filter(Boolean);
-  expect(lines, "expected the launcher to spawn exactly one child").toHaveLength(1);
-  return JSON.parse(lines[0]);
+/** Every spawn the launcher made, in order. */
+function spawnLog(layout: LauncherLayout): { cmd: string; args: string[]; stdio: string | string[] }[] {
+  return readFileSync(layout.spawnLog, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
 }
 
-describe("launcher: an installed oam beats one on PATH", () => {
-  // Deliberate ordering, per the source: someone who develops oam itself has
-  // oam/target/release on PATH, and cargo replaces that binary underneath
-  // running processes. The installed copy is what a normal user actually has.
+/** The one spawn the launcher made. */
+function spawnedWith(layout: LauncherLayout): { cmd: string; args: string[]; stdio: string | string[] } {
+  const calls = spawnLog(layout);
+  expect(calls, "expected the launcher to spawn exactly one child").toHaveLength(1);
+  return calls[0];
+}
+
+/** How many times `needle` occurs in `haystack`. */
+function occurrences(haystack: string, needle: string): number {
+  return haystack.split(needle).length - 1;
+}
+
+describe("launcher: every oam found is asked, and the newest wins", () => {
+  // Discovery used to stop at the FIRST binary that existed -- installed
+  // locations before PATH -- and only then check its version, so a stale or
+  // broken copy early in the search order hid a working one later.
   //
-  // Every fake oam here is an empty file, so the version gate always fails --
-  // and in `oam` mode that failure NAMES the path discovery chose, which is how
-  // these tests observe the decision without a runnable binary to fabricate.
-  it("takes ~/.oam/bin over a PATH hit", () => {
+  // Runnable fakes are hard links to the Node running this suite, so every
+  // runnable candidate reports the same version: a tie, which search order
+  // breaks. Which one won is read off the spy's spawn log. Unrunnable fakes are
+  // empty files; in `oam` mode the failure NAMES every one of them.
+  it("uses a runnable oam on PATH past an unrunnable one installed earlier", () => {
     const layout = makeLauncherLayout();
     const installed = plantOam(join(layout.home, ".oam", "bin"));
-    const onPath = plantOam(join(layout.dir, "pathdir"));
+    const onPath = plantRunnableOam(join(layout.dir, "pathdir"));
 
-    const r = runLauncher(layout, { mode: "oam", pathDirs: [join(layout.dir, "pathdir")] });
-    expect(r.status).toBe(1);
-    expect(r.stderr).toContain(installed);
-    expect(r.stderr).not.toContain(onPath);
+    const r = runLauncher(layout, { mode: "oam", pathDirs: [join(layout.dir, "pathdir")], spy: true });
+    expect(r.status, JSON.stringify(r)).toBe(0);
+    expect(spawnedWith(layout).cmd).toBe(onPath);
+    expect(spawnedWith(layout).cmd).not.toBe(installed);
+  });
+
+  it("uses the newest usable oam, not the first usable one found", () => {
+    // Every candidate here is USABLE, and the first one found (installed, at the
+    // floor) is not the newest. A launcher that took the first binary clearing
+    // the floor would spawn it; the pickNewest() unit test cannot see that,
+    // because it never runs chooseOam(). The spy answers each `--version`.
+    const layout = makeLauncherLayout();
+    const installed = plantOam(join(layout.home, ".oam", "bin"));
+    const newest = plantOam(join(layout.dir, "path-newest"));
+    const middle = plantOam(join(layout.dir, "path-middle"));
+    const pathDirs = [join(layout.dir, "path-newest"), join(layout.dir, "path-middle")];
+    // A shim on PATH too, on Windows: with a usable oam chosen, nothing degraded,
+    // so neither the shim nor the older binaries passed over are named.
+    if (isWin) writeFileSync(join(layout.dir, "path-middle", "oam.cmd"), "@echo off\r\n");
+
+    const r = runLauncher(layout, {
+      mode: "auto",
+      pathDirs,
+      spy: true,
+      fakeVersions: { [installed]: "0.15.2", [newest]: "0.16.0", [middle]: "0.15.9" },
+    });
+    expect(r.status, JSON.stringify(r)).toBe(0);
+    expect(spawnedWith(layout).cmd).toBe(newest);
+    expect(r.stderr).toBe("");
+  });
+
+  it("an installed oam wins a tie with one on PATH", () => {
+    // Deliberate ordering, per the source: someone who develops oam itself has
+    // oam/target/release on PATH, and cargo replaces that binary underneath
+    // running processes. The installed copy is what a normal user actually has.
+    const layout = makeLauncherLayout();
+    const installed = plantRunnableOam(join(layout.home, ".oam", "bin"));
+    plantRunnableOam(join(layout.dir, "pathdir"));
+
+    const r = runLauncher(layout, { mode: "oam", pathDirs: [join(layout.dir, "pathdir")], spy: true });
+    expect(r.status, JSON.stringify(r)).toBe(0);
+    expect(spawnedWith(layout).cmd).toBe(installed);
   });
 
   it("still finds the PATH copy when nothing is installed", () => {
     // The control. Without it, a launcher that had stopped scanning PATH
     // altogether would pass the test above.
     const layout = makeLauncherLayout();
-    const onPath = plantOam(join(layout.dir, "pathdir"));
+    const onPath = plantRunnableOam(join(layout.dir, "pathdir"));
 
-    const r = runLauncher(layout, { mode: "oam", pathDirs: [join(layout.dir, "pathdir")] });
-    expect(r.status).toBe(1);
-    expect(r.stderr).toContain(onPath);
+    const r = runLauncher(layout, { mode: "oam", pathDirs: [join(layout.dir, "pathdir")], spy: true });
+    expect(r.status, JSON.stringify(r)).toBe(0);
+    expect(spawnedWith(layout).cmd).toBe(onPath);
   });
 
-  it.skipIf(!isWin)("checks %LOCALAPPDATA%\\oam\\bin before ~/.oam/bin on Windows", () => {
+  it.skipIf(!isWin)("%LOCALAPPDATA%\\oam\\bin wins a tie with ~/.oam/bin on Windows", () => {
     // The Windows installer's default location. Checking only the documented
     // ~/.oam/bin silently misses a real install.
     const layout = makeLauncherLayout();
-    const appData = plantOam(join(layout.localAppData, "oam", "bin"));
-    const dotOam = plantOam(join(layout.home, ".oam", "bin"));
+    const appData = plantRunnableOam(join(layout.localAppData, "oam", "bin"));
+    plantRunnableOam(join(layout.home, ".oam", "bin"));
 
-    const r = runLauncher(layout, { mode: "oam" });
+    const r = runLauncher(layout, { mode: "oam", spy: true });
+    expect(r.status, JSON.stringify(r)).toBe(0);
+    expect(spawnedWith(layout).cmd).toBe(appData);
+  });
+
+  it("names every unusable oam it found, each one once", () => {
+    // Two distinct binaries, and one of them reachable twice through PATH --
+    // on Windows the second time in a different case, which is the same file.
+    const layout = makeLauncherLayout();
+    const installed = plantOam(join(layout.home, ".oam", "bin"));
+    const pathDir = join(layout.dir, "pathdir");
+    const onPath = plantOam(pathDir);
+    const pathDirs = [pathDir, isWin ? pathDir.toUpperCase() : pathDir];
+
+    const r = runLauncher(layout, { mode: "oam", pathDirs, spy: true });
     expect(r.status).toBe(1);
-    expect(r.stderr).toContain(appData);
-    expect(r.stderr).not.toContain(dotOam);
+    expect(spawnLog(layout), "nothing usable, so nothing may be spawned").toEqual([]);
+    expect(occurrences(r.stderr, installed), r.stderr).toBe(1);
+    expect(occurrences(r.stderr.toLowerCase(), onPath.toLowerCase()), r.stderr).toBe(1);
   });
 });
 
 describe("launcher: the argv handed to oam", () => {
   // process.execPath passes the REAL version gate (`node --version` reports a
-  // semver well above the 0.9.0 floor); the spy only replaces the spawn.
+  // semver well above the 0.15.2 floor); the spy only replaces the spawn.
   it("passes `run <server> --` and forwards host args after the separator", () => {
     const layout = makeLauncherLayout();
     const r = runLauncher(layout, { mode: "oam", oamBin: process.execPath, spy: true, args: ["--version", "extra"] });
@@ -433,6 +572,36 @@ describe("launcher: the argv handed to oam", () => {
     runLauncher(layout, { mode: "oam", oamBin: process.execPath, spy: true });
     expect(spawnedWith(layout).args).toEqual(["run", layout.serverEntry, "--"]);
   });
+
+  it("pipes stdio when handing off from an oam host below the floor", () => {
+    // An old oam treats `stdio: 'inherit'` as `'pipe'`, so an inherited handoff
+    // connects the child to pipes nobody reads and the MCP handshake never
+    // answers. From an oam host the launcher must pipe the streams itself.
+    const layout = makeLauncherLayout();
+    const r = runLauncher(layout, { mode: "auto", oamBin: process.execPath, spy: true, hostOam: "0.9.0" });
+    const call = spawnedWith(layout);
+    expect(call.cmd).toBe(process.execPath);
+    expect(call.args).toEqual(["run", layout.serverEntry, "--"]);
+    expect(call.stdio).toEqual(["pipe", "pipe", "pipe"]);
+    expect(r.stdout).not.toContain(MARKER);
+    expect(r.status, JSON.stringify(r)).toBe(0);
+  });
+
+  it("pipes stdio when handing SSH_MCP_RUNTIME=node off to Node from an oam host", () => {
+    const layout = makeLauncherLayout();
+    const nodeDir = join(layout.dir, "nodedir");
+    mkdirSync(nodeDir);
+    const node = join(nodeDir, isWin ? "node.exe" : "node");
+    // Only has to EXIST: Node on PATH is found by stat, and the spy runs nothing.
+    writeFileSync(node, "");
+    const r = runLauncher(layout, { mode: "node", pathDirs: [nodeDir], spy: true, hostOam: "0.15.2", args: ["x"] });
+    const call = spawnedWith(layout);
+    expect(call.cmd).toBe(node);
+    // Node takes the entry directly: no `run`, no separator.
+    expect(call.args).toEqual([layout.serverEntry, "x"]);
+    expect(call.stdio).toEqual(["pipe", "pipe", "pipe"]);
+    expect(r.status, JSON.stringify(r)).toBe(0);
+  });
 });
 
 describe("launcher: the child's exit status is mirrored", () => {
@@ -454,5 +623,12 @@ describe("launcher: the child's exit status is mirrored", () => {
     const layout = makeLauncherLayout();
     const r = runLauncher(layout, { mode: "oam", oamBin: process.execPath, spy: true, fakeSignal: "SIGTERM" });
     expect(r.status).toBe(143); // 128 + SIGTERM(15)
+  });
+
+  it("returns the child's code from a piped handoff too", () => {
+    // Piped, the launcher mirrors on 'close' rather than 'exit'.
+    const layout = makeLauncherLayout();
+    const r = runLauncher(layout, { oamBin: process.execPath, spy: true, hostOam: "0.9.0", fakeCode: "3" });
+    expect(r.status).toBe(3);
   });
 });
