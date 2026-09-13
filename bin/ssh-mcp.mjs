@@ -59,7 +59,7 @@
  * SELECTION
  *   SSH_MCP_RUNTIME=oam    require oam; fail loudly if it is missing
  *                            (already running on oam satisfies it)
- *   SSH_MCP_RUNTIME=node   never use oam
+ *   SSH_MCP_RUNTIME=node   never spawn oam; run on whatever started this file
  *   SSH_MCP_RUNTIME=auto   prefer oam, silently fall back (default)
  *   OAM_BIN=/path/to/oam     explicit binary, checked before any discovery
  */
