@@ -456,9 +456,9 @@ async function launchChild(cmd, args, onLaunchFailed) {
   // Everything that assumes a live child waits for 'spawn'. A failed spawn
   // still emits 'close' (after 'error', with the negative errno as its code), so
   // an unguarded close handler would process.exit() out from under the fallback
-  // onLaunchFailed has just started -- and stdin piped into a child that never
-  // ran would swallow the host's first bytes before the fallback could read
-  // them. Until 'spawn', process.stdin has no reader and simply stays paused.
+  // onLaunchFailed has just started. Piping and signal forwarding wait as well,
+  // so a child that never ran is never handed the host's stdin or its signals:
+  // nothing in this file reads process.stdin before 'spawn'.
   let spawned = false;
   child.on("spawn", () => {
     spawned = true;
@@ -574,13 +574,17 @@ async function handOffToNode(reason) {
   });
 }
 
-/** No usable oam, under a mode that allows Node. */
-async function fallBackToNode(hostOam) {
+/**
+ * No usable oam, or the chosen one would not start, under a mode that allows
+ * Node. `why` finishes the handoff note on an oam host, so a failed spawn --
+ * already named on stderr -- is not then reported as nothing being found.
+ */
+async function fallBackToNode(hostOam, why) {
   if (hostOam === undefined) {
     await runInProcess();
     return;
   }
-  await handOffToNode(`this process is oam ${hostOam}, older than ${OAM_MIN.join(".")}, and no newer oam was found`);
+  await handOffToNode(`this process is oam ${hostOam}, older than ${OAM_MIN.join(".")}, and ${why}`);
 }
 
 const mode = (process.env.SSH_MCP_RUNTIME ?? "auto").toLowerCase();
@@ -606,7 +610,7 @@ if (plan === "in-process") {
         process.exit(1);
       }
       await errSync(`ssh-mcp: failed to launch oam at ${chosen.path} (${err?.message ?? err}); using Node instead.\n`);
-      await fallBackToNode(hostOam);
+      await fallBackToNode(hostOam, "the newer oam would not start");
     });
   } else {
     const shim = findOamShim();
@@ -637,6 +641,6 @@ if (plan === "in-process") {
     // with console.log + process.exit(0) (src/index.ts) -- and that exit
     // truncates a pending async stderr write on Windows TTYs and pipes.
     if (notes.length > 0) await errSync(`ssh-mcp: ${notes.join("; ")}; using Node instead.\n`);
-    await fallBackToNode(hostOam).catch(fallbackFailed);
+    await fallBackToNode(hostOam, "no newer oam was found").catch(fallbackFailed);
   }
 }

@@ -594,6 +594,12 @@ describe("launcher: an oam host below the floor never serves", () => {
       });
       expect(r.status, JSON.stringify(r)).toBe(0);
       expect(r.stderr).toMatch(/^ssh-mcp: failed to launch oam at .*; using Node instead\.$/m);
+      // A newer oam WAS found; it just would not start. The handoff note must
+      // not then claim that nothing was found.
+      expect(r.stderr).toMatch(
+        /older than 0\.15\.2, and the newer oam would not start; running on .*node(\.exe)? instead/,
+      );
+      expect(r.stderr).not.toMatch(/no newer oam was found/);
       const payload = stubPayload(r.stdout);
       expect(payload.pid, "the Node fallback must still serve, in a child").not.toBe(r.pid);
       expect(payload.oam).toBeNull();

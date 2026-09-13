@@ -10,16 +10,16 @@ import { createServer, version } from "./server.js";
 // from the workstation via ./release.sh.
 //
 // 1. bin/ssh-mcp.mjs, in-process path. The launcher runs this module IN-PROCESS
-//    (`await import(dist/index.js)` in runInProcess, bin/ssh-mcp.mjs:378-391)
+//    (`await import(dist/index.js)` in runInProcess, bin/ssh-mcp.mjs:382-395)
 //    rather than spawning it, so a `ssh-mcp --version` that reached main() would
 //    connect a stdio transport and hang instead of printing. The process.exit(0)
 //    below is the only thing that ends that invocation, and the launcher is
 //    written around it: it flushes its own stderr synchronously first (errSync,
-//    bin/ssh-mcp.mjs:620-624) because this exit truncates a pending async write
+//    bin/ssh-mcp.mjs:639-643) because this exit truncates a pending async write
 //    on Windows TTYs and pipes. Taken on Node, and on a host that is already oam
 //    at or above the launcher's floor (ALREADY RUNNING ON OAM in its header).
 // 2. bin/ssh-mcp.mjs, spawned paths. `oam run <entry> -- ...process.argv.slice(2)`
-//    (bin/ssh-mcp.mjs:588), and `node <entry> ...process.argv.slice(2)` when an
+//    (bin/ssh-mcp.mjs:607), and `node <entry> ...process.argv.slice(2)` when an
 //    oam host hands off to Node (handOffToNode), forward the flag unchanged into
 //    a subprocess running this same module, so the answer has to come from here
 //    either way.

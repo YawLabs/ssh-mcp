@@ -317,7 +317,7 @@ Two environment variables control the choice; set them in your MCP client's `env
 
 Discovery looks in `%LOCALAPPDATA%\oam\bin` (Windows only), then `~/.oam/bin`, then every directory on `PATH`; asks every oam binary it finds for its version; and uses the newest one at 0.15.2 or newer. On a tie the one found first wins, so an installed copy beats one on `PATH`. On Windows only `oam.exe` counts: an `oam.cmd`/`oam.bat` shim on `PATH` is never run, and is named on stderr when no usable oam is found.
 
-By default an unusable oam is not an error: in `auto` mode the launcher falls back to Node — silently when there was nothing to find, or with a note on stderr naming each oam (and `OAM_BIN`) it passed over and why: older than 0.15.2, not runnable, or a shim. With `SSH_MCP_RUNTIME=oam`, each of these cases exits with status 1 instead.
+By default an unusable oam is not an error. When Node starts the launcher (`npx` or a global install, run directly by your MCP client), `auto` mode falls back to Node — silently when there was nothing to find, or with a note on stderr naming each oam (and `OAM_BIN`) it passed over and why: older than 0.15.2, not runnable, or a shim. A chosen oam that then fails to start is named on stderr too. When an older oam starts the launcher, the handoff to Node is always noted on stderr (see below). With `SSH_MCP_RUNTIME=oam`, each of these cases exits with status 1 instead.
 
 When the launcher is itself started by oam (`oam run <path>/bin/ssh-mcp.mjs`, which is how Yaw MCP starts an `npx @yawlabs/ssh-mcp` entry when a recent oam is installed):
 
