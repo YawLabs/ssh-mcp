@@ -303,10 +303,37 @@ for (const check of report.checks) {
 }
 ```
 
+## Runtime selection
+
+The `ssh-mcp` command — what `npx @yawlabs/ssh-mcp` runs — is a small launcher. It prefers the [oam](https://oamjs.org) runtime and otherwise runs the server on Node, so oam is optional. Two environment variables control the choice; set them in your MCP client's `env` block:
+
+- `SSH_MCP_RUNTIME` — which runtime to use. Case-insensitive; any value other than `oam` or `node` behaves as `auto`.
+  - `auto` (default) — use oam if it is usable, otherwise fall back to Node.
+  - `oam` — require oam. Fails loudly: if oam is missing or unusable, the launcher prints the reason to stderr and exits with status 1 instead of starting the server.
+  - `node` — never use oam. The launcher does not look for it, and `OAM_BIN` is ignored.
+- `OAM_BIN` — path to a specific oam binary. When set to a non-empty value it wins over discovery and nothing else is searched, so a path that does not exist counts as no oam found even if a working oam is installed elsewhere. Without it, the launcher takes the first oam it finds in `%LOCALAPPDATA%\oam\bin` (Windows only), then `~/.oam/bin`, then `PATH`, and does not keep looking if that one is unusable.
+
+oam must be **0.9.0 or newer**. By default an unusable oam is not an error: in `auto` mode the launcher falls back to Node — silently when no oam is found (including an `OAM_BIN` path that does not exist), or with a note on stderr when it finds one it cannot use: older than 0.9.0, not runnable, or on Windows only an `oam.cmd`/`oam.bat` shim on `PATH`. With `SSH_MCP_RUNTIME=oam`, each of these cases exits with status 1 instead.
+
+```json
+{
+  "mcpServers": {
+    "ssh": {
+      "command": "npx",
+      "args": ["-y", "@yawlabs/ssh-mcp@latest"],
+      "env": { "SSH_MCP_RUNTIME": "node" }
+    }
+  }
+}
+```
+
+On Windows, add the same `env` block to the `cmd /c` form from [Quick start](#quick-start).
+
 ## Requirements
 
 - Node.js 18+
 - SSH client installed (for diagnostics and environment management)
+- Optional: [oam](https://oamjs.org) 0.9.0+ — see [Runtime selection](#runtime-selection)
 
 ## License
 
