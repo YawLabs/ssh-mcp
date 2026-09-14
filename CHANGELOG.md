@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] — 2026-09-14
+
 ### Added
 - Library API: `acquire()` now rejects a full pool with a `PoolFullError` carrying `code: "ERR_SSH_MCP_POOL_FULL"` (`POOL_FULL_ERROR_CODE`, matched by `isPoolFullError()`), and `ConnectionPool.waitForCapacity(timeoutMs, signal?)` parks a caller until a slot may be free, resolving `true` on a wake and `false` on timeout or when `signal` aborts. `acquire()` and `withConnection()` still fail fast by default; pass `{ waitForCapacityMs }` (`AcquireOptions`) and they park on that primitive and retry on every capacity signal until a slot is won or the budget is spent, then reject with a `PoolFullError` whose message says `no slot became available to this call within <n>ms`. `ConnectionPool.maxSize` (read-only) exposes the cap; `multiExec()` runs at most that many hosts at once, and runs unbounded against a pool-like that lacks it. The rejection message's parenthetical changed — `N connections in use or dialing, the SSH_MCP_MAX_POOL_SIZE cap`, was `N active connections` — so match on `code` / `isPoolFullError()`, not the text. Every pool-backed tool uses the wait, as described below.
 

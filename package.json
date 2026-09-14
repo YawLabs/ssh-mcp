@@ -1,6 +1,6 @@
 {
   "name": "@yawlabs/ssh-mcp",
-  "version": "0.16.1",
+  "version": "0.17.0",
   "mcpName": "io.github.YawLabs/ssh-mcp",
   "description": "SSH MCP server: run remote commands, transfer files over SFTP, manage ssh-agent keys and known_hosts, and auto-diagnose SSH failures.",
   "type": "module",
