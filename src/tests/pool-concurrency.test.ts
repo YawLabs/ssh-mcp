@@ -275,9 +275,7 @@ describe("ConnectionPool — maxPoolSize eviction", () => {
     try {
       const c1 = await pool.acquire({ host: "env-cap-1.example.com" });
       const c2 = await pool.acquire({ host: "env-cap-2.example.com" });
-      await expect(pool.acquire({ host: "env-cap-3.example.com" })).rejects.toThrow(
-        /Connection pool is full \(2 active connections\)/,
-      );
+      await expect(pool.acquire({ host: "env-cap-3.example.com" })).rejects.toThrow(/Connection pool is full \(2 /);
       pool.release(c1);
       pool.release(c2);
     } finally {
@@ -286,11 +284,15 @@ describe("ConnectionPool — maxPoolSize eviction", () => {
   });
 
   // Pins the fallback to EXACTLY 100: 100 held connections succeed and the 101st is
-  // refused. "-1" catches a sign flip (Math.abs would yield cap 1); the 400-digit value
-  // makes Number.parseInt return Infinity, which only the Number.isFinite guard rejects.
+  // refused. "" takes the early `!raw` return that an unset var shares, and is the only
+  // row that pins that return's constant (the other rows reach the final fallback). "-1"
+  // catches a sign flip (Math.abs would yield cap 1); the 400-digit value makes
+  // Number.parseInt return Infinity, which only the Number.isFinite guard rejects.
   // Distinct ports on one host give 100 distinct pool keys while paying for a single
-  // memoized `ssh -G` spawn instead of 101.
+  // memoized `ssh -G` spawn instead of 101. The regexes pin the number but not the
+  // words after it, so a rewording of the pool-full message does not break them.
   it.each([
+    { label: '"" (empty/unset)', value: "" },
     { label: "0", value: "0" },
     { label: "-1", value: "-1" },
     { label: "not-a-number", value: "not-a-number" },
@@ -308,7 +310,7 @@ describe("ConnectionPool — maxPoolSize eviction", () => {
       expect(pool.size).toBe(100);
       expect(mockedConnect).toHaveBeenCalledTimes(100);
       await expect(pool.acquire({ host: "fallback-cap.example.com", port: 10_100 })).rejects.toThrow(
-        /Connection pool is full \(100 active connections\)/,
+        /Connection pool is full \(100 /,
       );
       for (const c of clients) pool.release(c);
     } finally {
