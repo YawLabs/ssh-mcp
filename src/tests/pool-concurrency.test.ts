@@ -285,4 +285,30 @@ describe("ConnectionPool — maxPoolSize eviction", () => {
       vi.unstubAllEnvs();
     }
   });
+
+  it.each([
+    "0",
+    "-5",
+    "not-a-number",
+  ])("falls back to the default pool cap when SSH_MCP_MAX_POOL_SIZE=%s", async (invalidValue) => {
+    vi.stubEnv("SSH_MCP_MAX_POOL_SIZE", invalidValue);
+    vi.resetModules();
+    vi.doMock("../ssh.js", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("../ssh.js")>();
+      return { ...actual, connectWithProxy: vi.fn().mockImplementation(async () => makeFakeClient()) };
+    });
+    const fresh = await import("../pool.js");
+    const pool = new fresh.ConnectionPool();
+    try {
+      await pool.acquire({ host: "invalid-cap-1.example.com" });
+      await pool.acquire({ host: "invalid-cap-2.example.com" });
+      await pool.acquire({ host: "invalid-cap-3.example.com" });
+      expect(pool.size).toBe(3);
+      expect(pool.connectCount).toBe(3);
+    } finally {
+      pool.drain();
+      vi.doUnmock("../ssh.js");
+      vi.unstubAllEnvs();
+    }
+  });
 });
