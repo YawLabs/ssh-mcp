@@ -2,6 +2,13 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.YawLabs/ssh-mcp",
   "description": "MCP server for SSH operations with built-in diagnostics",
+  "title": "SSH MCP Server",
+  "repository": {
+    "url": "https://github.com/YawLabs/ssh-mcp",
+    "source": "github",
+    "id": "1205491307"
+  },
+  "websiteUrl": "https://yaw.sh/mcp-servers/ssh-mcp/",
   "version": "0.16.0",
   "packages": [
     {

@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - `scripts/build-binary.mjs`: dropped the stale comment claiming the bundle entry is derived from `bin` "regardless of the server's entry filename". It contradicted the pinned `srcEntry` constant directly below it, and this script is copy-pasted across the `@yawlabs/*` servers, so the contradiction travelled with it.
+- npm and MCP Registry listing metadata: bugs URL, core keywords, and server.json title/repository/websiteUrl
 
 ## [0.13.0] — 2026-08-07
 

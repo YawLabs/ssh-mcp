@@ -46,13 +46,18 @@
     "diagnostics",
     "devops",
     "ai",
-    "ai-agents"
+    "ai-agents",
+    "claude-code",
+    "cursor"
   ],
   "author": "Yaw Labs <contact@yaw.sh>",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/YawLabs/ssh-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/YawLabs/ssh-mcp/issues"
   },
   "engines": {
     "node": ">=18"
