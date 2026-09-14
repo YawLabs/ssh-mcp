@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Mock only connectWithProxy — everything else in ssh.js (resolveConfig,
 // hostVerifier, readKnownHostsKeys, etc.) keeps its real implementation so the
@@ -222,6 +222,11 @@ describe("ConnectionPool — maxPoolSize eviction", () => {
     mockedConnect.mockReset();
     mockedConnect.mockImplementation(async () => makeFakeClient());
   });
+  // Runs even when an assertion throws mid-test, so a stubbed SSH_MCP_MAX_POOL_SIZE
+  // can never leak into a later test.
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
 
   it("evicts an idle entry to make room for a new host when at capacity", async () => {
     const pool = new ConnectionPool({ maxPoolSize: 2 });
@@ -261,28 +266,55 @@ describe("ConnectionPool — maxPoolSize eviction", () => {
     }
   });
 
+  // defaultMaxPoolSize() reads process.env on every ConnectionPool construction, so a
+  // stubbed env plus the file-level (already mocked) ConnectionPool is enough -- no
+  // module reset or re-import needed.
   it("uses SSH_MCP_MAX_POOL_SIZE as the default cap when no maxPoolSize option is passed", async () => {
     vi.stubEnv("SSH_MCP_MAX_POOL_SIZE", "2");
-    vi.resetModules();
-    // Re-import after stubEnv so module-level defaultMaxPoolSize() sees the new value
-    // and re-import the mocked ssh.js (vi.mock at the top of this file applies to
-    // resolved imports, but vi.resetModules() clears them — re-mock through fresh).
-    vi.doMock("../ssh.js", async (importOriginal) => {
-      const actual = await importOriginal<typeof import("../ssh.js")>();
-      return { ...actual, connectWithProxy: vi.fn().mockImplementation(async () => makeFakeClient()) };
-    });
-    const fresh = await import("../pool.js");
-    const pool = new fresh.ConnectionPool(); // no explicit maxPoolSize -- should pick up env
+    const pool = new ConnectionPool(); // no explicit maxPoolSize -- should pick up env
     try {
       const c1 = await pool.acquire({ host: "env-cap-1.example.com" });
       const c2 = await pool.acquire({ host: "env-cap-2.example.com" });
-      await expect(pool.acquire({ host: "env-cap-3.example.com" })).rejects.toThrow(/Connection pool is full/);
+      await expect(pool.acquire({ host: "env-cap-3.example.com" })).rejects.toThrow(/Connection pool is full \(2 /);
       pool.release(c1);
       pool.release(c2);
     } finally {
       pool.drain();
-      vi.doUnmock("../ssh.js");
-      vi.unstubAllEnvs();
+    }
+  });
+
+  // Pins the fallback to EXACTLY 100: 100 held connections succeed and the 101st is
+  // refused. "" takes the early `!raw` return that an unset var shares, and is the only
+  // row that pins that return's constant (the other rows reach the final fallback). "-1"
+  // catches a sign flip (Math.abs would yield cap 1); the 400-digit value makes
+  // Number.parseInt return Infinity, which only the Number.isFinite guard rejects.
+  // Distinct ports on one host give 100 distinct pool keys while paying for a single
+  // memoized `ssh -G` spawn instead of 101. The regexes pin the number but not the
+  // words after it, so a rewording of the pool-full message does not break them.
+  it.each([
+    { label: '"" (empty/unset)', value: "" },
+    { label: "0", value: "0" },
+    { label: "-1", value: "-1" },
+    { label: "not-a-number", value: "not-a-number" },
+    { label: '"9" x 400 (parseInt -> Infinity)', value: "9".repeat(400) },
+  ])("falls back to the default pool cap of exactly 100 when SSH_MCP_MAX_POOL_SIZE=$label", async ({ value }) => {
+    vi.stubEnv("SSH_MCP_MAX_POOL_SIZE", value);
+    const pool = new ConnectionPool();
+    try {
+      const clients = [];
+      // Sequential on purpose: the cap is checked against registered entries, which
+      // concurrent in-flight dials have not joined yet.
+      for (let i = 0; i < 100; i++) {
+        clients.push(await pool.acquire({ host: "fallback-cap.example.com", port: 10_000 + i }));
+      }
+      expect(pool.size).toBe(100);
+      expect(mockedConnect).toHaveBeenCalledTimes(100);
+      await expect(pool.acquire({ host: "fallback-cap.example.com", port: 10_100 })).rejects.toThrow(
+        /Connection pool is full \(100 /,
+      );
+      for (const c of clients) pool.release(c);
+    } finally {
+      pool.drain();
     }
   });
 });
