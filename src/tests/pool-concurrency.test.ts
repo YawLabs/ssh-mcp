@@ -523,6 +523,41 @@ describe("ConnectionPool — maxPoolSize eviction", () => {
     }
   });
 
+  it("waitForCapacity ends a park on abort with false and clears its timer; a wake that lands first still wins", async () => {
+    // multiExec aborts its parks when it declares a call starved, so a sibling that parked for a
+    // fresh budget does not sit that budget out. Timer counts are checked BEFORE each await, so an
+    // ignored abort fails on the count (its 60s timer still armed), not on the test timeout.
+    vi.useFakeTimers();
+    const pool = new ConnectionPool({ maxPoolSize: 1 });
+    try {
+      const held = await pool.acquire({ host: "abort-held.example.com" });
+      const starved = new AbortController();
+      const parked = pool.waitForCapacity(60_000, starved.signal);
+      expect(vi.getTimerCount()).toBe(1);
+      starved.abort();
+      expect(vi.getTimerCount()).toBe(0); // the abort cleared the wait timer
+      expect(await parked).toBe(false); // gave up, not woken: the pool is still full
+
+      // An already-aborted signal does not park at all.
+      const late = pool.waitForCapacity(60_000, starved.signal);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(await late).toBe(false);
+
+      // Woken first: the later abort changes nothing, and the wake dropped its abort listener.
+      const other = new AbortController();
+      const removed = vi.spyOn(other.signal, "removeEventListener");
+      const woken = pool.waitForCapacity(60_000, other.signal);
+      pool.release(held); // arms the idle timer, wakes the waiter
+      other.abort();
+      expect(await woken).toBe(true);
+      expect(removed).toHaveBeenCalledWith("abort", expect.any(Function));
+      expect(vi.getTimerCount()).toBe(1); // only the idle timer
+    } finally {
+      pool.drain();
+      vi.useRealTimers();
+    }
+  });
+
   it("acquire({ waitForCapacityMs }) parks for a slot; a spent budget names itself; a connect failure is not waited out", async () => {
     const pool = new ConnectionPool({ maxPoolSize: 1 });
     try {
@@ -538,7 +573,7 @@ describe("ConnectionPool — maxPoolSize eviction", () => {
       // The text reaches an MCP caller verbatim as the tool result, so both forms name the knob
       // and the waited form says what to do.
       expect((spent as Error).message).toBe(
-        "Connection pool is full (1 connections in use or dialing, the SSH_MCP_MAX_POOL_SIZE cap); no slot became available to this call within 20ms. Retry once the calls holding the slots finish, or raise SSH_MCP_MAX_POOL_SIZE in the server's environment.",
+        "Connection pool is full (1 connections in use or dialing, the SSH_MCP_MAX_POOL_SIZE cap); no slot became available to this call within 20ms. Retry once the calls holding the slots finish, or raise the cap (SSH_MCP_MAX_POOL_SIZE in the MCP server's environment).",
       );
       expect(mockedConnect).toHaveBeenCalledTimes(1); // never dialed
       // A bare acquire() is unchanged: fail-fast, no suffix.

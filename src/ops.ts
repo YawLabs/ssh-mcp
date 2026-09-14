@@ -72,7 +72,8 @@ export async function multiExec(
   //      parked count against the workers still in the loop (`running`), not against `limit`.
   // A parked worker waits out what is left of the budget. When it runs out while an own host
   // still holds a slot, the worker parks again for a full `timeoutMs`, as often as it takes:
-  // that slot is bounded (a dial by ssh2's readyTimeout, a command by exec()'s own
+  // that slot is bounded (a dial by ssh2's readyTimeout on each handshake and, through a
+  // ProxyJump, by the jump client's keepalive on the channel-open; a command by exec()'s own
   // `timeoutMs` plus teardown), and its release or failed dial is a capacity signal that
   // wakes the worker to retry at once. Every wait is a real timed park of at least 1ms,
   // never a retry spin. Without rule 2 a call raced its own hosts: a host stamps progress
@@ -88,6 +89,8 @@ export async function multiExec(
   let lastProgressAt = performance.now();
   // Once set, the call is starved: every host still queued reports this without a dial.
   let starvedError: string | undefined;
+  // Aborted with the verdict, so every park of this call ends at once (see the starved branch).
+  const starvation = new AbortController();
   // Workers still taking hosts from the queue, and how many of them are parked on the pool.
   // A running worker that is not parked holds a slot, or is a few microtasks from taking or
   // being refused one (see rule 2 above).
@@ -154,12 +157,17 @@ export async function multiExec(
           // Starved. The pool's suffix would name only this wait; report the call-level bound
           // instead, the same text for every host.
           starvedError ??= new PoolFullError(rejection.maxPoolSize, timeoutMs).message;
+          // End the call's other parks now. A sibling that re-parked for a fresh budget in the
+          // same turn -- counted as holding a slot while it was still between its rejection and
+          // its park -- would otherwise sit out that whole timer, since nothing in the pool
+          // changed to wake it, and the call would settle one `timeoutMs` after the verdict.
+          starvation.abort();
           return errorResult(hostConfig.host, starvedError);
         }
         parked++;
         let woken: boolean;
         try {
-          woken = await pool.waitForCapacity(waitMs);
+          woken = await pool.waitForCapacity(waitMs, starvation.signal);
         } finally {
           parked--;
         }

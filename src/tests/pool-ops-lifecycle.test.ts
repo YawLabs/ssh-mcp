@@ -315,6 +315,15 @@ describe("multiExec — waits for pool capacity held by OTHER callers", () => {
   const fleet = (prefix: string, n: number): MultiExecHost[] =>
     Array.from({ length: n }, (_, i) => ({ host: `${prefix}-${i}.test` }));
 
+  // resolveConfig memoizes a synchronous `ssh -G` spawn per host (hundreds of ms each on
+  // Windows, far more under load). Resolving a fleet up front keeps those stalls out of a
+  // real-timer run, so a short `timeout` there bounds the pool wait and nothing else.
+  const warmResolve = (hosts: MultiExecHost[]) => {
+    for (const h of hosts) resolveConfig(h);
+  };
+  // Every dial's host, in dial order.
+  const dialOrder = () => mockedConnect.mock.calls.map(([resolved]) => String(resolved.connectConfig.host));
+
   beforeEach(() => {
     vi.useRealTimers();
     mockedConnect.mockReset();
@@ -330,12 +339,20 @@ describe("multiExec — waits for pool capacity held by OTHER callers", () => {
       // e.g. a long-running ssh_exec holding one of the three slots for the whole fan-out.
       const held = await pool.acquire({ host: "held-outside.test" });
       const hosts = fleet("outside", 9);
+      warmResolve(hosts);
 
-      const results = await multiExec(pool, hosts, "hostname");
+      // A short budget, so a lost release notify fails on an assertion, not on the test timeout.
+      const results = await multiExec(pool, hosts, "hostname", 2_000);
 
       expect(results.map((r) => r.error)).toEqual(hosts.map(() => undefined));
       expect(results.map((r) => r.stdout)).toEqual(hosts.map((h) => `out:${h.host}\n`));
       expect(stats.peak).toBeLessThanOrEqual(3);
+      // The results alone do not prove the wake: with release() notifying nobody, the worker
+      // parked on outside-2 still finishes once its timer runs out and its re-park's capacity
+      // re-check finds an idle entry -- after its siblings have run every other host. Woken by
+      // the first release, it dials before the last host does.
+      const dials = dialOrder();
+      expect(dials.indexOf(hosts[2].host)).toBeLessThan(dials.indexOf(hosts[8].host));
       pool.release(held);
     } finally {
       pool.drain();
@@ -348,8 +365,13 @@ describe("multiExec — waits for pool capacity held by OTHER callers", () => {
     try {
       const first = fleet("first", 8);
       const second = fleet("second", 8);
+      warmResolve([...first, ...second]);
 
-      const [a, b] = await Promise.all([multiExec(pool, first, "hostname"), multiExec(pool, second, "hostname")]);
+      // A short budget, so a lost release notify fails on the error arrays, not on the test timeout.
+      const [a, b] = await Promise.all([
+        multiExec(pool, first, "hostname", 2_000),
+        multiExec(pool, second, "hostname", 2_000),
+      ]);
 
       expect(a.map((r) => r.error)).toEqual(first.map(() => undefined));
       expect(b.map((r) => r.error)).toEqual(second.map(() => undefined));
@@ -470,6 +492,7 @@ describe("multiExec — waits for pool capacity held by OTHER callers", () => {
     const pool = new ConnectionPool({ maxPoolSize: 3 });
     try {
       const hosts = fleet("fanout", 9);
+      warmResolve([...hosts, { host: "single.test" }]);
       let fanOutSettled = false;
       const fanOut = multiExec(pool, hosts, "hostname").then((r) => {
         fanOutSettled = true;
@@ -481,8 +504,10 @@ describe("multiExec — waits for pool capacity held by OTHER callers", () => {
       // The default is still fail-fast (the precondition: the pool really is full right now).
       await expect(pool.withConnection({ host: "single.test" }, async () => "never")).rejects.toThrow(PoolFullError);
 
+      // Next in line, it wins a slot within one command of arriving. A short budget, so a lost
+      // release notify fails on `fanOutSettled` below, not on the test timeout.
       const single = await pool.withConnection({ host: "single.test" }, (client) => exec(client, "hostname", 1_000), {
-        waitForCapacityMs: 30_000,
+        waitForCapacityMs: 2_000,
       });
       expect(single.stdout).toBe("out:single.test\n");
       expect(fanOutSettled).toBe(false); // it ran INSIDE the fan-out, not after it
@@ -528,7 +553,7 @@ describe("multiExec — waits for pool capacity held by OTHER callers", () => {
       for (const r of results) {
         expect(r.code).toBe(-1);
         expect(r.error).toBe(
-          `Connection pool is full (4 connections in use or dialing, the SSH_MCP_MAX_POOL_SIZE cap); no slot became available to this call within ${BOUND}ms. Retry once the calls holding the slots finish, or raise SSH_MCP_MAX_POOL_SIZE in the server's environment.`,
+          `Connection pool is full (4 connections in use or dialing, the SSH_MCP_MAX_POOL_SIZE cap); no slot became available to this call within ${BOUND}ms. Retry once the calls holding the slots finish, or raise the cap (SSH_MCP_MAX_POOL_SIZE in the MCP server's environment).`,
         );
       }
       // Only the first host of each of the min(hosts, cap) workers was ever handed to the pool;
@@ -536,6 +561,45 @@ describe("multiExec — waits for pool capacity held by OTHER callers", () => {
       expect(attempts).toHaveBeenCalledTimes(4);
       expect(mockedConnect).toHaveBeenCalledTimes(4); // the hogs only
       expect(vi.getTimerCount()).toBe(0);
+      for (const c of held) pool.release(c);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("settles at the starvation verdict, not one timeout later, when the workers reach the pool after a stall", async () => {
+    // A stall longer than the budget (a cold `ssh -G` per host of the first wave, any blocked
+    // event loop) before the workers reach the park loop: each but the last finds the budget
+    // spent while a sibling still counts as holding a slot -- it is between its rejection and
+    // its park -- so it parks for a fresh budget, and the last declares the call starved.
+    // Nothing in the pool changes to wake those fresh parks, so unless the verdict ends them
+    // the call settles a full budget after it, with the same all-pool-full results (measured at
+    // T = 100: stall over at +202ms, call settled at +318ms). Real timers: the stall is a
+    // busy-wait, which fake timers cannot model.
+    mockedConnect.mockImplementation(async () => makeQuietClient() as never);
+    const pool = new ConnectionPool({ maxPoolSize: 3 });
+    try {
+      const held = await Promise.all(fleet("stall-hog", 3).map((h) => pool.acquire(h))); // every slot
+      const hosts = fleet("stalled", 6);
+      warmResolve(hosts); // the busy-wait below is the only stall
+      const T = 200;
+      let settledAt: number | undefined;
+      const run = multiExec(pool, hosts, "true", T).then((r) => {
+        settledAt = performance.now();
+        return r;
+      });
+      // Every worker has been refused synchronously and is suspended before its first await.
+      const stallStart = performance.now();
+      while (performance.now() - stallStart < 2 * T) {
+        // Busy-wait: the workers' rejections are queued behind this block.
+      }
+      const stallEnd = performance.now();
+
+      const results = await run;
+      expect(results.map((r) => /^Connection pool is full \(/.test(r.error ?? ""))).toEqual(hosts.map(() => true));
+      expect(mockedConnect).toHaveBeenCalledTimes(3); // the hogs only
+      // Settled on microtasks after the stall; an unaborted fresh park would add a whole T.
+      expect((settledAt ?? Number.NaN) - stallEnd).toBeLessThan(T / 2);
       for (const c of held) pool.release(c);
     } finally {
       pool.drain();

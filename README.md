@@ -118,8 +118,8 @@ Remote operations reuse SSH connections automatically. When your agent makes mul
 
 The pool caps at 100 connections by default, and a connection still being dialed counts against the cap. When the cap is reached the pool closes an idle connection to make room. If every slot is in use or dialing, a tool call waits for one instead of failing:
 
-- **A single-host tool** (`ssh_exec`, the SFTP tools, and the rest) waits up to its `timeout` (30s for the SFTP tools, which have none) and is next in line for the first slot that frees, so an `ssh_exec` arriving in the middle of a wide `ssh_multi_exec` runs between two of its hosts rather than being refused for the whole run. It reports `Connection pool is full` only if it never won a slot in that time.
-- **`ssh_multi_exec`** runs at most `SSH_MCP_MAX_POOL_SIZE` hosts at once (default 100) and works through a longer list as slots free up, so raising the cap raises its parallelism; `timeout` is per host, not a bound on the whole call. When the pool is full it waits, and gives up only when none of its own hosts holds a slot and a full `timeout` has passed with none of them starting or finishing. The host waiting at that point and every host still queued then report `Connection pool is full`; the queued ones are never attempted.
+- **A single-host remote tool** (`ssh_exec`, the SFTP tools, `ssh_find`, `ssh_tail`, `ssh_service_status`) waits up to its `timeout` (30s for the SFTP tools, which have no `timeout` parameter) and is next in line for the first slot that frees, so an `ssh_exec` arriving in the middle of a wide `ssh_multi_exec` runs between two of its hosts rather than being refused for the whole run. It reports `Connection pool is full` only if it never won a slot in that time.
+- **`ssh_multi_exec`** runs at most `SSH_MCP_MAX_POOL_SIZE` hosts at once (default 100) and works through a longer list as slots free up, so raising the cap raises its parallelism; `timeout` is per host, not a bound on the whole call. When the pool is full it waits, and gives up only when none of its own hosts holds a slot and a full `timeout` has passed with none of them starting or finishing. The hosts waiting at that point (up to one per parallel slot) and every host still queued then report `Connection pool is full`; the queued ones are never attempted.
 
 A call reaches `Connection pool is full` only when other calls — a long `ssh_exec`, a concurrent `ssh_multi_exec` — kept every slot from it for a full `timeout`; a fan-out wider than the cap that has the pool to itself never does, however long it runs. If you see it, rerun once those calls finish (for `ssh_multi_exec`, the hosts that reported it), or raise the cap with `SSH_MCP_MAX_POOL_SIZE=<n>` in the server's environment. The error names the variable.
 
@@ -299,16 +299,21 @@ await pool.withConnection({ host: 'my-server' }, async (client) => {
   const r2 = await exec(client, 'df -h');
   console.log(r2.stdout);
 });
-// A full pool rejects at once with a PoolFullError (isPoolFullError(err)); pass a budget
-// to wait for a slot instead, the way the tools do
-await pool.withConnection(
-  { host: 'other-server' },
-  async (client) => {
-    const r3 = await exec(client, 'uptime');
-    console.log(r3.stdout);
-  },
-  { waitForCapacityMs: 30_000 },
-);
+// A full pool rejects at once with a PoolFullError; pass a budget to wait for a slot
+// instead, the way the tools do, and match the rejection on its code, not its text
+try {
+  await pool.withConnection(
+    { host: 'other-server' },
+    async (client) => {
+      const r3 = await exec(client, 'uptime');
+      console.log(r3.stdout);
+    },
+    { waitForCapacityMs: 30_000 },
+  );
+} catch (err) {
+  if (!isPoolFullError(err)) throw err;
+  console.log('no slot within 30s:', err.message);
+}
 pool.drain(); // close all connections when done
 
 // Diagnose issues

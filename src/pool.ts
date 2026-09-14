@@ -63,7 +63,7 @@ export class PoolFullError extends Error {
         ? base
         : // "became available to this call", not "freed up": every capacity signal wakes every
           // parked caller, so a slot can free during the wait and still go to someone else.
-          `${base}; no slot became available to this call within ${Math.round(waitedMs)}ms. Retry once the calls holding the slots finish, or raise SSH_MCP_MAX_POOL_SIZE in the server's environment.`,
+          `${base}; no slot became available to this call within ${Math.round(waitedMs)}ms. Retry once the calls holding the slots finish, or raise the cap (SSH_MCP_MAX_POOL_SIZE in the MCP server's environment).`,
     );
     this.name = "PoolFullError";
     this.maxPoolSize = maxPoolSize;
@@ -419,15 +419,27 @@ export class ConnectionPool {
    * rejects. A `true` is a hint, not a reservation: another caller can take the slot first,
    * so retry `acquire()` and wait again on another `PoolFullError`. The timer is cleared on
    * wake and unref'd, so a parked caller never holds the process open.
+   *
+   * Aborting `signal` ends the park early with `false`, as if the timer had run out; an
+   * already-aborted signal resolves `false` without parking, unless the pool is drained or a
+   * new host would fit right now. A wake that lands first still resolves `true`. A caller that
+   * gives up on its own (`ssh_multi_exec` declaring the call starved) aborts rather than racing
+   * this promise against another: the race would add a promise hop to every wake.
    */
-  waitForCapacity(timeoutMs: number): Promise<boolean> {
+  waitForCapacity(timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
     return new Promise<boolean>((resolve) => {
       let timer: ReturnType<typeof setTimeout> | undefined;
-      const wake = () => {
+      const settle = (woken: boolean) => {
         if (timer !== undefined) clearTimeout(timer);
         this.capacityWaiters.delete(wake);
-        resolve(true);
+        signal?.removeEventListener("abort", abort);
+        resolve(woken);
       };
+      // Resolved synchronously from notifyCapacity(), with no extra promise hop: a waiter's
+      // continuation must be queued before the releasing caller's own, which is what puts a
+      // single-host call next in line inside a fan-out.
+      const wake = () => settle(true);
+      const abort = () => settle(false);
       this.capacityWaiters.add(wake);
       if (this.drained) {
         wake();
@@ -440,19 +452,13 @@ export class ConnectionPool {
         wake();
         return;
       }
-      if (!(timeoutMs > 0)) {
-        this.capacityWaiters.delete(wake);
-        resolve(false);
+      if (!(timeoutMs > 0) || signal?.aborted) {
+        abort();
         return;
       }
-      timer = setTimeout(
-        () => {
-          this.capacityWaiters.delete(wake);
-          resolve(false);
-        },
-        Math.min(timeoutMs, MAX_TIMER_MS),
-      );
+      timer = setTimeout(abort, Math.min(timeoutMs, MAX_TIMER_MS));
       timer.unref();
+      signal?.addEventListener("abort", abort, { once: true });
     });
   }
 
