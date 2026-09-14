@@ -526,7 +526,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_multi_exec",
-    "Execute a command on multiple remote hosts in parallel. Returns results per host. Use this instead of calling ssh_exec multiple times — it's faster and shows results side by side. Use `env` to set environment variables for this call without modifying the command string. Subject to SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST if configured (policy is checked once, against the env-prefixed command, before fan-out).",
+    "Execute a command on multiple remote hosts in parallel: up to SSH_MCP_MAX_POOL_SIZE hosts at once (default 100), a larger list proceeding as slots free up. Returns results per host. Use this instead of calling ssh_exec multiple times — it's faster and shows results side by side. Use `env` to set environment variables for this call without modifying the command string. Subject to SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST if configured (policy is checked once, against the env-prefixed command, before fan-out).",
     {
       hosts: z.array(z.string()).describe("List of SSH hostnames or IPs"),
       command: z.string().describe("Shell command to execute on all hosts"),

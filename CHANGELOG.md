@@ -15,14 +15,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Library API: `acquire()` now rejects a full pool with a `PoolFullError` carrying `code: "ERR_SSH_MCP_POOL_FULL"` (`POOL_FULL_ERROR_CODE`, matched by `isPoolFullError()`), and `ConnectionPool.waitForCapacity(timeoutMs)` parks a caller until a slot may be free, resolving `true` on a wake and `false` on timeout. `acquire()` itself still never waits; the wait is opt-in for callers with a queue to keep moving, which is how `ssh_multi_exec` uses it below.
+
+### Fixed
+- **The connection pool no longer opens more connections than `maxPoolSize` under concurrent load.** The capacity check counted only registered entries, and an entry is registered only after its dial completes, so concurrent acquires to distinct hosts all passed it: with `maxPoolSize` 1, three simultaneous acquires opened three connections. Dials still in flight now count against the cap, so the excess acquires evict an idle entry or reject with `Connection pool is full`; concurrent callers to the same host still share one dial, and a failed dial frees its slot. `ssh_multi_exec` used to fire every host at once, which under the enforced cap would have failed every host past it, so it now runs at most `maxPoolSize` hosts at a time and completes a wider fleet as slots free up, with results still in input order.
+- **`ssh_multi_exec` waits for pool capacity instead of failing the rest of its queue.** The pool is shared by every tool, so a slot held elsewhere — a long `ssh_exec`, a concurrent `ssh_multi_exec` — made a fan-out's acquire reject with `Connection pool is full`; that rejection was recorded as the host's result and the worker moved to the next host, which was rejected the same way, so one rejected worker failed every remaining host within microtasks (measured: cap 3 with one slot held elsewhere and 9 hosts failed 7; cap 4 with two concurrent 8-host calls failed the second call's 8 hosts). A capacity rejection is now treated as backpressure, not a host failure: the worker parks until the pool signals a slot may be free (a release, an entry closing or expiring, a failed dial, or `drain()`) and retries the same host, for at most the call's `timeout` per host from its first rejection, after which `Connection pool is full` is reported for that host as before. Connect and exec errors are still recorded at once, and single-host tools still fail fast.
+
 ## [0.16.1] — 2026-09-14
 
 ### Changed
 - npm and MCP Registry listing metadata: bugs URL, core keywords, and server.json title/repository/websiteUrl
 - `release.sh` writes a `## [x.y.z]` changelog entry for every release — promoting `[Unreleased]` when it has content, otherwise generating one from the commit subjects since the previous tag — moves the Keep-a-Changelog link references along when a file has them, and takes the GitHub release notes from that entry instead of from `git log` subjects. Before this the script never touched CHANGELOG.md at all: documented work sat under `[Unreleased]` while the versions that shipped it went out with no entry (0.14.0 through 0.16.0 below are backfilled), and every GitHub release page showed raw commit subjects.
-
-### Fixed
-- **The connection pool no longer opens more connections than `maxPoolSize` under concurrent load.** The capacity check counted only registered entries, and an entry is registered only after its dial completes, so concurrent acquires to distinct hosts all passed it: with `maxPoolSize` 1, three simultaneous acquires opened three connections. Dials still in flight now count against the cap, so the excess acquires evict an idle entry or reject with `Connection pool is full`; concurrent callers to the same host still share one dial, and a failed dial frees its slot. `ssh_multi_exec` used to fire every host at once, which under the enforced cap would have failed every host past it, so it now runs at most `maxPoolSize` hosts at a time and completes a wider fleet in waves, with results still in input order.
 
 ## [0.16.0] — 2026-09-13
 

@@ -12,7 +12,7 @@ vi.mock("../ssh.js", async (importOriginal) => {
   };
 });
 
-import { ConnectionPool } from "../pool.js";
+import { ConnectionPool, isPoolFullError, POOL_FULL_ERROR_CODE, PoolFullError } from "../pool.js";
 import { connectWithProxy } from "../ssh.js";
 
 const mockedConnect = vi.mocked(connectWithProxy);
@@ -380,6 +380,143 @@ describe("ConnectionPool — maxPoolSize eviction", () => {
       pool.release(b);
     } finally {
       pool.drain();
+    }
+  });
+
+  // --- waitForCapacity: opt-in backpressure on top of the fail-fast acquire() ---
+  //
+  // Every wait below uses a SHORT timeout and asserts the resolved value: `true` means the
+  // pool woke the waiter, `false` means it slept to the timeout. A missing notify therefore
+  // shows up as `false`, not as a hang.
+
+  it("rejects a full pool with a PoolFullError identified by its code, and a failed dial with neither", async () => {
+    const pool = new ConnectionPool({ maxPoolSize: 1 });
+    try {
+      const held = await pool.acquire({ host: "code-held.example.com" });
+      const full = await pool.acquire({ host: "code-full.example.com" }).catch((e: unknown) => e);
+      expect(full).toBeInstanceOf(PoolFullError);
+      expect((full as PoolFullError).code).toBe(POOL_FULL_ERROR_CODE);
+      expect(isPoolFullError(full)).toBe(true);
+      // Matched by code, not by class or message: a look-alike from another module copy counts,
+      expect(isPoolFullError(Object.assign(new Error("anything"), { code: POOL_FULL_ERROR_CODE }))).toBe(true);
+      // ...and a message that merely mentions it does not.
+      expect(isPoolFullError(new Error("Connection pool is full"))).toBe(false);
+      pool.release(held);
+
+      mockedConnect.mockRejectedValueOnce(new Error("connect ECONNREFUSED"));
+      const dialErr = await pool.acquire({ host: "code-refused.example.com" }).catch((e: unknown) => e);
+      expect(String(dialErr)).toMatch(/ECONNREFUSED/);
+      expect(isPoolFullError(dialErr)).toBe(false);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("waitForCapacity wakes a parked caller when a held entry is released, and its retry fits", async () => {
+    const pool = new ConnectionPool({ maxPoolSize: 1 });
+    try {
+      const held = await pool.acquire({ host: "wake-held.example.com" });
+      await expect(pool.acquire({ host: "wake-next.example.com" })).rejects.toThrow(PoolFullError);
+
+      let woke: boolean | undefined;
+      const wait = pool.waitForCapacity(200).then((v) => {
+        woke = v;
+        return v;
+      });
+      await Promise.resolve();
+      expect(woke).toBeUndefined(); // parked: nothing has freed yet
+
+      pool.release(held); // refCount 0 -> evictable -> notify
+      expect(await wait).toBe(true);
+      const next = await pool.acquire({ host: "wake-next.example.com" });
+      expect((held as any).endCalls).toBe(1); // the idle entry was evicted to make the room
+      pool.release(next);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("waitForCapacity wakes when a held entry dies, and when an in-flight dial fails", async () => {
+    const dials = deferredConnects();
+    const pool = new ConnectionPool({ maxPoolSize: 1 });
+    try {
+      // markDead: the only slot's connection drops while still checked out.
+      const t1 = pool.acquire({ host: "dies-held.example.com" });
+      const c1 = makeFakeClient();
+      dials[0].resolve(c1);
+      await t1;
+      const onDeath = pool.waitForCapacity(200);
+      c1.emit("close");
+      expect(await onDeath).toBe(true);
+      expect(pool.size).toBe(0);
+
+      // Failed dial: the slot is held by a dial, not an entry.
+      const doomed = pool.acquire({ host: "dial-doomed.example.com" }).catch(() => undefined);
+      const onFailure = pool.waitForCapacity(200);
+      dials[1].reject(new Error("connect ETIMEDOUT"));
+      expect(await onFailure).toBe(true);
+      await doomed;
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("waitForCapacity resolves at once when the slot freed BEFORE the caller parked", async () => {
+    // The lost-wakeup shape: acquire() rejects, the holder releases (notifying nobody, since
+    // nobody is parked yet), and only then does the caller call waitForCapacity. Only the
+    // re-check at registration can see that capacity already exists.
+    const pool = new ConnectionPool({ maxPoolSize: 1 });
+    try {
+      const held = await pool.acquire({ host: "early-held.example.com" });
+      await expect(pool.acquire({ host: "early-next.example.com" })).rejects.toThrow(PoolFullError);
+      pool.release(held);
+
+      expect(await pool.waitForCapacity(50)).toBe(true);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("waitForCapacity times out to false, and its timer is unref'd", async () => {
+    const pool = new ConnectionPool({ maxPoolSize: 1 });
+    const timeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    try {
+      const held = await pool.acquire({ host: "timeout-held.example.com" });
+      const wait = pool.waitForCapacity(20);
+      const timer = timeoutSpy.mock.results.at(-1)?.value as NodeJS.Timeout;
+      expect(timer.hasRef()).toBe(false); // a parked caller never holds the process open
+      expect(await wait).toBe(false);
+      pool.release(held);
+    } finally {
+      timeoutSpy.mockRestore();
+      pool.drain();
+    }
+  });
+
+  it("waitForCapacity clears its timer on wake, and drain() wakes a parked caller", async () => {
+    vi.useFakeTimers();
+    const pool = new ConnectionPool({ maxPoolSize: 1 });
+    try {
+      const held = await pool.acquire({ host: "clear-held.example.com" });
+      const wait = pool.waitForCapacity(60_000);
+      expect(vi.getTimerCount()).toBe(1);
+      pool.release(held); // arms the entry's idle timer, wakes the waiter
+      expect(await wait).toBe(true);
+      expect(vi.getTimerCount()).toBe(1); // only the idle timer: the wait timer was cleared
+
+      const again = await pool.acquire({ host: "clear-held.example.com" });
+      const parked = pool.waitForCapacity(60_000);
+      pool.drain();
+      expect(await parked).toBe(true); // woken, not left to sit out 60s
+      expect(vi.getTimerCount()).toBe(0);
+      await expect(pool.acquire({ host: "clear-after.example.com" })).rejects.toThrow(/drained/);
+      // Already drained: resolves at once rather than arming a timer.
+      expect(await pool.waitForCapacity(60_000)).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+      pool.release(again);
+    } finally {
+      pool.drain();
+      vi.useRealTimers();
     }
   });
 

@@ -1,5 +1,5 @@
 import type { Client } from "ssh2";
-import type { ConnectionPool } from "./pool.js";
+import { type ConnectionPool, isPoolFullError } from "./pool.js";
 import { exec } from "./ssh.js";
 
 // POSIX single-quote wrapping. Used by every helper that interpolates user input into
@@ -49,14 +49,25 @@ export async function multiExec(
   const cap: unknown = (pool as Partial<Pick<ConnectionPool, "maxSize">>).maxSize;
   const limit = typeof cap === "number" && cap >= 1 ? Math.min(hosts.length, Math.floor(cap)) : hosts.length;
 
-  const results = new Array<MultiExecResult>(hosts.length);
-  let next = 0;
-  const worker = async (): Promise<void> => {
-    while (next < hosts.length) {
-      const i = next++;
-      const hostConfig = hosts[i];
+  // The pool is shared by every tool, so pacing our OWN workers to the cap is not enough:
+  // slots held by other calls (a concurrent ssh_multi_exec, a long ssh_exec) make our
+  // acquires reject with PoolFullError. That rejection is backpressure, not a host failure:
+  // recording it and moving on used to fail the rest of the queue within microtasks, because
+  // every following host was rejected the same way. So on a capacity rejection -- and only
+  // that; connect and exec errors are recorded as before -- the worker parks until the pool
+  // signals a slot may be free and retries the SAME host.
+  //
+  // Bound: a host waits at most `timeoutMs` in total for a slot (the same budget its command
+  // gets, so a host's worst case is two timeouts: one queued, one running), measured from its
+  // first rejection. Past that it records "Connection pool is full" as its result.
+  const waitForCapacity = (pool as Partial<Pick<ConnectionPool, "waitForCapacity">>).waitForCapacity;
+  const canWait = typeof waitForCapacity === "function";
+
+  const runHost = async (hostConfig: MultiExecHost): Promise<MultiExecResult> => {
+    let deadline: number | undefined;
+    for (;;) {
       try {
-        results[i] = await pool.withConnection(hostConfig, async (client) => {
+        return await pool.withConnection(hostConfig, async (client) => {
           const result = await exec(client, command, timeoutMs);
           // Spreading the whole ExecResult carries `signal` (and the truncation flags) through
           // per-host without re-listing every field; `signal` is declared on MultiExecResult so
@@ -64,14 +75,28 @@ export async function multiExec(
           return { host: hostConfig.host, ...result };
         });
       } catch (reason: unknown) {
-        results[i] = {
-          host: hostConfig.host,
-          stdout: "",
-          stderr: "",
-          code: -1,
-          error: reason instanceof Error ? reason.message : String(reason),
-        };
+        let message = reason instanceof Error ? reason.message : String(reason);
+        if (isPoolFullError(reason)) {
+          const now = performance.now();
+          deadline ??= now + timeoutMs;
+          const remaining = deadline - now;
+          if (canWait && remaining > 0) {
+            await pool.waitForCapacity(remaining);
+            continue;
+          }
+          if (canWait) message += `; no slot freed up within ${timeoutMs}ms`;
+        }
+        return { host: hostConfig.host, stdout: "", stderr: "", code: -1, error: message };
       }
+    }
+  };
+
+  const results = new Array<MultiExecResult>(hosts.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < hosts.length) {
+      const i = next++;
+      results[i] = await runHost(hosts[i]);
     }
   };
 

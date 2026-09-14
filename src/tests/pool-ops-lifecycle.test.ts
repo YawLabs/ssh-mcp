@@ -274,6 +274,137 @@ describe("multiExec — fan-out wider than the pool cap", () => {
   });
 });
 
+describe("multiExec — waits for pool capacity held by OTHER callers", () => {
+  // The pool is shared by every tool. multiExec pacing its own workers to the cap does not
+  // stop a slot held elsewhere from rejecting its acquires; those rejections must be waited
+  // out and retried, not recorded as the host's result -- recording them used to fail the
+  // rest of the queue within microtasks, one rejected host after another.
+  const DIAL_MS = 10;
+  const EXEC_MS = 20;
+
+  /** Dials take DIAL_MS, every command takes EXEC_MS and prints `out:<host>`. Tracks open/peak. */
+  function timedConnects() {
+    const stats = { open: 0, peak: 0 };
+    mockedConnect.mockImplementation(async (resolved) => {
+      const host = String(resolved.connectConfig.host);
+      await new Promise((r) => setTimeout(r, DIAL_MS));
+      stats.open++;
+      stats.peak = Math.max(stats.peak, stats.open);
+      const client = makeQuietClient() as EventEmitter & { endCalls: number; end: () => void; exec: unknown };
+      client.end = () => {
+        if (client.endCalls++ === 0) stats.open--;
+      };
+      client.exec = (_command: string, cb: (err: Error | null, stream: unknown) => void) => {
+        const stream = new EventEmitter() as EventEmitter & { stderr: EventEmitter };
+        stream.stderr = new EventEmitter();
+        cb(null, stream);
+        setTimeout(() => {
+          stream.emit("data", Buffer.from(`out:${host}\n`));
+          stream.emit("close", 0);
+        }, EXEC_MS);
+      };
+      return client as never;
+    });
+    return stats;
+  }
+
+  const fleet = (prefix: string, n: number): MultiExecHost[] =>
+    Array.from({ length: n }, (_, i) => ({ host: `${prefix}-${i}.test` }));
+
+  beforeEach(() => {
+    vi.useRealTimers();
+    mockedConnect.mockReset();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("completes every host while one slot is held outside the fan-out", async () => {
+    const stats = timedConnects();
+    const pool = new ConnectionPool({ maxPoolSize: 3 });
+    try {
+      // e.g. a long-running ssh_exec holding one of the three slots for the whole fan-out.
+      const held = await pool.acquire({ host: "held-outside.test" });
+      const hosts = fleet("outside", 9);
+
+      const results = await multiExec(pool, hosts, "hostname");
+
+      expect(results.map((r) => r.error)).toEqual(hosts.map(() => undefined));
+      expect(results.map((r) => r.stdout)).toEqual(hosts.map((h) => `out:${h.host}\n`));
+      expect(stats.peak).toBeLessThanOrEqual(3);
+      pool.release(held);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("completes both of two concurrent fan-outs that together need twice the cap", async () => {
+    timedConnects();
+    const pool = new ConnectionPool({ maxPoolSize: 4 });
+    try {
+      const first = fleet("first", 8);
+      const second = fleet("second", 8);
+
+      const [a, b] = await Promise.all([multiExec(pool, first, "hostname"), multiExec(pool, second, "hostname")]);
+
+      expect(a.map((r) => r.error)).toEqual(first.map(() => undefined));
+      expect(b.map((r) => r.error)).toEqual(second.map(() => undefined));
+      expect(b.map((r) => r.stdout)).toEqual(second.map((h) => `out:${h.host}\n`));
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("still records 'Connection pool is full' once a host has waited its timeoutMs without a slot", async () => {
+    // multiExec measures the per-host bound with performance.now(). Vitest's fake clock covers
+    // it (the default toFake is everything but nextTick / queueMicrotask), so advancing the
+    // clock moves the deadline too; a narrower toFake would leave the retry loop re-parking
+    // on real time and this test would hang instead of settling at the bound.
+    vi.useFakeTimers();
+    mockedConnect.mockImplementation(async () => makeQuietClient() as never);
+    const pool = new ConnectionPool({ maxPoolSize: 1 });
+    try {
+      const held = await pool.acquire({ host: "hog.test" }); // never released during the wait
+      const BOUND = 1_000;
+      let settled = false;
+      const run = multiExec(pool, [{ host: "starved.test" }], "true", BOUND).then((r) => {
+        settled = true;
+        return r;
+      });
+
+      await vi.advanceTimersByTimeAsync(BOUND - 1);
+      expect(settled).toBe(false); // still waiting inside the bound
+
+      await vi.advanceTimersByTimeAsync(1);
+      const [result] = await run;
+      expect(result).toMatchObject({ host: "starved.test", code: -1 });
+      expect(result.error).toMatch(/Connection pool is full/);
+      expect(result.error).toContain(`no slot freed up within ${BOUND}ms`);
+      expect(mockedConnect).toHaveBeenCalledTimes(1); // the starved host never dialed
+      // The wait timer is gone -- nothing left armed behind the recorded result.
+      expect(vi.getTimerCount()).toBe(0);
+      pool.release(held);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("does not hang when the pool is drained while hosts are waiting for a slot", async () => {
+    mockedConnect.mockImplementation(async () => makeQuietClient() as never);
+    const pool = new ConnectionPool({ maxPoolSize: 1 });
+    await pool.acquire({ host: "hog-until-shutdown.test" });
+
+    // Default 30s bound -- far past this test's timeout, so only drain() can end the wait.
+    const run = multiExec(pool, [{ host: "queued-1.test" }, { host: "queued-2.test" }], "true");
+    await new Promise((r) => setTimeout(r, 5)); // let the worker hit the full pool and park
+    pool.drain();
+
+    const results = await run;
+    expect(results.map((r) => r.host)).toEqual(["queued-1.test", "queued-2.test"]);
+    for (const r of results) expect(r.error).toMatch(/drained/);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // GAP 4 — ConnectionPool idle-timer release path
 // ---------------------------------------------------------------------------
