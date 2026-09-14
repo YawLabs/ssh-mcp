@@ -266,6 +266,123 @@ describe("ConnectionPool — maxPoolSize eviction", () => {
     }
   });
 
+  /**
+   * connectWithProxy stand-in whose dials stay in flight until the test settles them,
+   * so several acquires can reach the capacity check while a dial has not yet
+   * registered its entry.
+   */
+  function deferredConnects() {
+    const dials: { host: string; resolve: (c: any) => void; reject: (e: Error) => void }[] = [];
+    mockedConnect.mockImplementation(
+      (resolved) =>
+        new Promise((resolve, reject) => {
+          dials.push({ host: String(resolved.connectConfig.host), resolve, reject });
+        }),
+    );
+    return dials;
+  }
+
+  it("counts in-flight dials against the cap: concurrent distinct-host acquires cannot overshoot", async () => {
+    const dials = deferredConnects();
+    const pool = new ConnectionPool({ maxPoolSize: 1 });
+    try {
+      const settled = Promise.allSettled(
+        ["inflight-1.example.com", "inflight-2.example.com", "inflight-3.example.com"].map((host) =>
+          pool.acquire({ host }),
+        ),
+      );
+      // Only the first acquire may dial; the other two hit the cap while it is in flight.
+      expect(mockedConnect).toHaveBeenCalledTimes(1);
+      for (const d of dials) d.resolve(makeFakeClient());
+
+      const outcomes = await settled;
+      const fulfilled = outcomes.filter((o) => o.status === "fulfilled");
+      const rejected = outcomes.filter((o): o is PromiseRejectedResult => o.status === "rejected");
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(2);
+      for (const r of rejected) expect(String(r.reason)).toMatch(/Connection pool is full/);
+      expect(pool.connectCount).toBe(1);
+      expect(pool.size).toBe(1);
+
+      pool.release((fulfilled[0] as PromiseFulfilledResult<any>).value);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("still dedupes concurrent SAME-host acquires at the cap -- a shared dial never rejects its own waiters", async () => {
+    const dials = deferredConnects();
+    const pool = new ConnectionPool({ maxPoolSize: 1 });
+    try {
+      const tasks = Array.from({ length: 5 }, () => pool.acquire({ host: "shared-dial.example.com" }));
+      expect(mockedConnect).toHaveBeenCalledTimes(1);
+      dials[0].resolve(makeFakeClient());
+
+      const clients = await Promise.all(tasks);
+      expect(new Set(clients).size).toBe(1);
+      expect(pool.connectCount).toBe(1);
+      expect(pool.size).toBe(1);
+
+      for (const c of clients) pool.release(c);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("frees the slot of an in-flight dial that fails", async () => {
+    const dials = deferredConnects();
+    const pool = new ConnectionPool({ maxPoolSize: 1 });
+    try {
+      const doomed = pool.acquire({ host: "dial-fails.example.com" });
+      // While the failing dial is in flight it holds the only slot.
+      await expect(pool.acquire({ host: "after-fail.example.com" })).rejects.toThrow(/Connection pool is full/);
+
+      dials[0].reject(new Error("connect ECONNREFUSED"));
+      await expect(doomed).rejects.toThrow(/ECONNREFUSED/);
+      expect(pool.size).toBe(0);
+
+      // The failed dial registered nothing and released its slot, so a new host fits.
+      const next = pool.acquire({ host: "after-fail.example.com" });
+      expect(mockedConnect).toHaveBeenCalledTimes(2);
+      dials[1].resolve(makeFakeClient());
+      const client = await next;
+      expect(pool.size).toBe(1);
+      expect(pool.connectCount).toBe(1);
+
+      pool.release(client);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("evicts an idle entry when in-flight dials fill the rest of the cap", async () => {
+    const dials = deferredConnects();
+    const pool = new ConnectionPool({ maxPoolSize: 2 });
+    try {
+      const idleTask = pool.acquire({ host: "cap-idle.example.com" });
+      const idle = makeFakeClient();
+      dials[0].resolve(idle);
+      pool.release(await idleTask); // one idle entry
+
+      const dialing = pool.acquire({ host: "cap-dialing.example.com" }); // one in-flight dial
+      // entries (1) + pending (1) is at the cap, so this one must evict the idle entry.
+      const newcomer = pool.acquire({ host: "cap-newcomer.example.com" });
+      expect(mockedConnect).toHaveBeenCalledTimes(3);
+      expect(idle.endCalls).toBe(1);
+
+      dials[1].resolve(makeFakeClient());
+      dials[2].resolve(makeFakeClient());
+      const [a, b] = await Promise.all([dialing, newcomer]);
+      expect(pool.size).toBe(2);
+      expect(pool.stats).toEqual({ active: 2, idle: 0 });
+
+      pool.release(a);
+      pool.release(b);
+    } finally {
+      pool.drain();
+    }
+  });
+
   // defaultMaxPoolSize() reads process.env on every ConnectionPool construction, so a
   // stubbed env plus the file-level (already mocked) ConnectionPool is enough -- no
   // module reset or re-import needed.
@@ -302,8 +419,8 @@ describe("ConnectionPool — maxPoolSize eviction", () => {
     const pool = new ConnectionPool();
     try {
       const clients = [];
-      // Sequential on purpose: the cap is checked against registered entries, which
-      // concurrent in-flight dials have not joined yet.
+      // Sequential so each dial registers before the next; keeps the 100th/101st
+      // boundary deterministic (in-flight dials count against the cap too).
       for (let i = 0; i < 100; i++) {
         clients.push(await pool.acquire({ host: "fallback-cap.example.com", port: 10_000 + i }));
       }

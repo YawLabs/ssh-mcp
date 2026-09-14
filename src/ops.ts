@@ -41,30 +41,42 @@ export async function multiExec(
   command: string,
   timeoutMs = 30000,
 ): Promise<MultiExecResult[]> {
-  const results = await Promise.allSettled(
-    hosts.map(async (hostConfig) => {
-      return pool.withConnection(hostConfig, async (client) => {
-        const result = await exec(client, command, timeoutMs);
-        // Spreading the whole ExecResult carries `signal` (and the truncation flags) through
-        // per-host without re-listing every field; `signal` is declared on MultiExecResult so
-        // the ssh_multi_exec formatter can actually see it.
-        return { host: hostConfig.host, ...result };
-      });
-    }),
-  );
+  // Run at most `pool.maxSize` hosts at once. The pool counts in-flight dials against its
+  // cap, so firing every host at once would fail everything past the cap with "Connection
+  // pool is full". A worker releases its connection (it goes idle) before taking the next
+  // host, and the pool evicts that idle entry for the new one, so a fan-out wider than the
+  // cap completes in waves. A pool-like object with no usable `maxSize` runs unbounded.
+  const cap: unknown = (pool as Partial<Pick<ConnectionPool, "maxSize">>).maxSize;
+  const limit = typeof cap === "number" && cap >= 1 ? Math.min(hosts.length, Math.floor(cap)) : hosts.length;
 
-  return results.map((result, i) => {
-    if (result.status === "fulfilled") {
-      return result.value;
+  const results = new Array<MultiExecResult>(hosts.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < hosts.length) {
+      const i = next++;
+      const hostConfig = hosts[i];
+      try {
+        results[i] = await pool.withConnection(hostConfig, async (client) => {
+          const result = await exec(client, command, timeoutMs);
+          // Spreading the whole ExecResult carries `signal` (and the truncation flags) through
+          // per-host without re-listing every field; `signal` is declared on MultiExecResult so
+          // the ssh_multi_exec formatter can actually see it.
+          return { host: hostConfig.host, ...result };
+        });
+      } catch (reason: unknown) {
+        results[i] = {
+          host: hostConfig.host,
+          stdout: "",
+          stderr: "",
+          code: -1,
+          error: reason instanceof Error ? reason.message : String(reason),
+        };
+      }
     }
-    return {
-      host: hosts[i].host,
-      stdout: "",
-      stderr: "",
-      code: -1,
-      error: result.reason instanceof Error ? result.reason.message : String(result.reason),
-    };
-  });
+  };
+
+  await Promise.all(Array.from({ length: limit }, worker));
+  return results;
 }
 
 // --- Remote file search ---

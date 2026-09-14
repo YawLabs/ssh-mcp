@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - npm and MCP Registry listing metadata: bugs URL, core keywords, and server.json title/repository/websiteUrl
 - `release.sh` writes a `## [x.y.z]` changelog entry for every release — promoting `[Unreleased]` when it has content, otherwise generating one from the commit subjects since the previous tag — moves the Keep-a-Changelog link references along when a file has them, and takes the GitHub release notes from that entry instead of from `git log` subjects. Before this the script never touched CHANGELOG.md at all: documented work sat under `[Unreleased]` while the versions that shipped it went out with no entry (0.14.0 through 0.16.0 below are backfilled), and every GitHub release page showed raw commit subjects.
 
+### Fixed
+- **The connection pool no longer opens more connections than `maxPoolSize` under concurrent load.** The capacity check counted only registered entries, and an entry is registered only after its dial completes, so concurrent acquires to distinct hosts all passed it: with `maxPoolSize` 1, three simultaneous acquires opened three connections. Dials still in flight now count against the cap, so the excess acquires evict an idle entry or reject with `Connection pool is full`; concurrent callers to the same host still share one dial, and a failed dial frees its slot. `ssh_multi_exec` used to fire every host at once, which under the enforced cap would have failed every host past it, so it now runs at most `maxPoolSize` hosts at a time and completes a wider fleet in waves, with results still in input order.
+
 ## [0.16.0] — 2026-09-13
 
 Release tooling and README only; no change to the published server.

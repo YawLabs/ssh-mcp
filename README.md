@@ -116,7 +116,7 @@ When any remote operation fails, ssh-mcp automatically runs diagnostics and incl
 
 Remote operations reuse SSH connections automatically. When your agent makes multiple calls to the same host, the first call opens a connection and subsequent calls reuse it. Connections are kept alive for 60 seconds after the last use, then closed automatically.
 
-The pool caps at 100 active connections by default. Set `SSH_MCP_MAX_POOL_SIZE=<n>` to raise it for fan-out workloads against many distinct hosts (e.g. `ssh_multi_exec` across a large fleet). When the cap is reached, the pool evicts an idle entry to make room; if every entry is in use it rejects with `Connection pool is full`.
+The pool caps at 100 connections by default, counting connections still being dialed. Set `SSH_MCP_MAX_POOL_SIZE=<n>` to raise it for fan-out workloads against many distinct hosts. `ssh_multi_exec` runs at most that many hosts at once and works through a larger fleet in waves, so raising the cap raises its parallelism. When the cap is reached, the pool evicts an idle entry to make room; if every entry is in use or dialing it rejects with `Connection pool is full`.
 
 ### SSH config support
 

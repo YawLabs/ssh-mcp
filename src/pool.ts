@@ -14,7 +14,8 @@ export interface PoolOptions {
   /** Milliseconds before an idle connection is closed. Default: 60000 (60s) */
   idleTtlMs?: number;
   /**
-   * Maximum number of connections in the pool. Default: 100, overridable via the
+   * Maximum number of connections in the pool, counting dials still in flight.
+   * Default: 100, overridable via the
    * `SSH_MCP_MAX_POOL_SIZE` env var. When at capacity, the pool first tries to evict
    * an idle entry; if every entry is in use, `acquire()` rejects with
    * "Connection pool is full". Bump this for fan-out workloads against many distinct
@@ -133,7 +134,15 @@ export class ConnectionPool {
       let inflight = this.pending.get(key);
       if (!inflight) {
         // Eviction is only needed when we're about to create a new entry.
-        if (this.entries.size >= this.maxPoolSize) {
+        //
+        // In-flight dials count against the cap: `entries.set` only runs after
+        // `connectWithProxy` resolves, so checking `entries.size` alone let N concurrent
+        // acquires to N distinct hosts all pass and open N connections past the limit.
+        // Same-key callers never reach this check (they join `pending` above), so a
+        // shared dial does not reject its own waiters. No slot is counted twice: the
+        // factory's `entries.set` and its `finally` `pending.delete` run in one
+        // synchronous segment, and a failed dial runs only the delete, freeing its slot.
+        if (this.entries.size + this.pending.size >= this.maxPoolSize) {
           let evicted = false;
           for (const [k, e] of this.entries) {
             if (e.refCount === 0) {
@@ -149,7 +158,7 @@ export class ConnectionPool {
             }
           }
           if (!evicted) {
-            throw new Error(`Connection pool is full (${this.maxPoolSize} active connections)`);
+            throw new Error(`Connection pool is full (${this.maxPoolSize} connections in use or dialing)`);
           }
         }
 
@@ -289,6 +298,11 @@ export class ConnectionPool {
 
   get size(): number {
     return this.entries.size;
+  }
+
+  /** The connection cap (`maxPoolSize`), counting pooled entries plus in-flight dials. */
+  get maxSize(): number {
+    return this.maxPoolSize;
   }
 
   get stats(): { active: number; idle: number } {

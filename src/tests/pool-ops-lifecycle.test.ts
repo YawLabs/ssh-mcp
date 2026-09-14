@@ -198,6 +198,82 @@ describe("multiExec — mixed success/failure fan-out", () => {
   });
 });
 
+describe("multiExec — fan-out wider than the pool cap", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+    mockedConnect.mockReset();
+  });
+
+  it("completes every host in waves on a REAL pool, never opening more than maxSize connections, in input order", async () => {
+    // The pool counts in-flight dials against maxPoolSize, so firing all six hosts at
+    // once would fail four of them with "Connection pool is full". multiExec must pace
+    // the fan-out to the cap and let each released (idle) entry be evicted for the next.
+    const CAP = 2;
+    const hosts: MultiExecHost[] = Array.from({ length: 6 }, (_, i) => ({ host: `wave-${i}.test` }));
+    let open = 0;
+    let peak = 0;
+    mockedConnect.mockImplementation(async (resolved) => {
+      const host = String(resolved.connectConfig.host);
+      const idx = hosts.findIndex((h) => h.host === host);
+      if (idx < 0) throw new Error(`test bug: unexpected host ${host}`);
+      open++;
+      peak = Math.max(peak, open);
+      const client = makeQuietClient() as EventEmitter & { endCalls: number; end: () => void; exec: unknown };
+      client.end = () => {
+        if (client.endCalls++ === 0) open--;
+      };
+      client.exec = (_command: string, cb: (err: Error | null, stream: unknown) => void) => {
+        const stream = new EventEmitter() as EventEmitter & { stderr: EventEmitter };
+        stream.stderr = new EventEmitter();
+        cb(null, stream);
+        // Later hosts finish sooner, so completion order is NOT input order.
+        setTimeout(
+          () => {
+            stream.emit("data", Buffer.from(`out:${host}\n`));
+            stream.emit("close", 0);
+          },
+          (hosts.length - idx) * 5,
+        );
+      };
+      return client as never;
+    });
+
+    const pool = new ConnectionPool({ maxPoolSize: CAP });
+    try {
+      const results = await multiExec(pool, hosts, "hostname");
+
+      expect(results.map((r) => r.error)).toEqual(hosts.map(() => undefined));
+      expect(results.map((r) => r.host)).toEqual(hosts.map((h) => h.host));
+      // Each host's OWN output sits at its own index.
+      expect(results.map((r) => r.stdout)).toEqual(hosts.map((h) => `out:${h.host}\n`));
+      expect(mockedConnect).toHaveBeenCalledTimes(hosts.length);
+      // Parallel up to the cap, and never past it.
+      expect(peak).toBe(CAP);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("runs every host concurrently when the pool exposes no usable maxSize", async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const barePool = {
+      async withConnection<T>(_config: unknown, fn: (client: never) => Promise<T>): Promise<T> {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        await new Promise((r) => setTimeout(r, 5));
+        inFlight--;
+        return fn(scriptedClient({ stdout: "ok\n" }) as never);
+      },
+    } as unknown as ConnectionPool;
+
+    const results = await multiExec(barePool, [{ host: "x.test" }, { host: "y.test" }, { host: "z.test" }], "true");
+
+    expect(results.map((r) => r.host)).toEqual(["x.test", "y.test", "z.test"]);
+    expect(peak).toBe(3);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // GAP 4 — ConnectionPool idle-timer release path
 // ---------------------------------------------------------------------------
