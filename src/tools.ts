@@ -41,7 +41,9 @@ const TimeoutSchema = z
   .int()
   .positive()
   .optional()
-  .describe("Command timeout in milliseconds (default: 30000)");
+  .describe(
+    "Command timeout in milliseconds (default: 30000). Also the longest the call waits for a free connection-pool slot (SSH_MCP_MAX_POOL_SIZE, default 100) before the command starts; the wait and the command are bounded separately.",
+  );
 
 const EnvSchema = z
   .record(z.string(), z.string())
@@ -57,6 +59,25 @@ const connectionParams = {
   privateKeyPath: KeyPathSchema,
   password: PasswordSchema,
 };
+
+// The `timeout` default every command-running tool falls back to (see TimeoutSchema).
+const DEFAULT_TIMEOUT_MS = 30000;
+
+/**
+ * Pool options for a single-host tool: wait for a slot in the shared pool for as long as
+ * the tool's own command may run. The pool is shared with ssh_multi_exec, whose workers
+ * release and re-acquire a slot within one microtask drain, so a single-host call that
+ * failed fast on a full pool was refused for essentially the whole run of any fan-out wider
+ * than the cap. Parking makes it next in line instead: the pool wakes it on the very
+ * release that would otherwise have gone to the fan-out's next host. Tools with no
+ * `timeout` parameter (the SFTP tools) wait the same 30s the others default to.
+ */
+const poolWait = (timeoutMs: number = DEFAULT_TIMEOUT_MS) => ({ waitForCapacityMs: timeoutMs });
+
+// Appended to every SFTP tool description. Those tools take no `timeout`, so TimeoutSchema's
+// note about the pool wait never reaches them; without this a caller would learn of the 30s
+// wait only from the error text once it had already been spent.
+const SFTP_POOL_WAIT_NOTE = ` If the connection pool is full (SSH_MCP_MAX_POOL_SIZE, default 100), waits up to ${DEFAULT_TIMEOUT_MS / 1000}s for a free slot before starting.`;
 
 // Standard note appended to every tool description that command policy does NOT cover.
 // See the SCOPE LIMIT block in src/policy.ts -- a blacklist is not whole-server coverage,
@@ -128,23 +149,28 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
     async ({ command, env, timeout, ...conn }) => {
       const { finalCommand, envPrefixApplied } = applyEnvPrefix(command, env);
       enforcePolicy(finalCommand, { envPrefixApplied });
-      return connectionPool.withConnection(conn, async (client) => {
-        const result = await exec(client, finalCommand, timeout || 30000);
-        const parts: string[] = [];
-        if (result.stdout) parts.push(result.stdout);
-        if (result.stderr) parts.push(`[stderr]\n${result.stderr}`);
-        // Surface signal when the channel closed signal-only -- otherwise `code: -1`
-        // looks like a generic failure with no hint that the remote was killed.
-        if (result.signal) parts.push(`[signal: ${result.signal}]`);
-        parts.push(`[exit code: ${result.code}]`);
-        return { content: [{ type: "text", text: parts.join("\n") }] };
-      });
+      const timeoutMs = timeout || DEFAULT_TIMEOUT_MS;
+      return connectionPool.withConnection(
+        conn,
+        async (client) => {
+          const result = await exec(client, finalCommand, timeoutMs);
+          const parts: string[] = [];
+          if (result.stdout) parts.push(result.stdout);
+          if (result.stderr) parts.push(`[stderr]\n${result.stderr}`);
+          // Surface signal when the channel closed signal-only -- otherwise `code: -1`
+          // looks like a generic failure with no hint that the remote was killed.
+          if (result.signal) parts.push(`[signal: ${result.signal}]`);
+          parts.push(`[exit code: ${result.code}]`);
+          return { content: [{ type: "text", text: parts.join("\n") }] };
+        },
+        poolWait(timeoutMs),
+      );
     },
   );
 
   server.tool(
     "ssh_read_file",
-    "Read a file from a remote host via SFTP.",
+    `Read a file from a remote host via SFTP.${SFTP_POOL_WAIT_NOTE}`,
     {
       ...connectionParams,
       path: z
@@ -156,120 +182,144 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
         .describe("Absolute path to the remote file. Must start with /."),
     },
     async ({ path, ...conn }) => {
-      return connectionPool.withConnection(conn, async (client) => {
-        const content = await readFile(client, path);
-        return { content: [{ type: "text", text: content }] };
-      });
+      return connectionPool.withConnection(
+        conn,
+        async (client) => {
+          const content = await readFile(client, path);
+          return { content: [{ type: "text", text: content }] };
+        },
+        poolWait(),
+      );
     },
   );
 
   server.tool(
     "ssh_write_file",
-    `Write content to a file on a remote host via SFTP. Creates or overwrites the file.${POLICY_EXEMPT_NOTE}`,
+    `Write content to a file on a remote host via SFTP. Creates or overwrites the file.${SFTP_POOL_WAIT_NOTE}${POLICY_EXEMPT_NOTE}`,
     {
       ...connectionParams,
       path: AbsoluteRemotePathSchema.describe("Absolute path to the remote file. Must start with /."),
       content: z.string().describe("File content to write"),
     },
     async ({ path, content, ...conn }) => {
-      return connectionPool.withConnection(conn, async (client) => {
-        await writeFile(client, path, content);
-        // Buffer.byteLength, not content.length: a JS string's .length counts UTF-16 code
-        // units, so any non-ASCII content (accents, CJK, emoji) under-reports what actually
-        // landed on the remote. ssh2's sftp.writeFile encodes a string as utf8 by default,
-        // which is what we measure here.
-        const bytes = Buffer.byteLength(content, "utf8");
-        return { content: [{ type: "text", text: `Wrote ${bytes} bytes to ${path}` }] };
-      });
+      return connectionPool.withConnection(
+        conn,
+        async (client) => {
+          await writeFile(client, path, content);
+          // Buffer.byteLength, not content.length: a JS string's .length counts UTF-16 code
+          // units, so any non-ASCII content (accents, CJK, emoji) under-reports what actually
+          // landed on the remote. ssh2's sftp.writeFile encodes a string as utf8 by default,
+          // which is what we measure here.
+          const bytes = Buffer.byteLength(content, "utf8");
+          return { content: [{ type: "text", text: `Wrote ${bytes} bytes to ${path}` }] };
+        },
+        poolWait(),
+      );
     },
   );
 
   server.tool(
     "ssh_upload",
-    `Upload a local file to a remote host via SFTP.${POLICY_EXEMPT_NOTE}`,
+    `Upload a local file to a remote host via SFTP.${SFTP_POOL_WAIT_NOTE}${POLICY_EXEMPT_NOTE}`,
     {
       ...connectionParams,
       localPath: z.string().describe("Path to the local file to upload"),
       remotePath: AbsoluteRemotePathSchema.describe("Absolute path on the remote host. Must start with /."),
     },
     async ({ localPath, remotePath, ...conn }) => {
-      return connectionPool.withConnection(conn, async (client) => {
-        await uploadFile(client, localPath, remotePath);
-        return { content: [{ type: "text", text: `Uploaded ${localPath} → ${remotePath}` }] };
-      });
+      return connectionPool.withConnection(
+        conn,
+        async (client) => {
+          await uploadFile(client, localPath, remotePath);
+          return { content: [{ type: "text", text: `Uploaded ${localPath} → ${remotePath}` }] };
+        },
+        poolWait(),
+      );
     },
   );
 
   server.tool(
     "ssh_download",
-    "Download a file from a remote host to local filesystem via SFTP.",
+    `Download a file from a remote host to local filesystem via SFTP.${SFTP_POOL_WAIT_NOTE}`,
     {
       ...connectionParams,
       remotePath: AbsoluteRemotePathSchema.describe("Absolute path to the remote file. Must start with /."),
       localPath: z.string().describe("Local path to save the downloaded file"),
     },
     async ({ remotePath, localPath, ...conn }) => {
-      return connectionPool.withConnection(conn, async (client) => {
-        await downloadFile(client, remotePath, localPath);
-        return { content: [{ type: "text", text: `Downloaded ${remotePath} → ${localPath}` }] };
-      });
+      return connectionPool.withConnection(
+        conn,
+        async (client) => {
+          await downloadFile(client, remotePath, localPath);
+          return { content: [{ type: "text", text: `Downloaded ${remotePath} → ${localPath}` }] };
+        },
+        poolWait(),
+      );
     },
   );
 
   server.tool(
     "ssh_ls",
-    "List files in a directory on a remote host via SFTP.",
+    `List files in a directory on a remote host via SFTP.${SFTP_POOL_WAIT_NOTE}`,
     {
       ...connectionParams,
       path: AbsoluteRemotePathSchema.describe("Absolute path to the remote directory. Must start with /."),
     },
     async ({ path, ...conn }) => {
-      return connectionPool.withConnection(conn, async (client) => {
-        const files = await listDir(client, path);
-        // An empty join() is an empty text block, which a caller cannot tell apart from a
-        // read that produced nothing at all. Say so explicitly, the way ssh_find does with
-        // "No files found." -- and, like ssh_find, do NOT flag it: an empty directory is a
-        // legitimate answer to "what is in here?", not a failure.
-        if (files.length === 0) {
-          return { content: [{ type: "text", text: `Directory is empty: ${path}` }] };
-        }
-        return { content: [{ type: "text", text: files.join("\n") }] };
-      });
+      return connectionPool.withConnection(
+        conn,
+        async (client) => {
+          const files = await listDir(client, path);
+          // An empty join() is an empty text block, which a caller cannot tell apart from a
+          // read that produced nothing at all. Say so explicitly, the way ssh_find does with
+          // "No files found." -- and, like ssh_find, do NOT flag it: an empty directory is a
+          // legitimate answer to "what is in here?", not a failure.
+          if (files.length === 0) {
+            return { content: [{ type: "text", text: `Directory is empty: ${path}` }] };
+          }
+          return { content: [{ type: "text", text: files.join("\n") }] };
+        },
+        poolWait(),
+      );
     },
   );
 
   server.tool(
     "ssh_stat",
-    "Get metadata for a file or directory on a remote host via SFTP. Returns size, permissions (octal), uid/gid, mtime/atime, and the path type. Symlinks are reported as `symlink -> <target kind>`: the type describes the link itself while size/mode/mtime describe its TARGET, and a dangling symlink is reported rather than erroring. Use this instead of parsing `ls -la` output.",
+    `Get metadata for a file or directory on a remote host via SFTP. Returns size, permissions (octal), uid/gid, mtime/atime, and the path type. Symlinks are reported as \`symlink -> <target kind>\`: the type describes the link itself while size/mode/mtime describe its TARGET, and a dangling symlink is reported rather than erroring. Use this instead of parsing \`ls -la\` output.${SFTP_POOL_WAIT_NOTE}`,
     {
       ...connectionParams,
       path: AbsoluteRemotePathSchema.describe("Absolute path to the remote file or directory. Must start with /."),
     },
     async ({ path, ...conn }) => {
-      return connectionPool.withConnection(conn, async (client) => {
-        const stats = await statFile(client, path);
-        const lines: string[] = [];
-        // isSymbolicLink describes the PATH, isFile/isDirectory the TARGET, so a
-        // symlink to a directory is legitimately both -- report it as "symlink ->
-        // directory" rather than picking one and hiding the other. Checking
-        // isDirectory first (as this did) made the symlink half permanently
-        // invisible, which is why the flag read as dead.
-        const targetKind = stats.isDirectory ? "directory" : stats.isFile ? "file" : "other";
-        const kind = stats.isSymbolicLink ? `symlink -> ${targetKind}` : targetKind;
-        lines.push(`${path}: ${kind}`);
-        lines.push(`  Size: ${stats.size} bytes`);
-        lines.push(`  Mode: ${stats.modeOctal}`);
-        lines.push(`  Owner: uid=${stats.uid} gid=${stats.gid}`);
-        lines.push(`  Modified: ${new Date(stats.mtime * 1000).toISOString()}`);
-        lines.push(`  Accessed: ${new Date(stats.atime * 1000).toISOString()}`);
-        return { content: [{ type: "text", text: lines.join("\n") }] };
-      });
+      return connectionPool.withConnection(
+        conn,
+        async (client) => {
+          const stats = await statFile(client, path);
+          const lines: string[] = [];
+          // isSymbolicLink describes the PATH, isFile/isDirectory the TARGET, so a
+          // symlink to a directory is legitimately both -- report it as "symlink ->
+          // directory" rather than picking one and hiding the other. Checking
+          // isDirectory first (as this did) made the symlink half permanently
+          // invisible, which is why the flag read as dead.
+          const targetKind = stats.isDirectory ? "directory" : stats.isFile ? "file" : "other";
+          const kind = stats.isSymbolicLink ? `symlink -> ${targetKind}` : targetKind;
+          lines.push(`${path}: ${kind}`);
+          lines.push(`  Size: ${stats.size} bytes`);
+          lines.push(`  Mode: ${stats.modeOctal}`);
+          lines.push(`  Owner: uid=${stats.uid} gid=${stats.gid}`);
+          lines.push(`  Modified: ${new Date(stats.mtime * 1000).toISOString()}`);
+          lines.push(`  Accessed: ${new Date(stats.atime * 1000).toISOString()}`);
+          return { content: [{ type: "text", text: lines.join("\n") }] };
+        },
+        poolWait(),
+      );
     },
   );
 
   server.tool(
     "ssh_mkdir",
-    `Create a directory on a remote host via SFTP. Set \`recursive: true\` to create parent directories as needed (like \`mkdir -p\`). Existing intermediate dirs are tolerated; an existing leaf path is still an error. Unlike the other SFTP tools, the path may be relative.${POLICY_EXEMPT_NOTE}`,
+    `Create a directory on a remote host via SFTP. Set \`recursive: true\` to create parent directories as needed (like \`mkdir -p\`). Existing intermediate dirs are tolerated; an existing leaf path is still an error. Unlike the other SFTP tools, the path may be relative.${SFTP_POOL_WAIT_NOTE}${POLICY_EXEMPT_NOTE}`,
     {
       ...connectionParams,
       path: z
@@ -283,16 +333,20 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
         .describe("Create parent directories as needed (default: false). Like `mkdir -p`."),
     },
     async ({ path, recursive, ...conn }) => {
-      return connectionPool.withConnection(conn, async (client) => {
-        await makeDir(client, path, recursive ?? false);
-        return { content: [{ type: "text", text: `Created directory ${path}` }] };
-      });
+      return connectionPool.withConnection(
+        conn,
+        async (client) => {
+          await makeDir(client, path, recursive ?? false);
+          return { content: [{ type: "text", text: `Created directory ${path}` }] };
+        },
+        poolWait(),
+      );
     },
   );
 
   server.tool(
     "ssh_delete",
-    `Delete a file or empty directory on a remote host via SFTP. Auto-detects the path type and calls the right SFTP op (unlink for files/symlinks, rmdir for empty dirs). Recursive directory delete is intentionally NOT supported -- for that, use ssh_exec with \`rm -rf\` explicitly so the destructive intent is visible in the tool trace.${POLICY_EXEMPT_NOTE}`,
+    `Delete a file or empty directory on a remote host via SFTP. Auto-detects the path type and calls the right SFTP op (unlink for files/symlinks, rmdir for empty dirs). Recursive directory delete is intentionally NOT supported -- for that, use ssh_exec with \`rm -rf\` explicitly so the destructive intent is visible in the tool trace.${SFTP_POOL_WAIT_NOTE}${POLICY_EXEMPT_NOTE}`,
     {
       ...connectionParams,
       path: AbsoluteRemotePathSchema.describe(
@@ -300,10 +354,14 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       ),
     },
     async ({ path, ...conn }) => {
-      return connectionPool.withConnection(conn, async (client) => {
-        await deleteFile(client, path);
-        return { content: [{ type: "text", text: `Deleted ${path}` }] };
-      });
+      return connectionPool.withConnection(
+        conn,
+        async (client) => {
+          await deleteFile(client, path);
+          return { content: [{ type: "text", text: `Deleted ${path}` }] };
+        },
+        poolWait(),
+      );
     },
   );
 
@@ -526,7 +584,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_multi_exec",
-    "Execute a command on multiple remote hosts in parallel. Returns results per host. Use this instead of calling ssh_exec multiple times — it's faster and shows results side by side. Use `env` to set environment variables for this call without modifying the command string. Subject to SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST if configured (policy is checked once, against the env-prefixed command, before fan-out).",
+    "Execute a command on multiple remote hosts in parallel. Runs at most SSH_MCP_MAX_POOL_SIZE hosts at once (default 100) and works through a longer list as slots free up. `timeout` is per host: it bounds each host's command, not the whole call. Each parallel slot works through its share of the list one host at a time, so with the pool to itself a call can take up to about ceil(hosts / SSH_MCP_MAX_POOL_SIZE) x (`timeout` + connect time). The connection pool is shared with every other tool; when it is full this call waits for slots instead of failing, and gives up only when none of its own hosts holds a slot and a full `timeout` has passed with none of them starting or finishing. The hosts waiting at that point (up to one per parallel slot) and every host still queued then report `Connection pool is full`; the queued ones are never attempted. Rerun those hosts once the other calls finish, or raise SSH_MCP_MAX_POOL_SIZE. Returns results per host. Use this instead of calling ssh_exec multiple times — it's faster and shows results side by side. Use `env` to set environment variables for this call without modifying the command string. Subject to SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST if configured (policy is checked once, against the env-prefixed command, before fan-out).",
     {
       hosts: z.array(z.string()).describe("List of SSH hostnames or IPs"),
       command: z.string().describe("Shell command to execute on all hosts"),
@@ -535,7 +593,11 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       privateKeyPath: KeyPathSchema,
       password: PasswordSchema,
       env: EnvSchema,
-      timeout: TimeoutSchema,
+      // Not the shared text: here the pool wait is the call-level no-progress budget, not a
+      // wait before one command starts.
+      timeout: TimeoutSchema.describe(
+        "Per-host command timeout in milliseconds (default: 30000): bounds each host's command, not the whole call. Also the call's no-progress budget on a full pool (see the tool description).",
+      ),
     },
     async ({ hosts, command, port, username, privateKeyPath, password, env, timeout }) => {
       // Same env-prefix + policy semantics as ssh_exec: one prefixed command string, checked
@@ -543,7 +605,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       const { finalCommand, envPrefixApplied } = applyEnvPrefix(command, env);
       enforcePolicy(finalCommand, { envPrefixApplied });
       const hostConfigs = hosts.map((host) => ({ host, port, username, privateKeyPath, password }));
-      const results = await multiExec(connectionPool, hostConfigs, finalCommand, timeout || 30000);
+      const results = await multiExec(connectionPool, hostConfigs, finalCommand, timeout || DEFAULT_TIMEOUT_MS);
 
       const lines: string[] = [];
       for (const r of results) {
@@ -583,13 +645,18 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       timeout: TimeoutSchema,
     },
     async ({ path, name, type, maxdepth, minsize, maxsize, newer, timeout, ...conn }) => {
-      return connectionPool.withConnection(conn, async (client) => {
-        const files = await find(client, { path, name, type, maxdepth, minsize, maxsize, newer }, timeout || 30000);
-        if (files.length === 0) {
-          return { content: [{ type: "text", text: "No files found." }] };
-        }
-        return { content: [{ type: "text", text: `Found ${files.length} result(s):\n${files.join("\n")}` }] };
-      });
+      const timeoutMs = timeout || DEFAULT_TIMEOUT_MS;
+      return connectionPool.withConnection(
+        conn,
+        async (client) => {
+          const files = await find(client, { path, name, type, maxdepth, minsize, maxsize, newer }, timeoutMs);
+          if (files.length === 0) {
+            return { content: [{ type: "text", text: "No files found." }] };
+          }
+          return { content: [{ type: "text", text: `Found ${files.length} result(s):\n${files.join("\n")}` }] };
+        },
+        poolWait(timeoutMs),
+      );
     },
   );
 
@@ -609,26 +676,31 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       timeout: TimeoutSchema,
     },
     async ({ path, lines, grep, timeout, ...conn }) => {
-      return connectionPool.withConnection(conn, async (client) => {
-        const output = await tail(client, path, lines || 100, grep, timeout || 30000);
-        if (!output.trim()) {
-          // Reachable only when the remote produced no stdout AND no stderr. A missing or
-          // unreadable file cannot land here: tail() throws on any non-empty stderr
-          // (src/ops.ts), which is exactly what tail writes for those cases. So the only
-          // thing this branch can be reporting is genuinely blank content.
-          return {
-            content: [
-              {
-                type: "text",
-                text: grep
-                  ? `No lines matching "${grep}" in last ${lines || 100} lines.`
-                  : "File is empty (no content in the last lines read; whitespace-only counts as empty here).",
-              },
-            ],
-          };
-        }
-        return { content: [{ type: "text", text: output }] };
-      });
+      const timeoutMs = timeout || DEFAULT_TIMEOUT_MS;
+      return connectionPool.withConnection(
+        conn,
+        async (client) => {
+          const output = await tail(client, path, lines || 100, grep, timeoutMs);
+          if (!output.trim()) {
+            // Reachable only when the remote produced no stdout AND no stderr. A missing or
+            // unreadable file cannot land here: tail() throws on any non-empty stderr
+            // (src/ops.ts), which is exactly what tail writes for those cases. So the only
+            // thing this branch can be reporting is genuinely blank content.
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: grep
+                    ? `No lines matching "${grep}" in last ${lines || 100} lines.`
+                    : "File is empty (no content in the last lines read; whitespace-only counts as empty here).",
+                },
+              ],
+            };
+          }
+          return { content: [{ type: "text", text: output }] };
+        },
+        poolWait(timeoutMs),
+      );
     },
   );
 
@@ -641,22 +713,27 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       timeout: TimeoutSchema,
     },
     async ({ service, timeout, ...conn }) => {
-      return connectionPool.withConnection(conn, async (client) => {
-        const status = await serviceStatus(client, service, timeout || 30000);
-        const lines: string[] = [];
-        lines.push(`Service: ${status.name}`);
-        lines.push(`Status: ${status.status}`);
-        if (status.description) lines.push(`Description: ${status.description}`);
-        if (status.pid) lines.push(`PID: ${status.pid}`);
-        if (status.since) lines.push(`Since: ${status.since}`);
-        lines.push("");
-        lines.push(status.raw);
-        // isError only when systemctl could not report on the unit at all (typo'd name,
-        // missing unit file, systemd unreachable). "Service exists but is stopped" is a
-        // legitimate state answer to "is this running?", not a failure -- callers gating
-        // on running vs. stopped should read status.active.
-        return { content: [{ type: "text", text: lines.join("\n") }], isError: status.unknown };
-      });
+      const timeoutMs = timeout || DEFAULT_TIMEOUT_MS;
+      return connectionPool.withConnection(
+        conn,
+        async (client) => {
+          const status = await serviceStatus(client, service, timeoutMs);
+          const lines: string[] = [];
+          lines.push(`Service: ${status.name}`);
+          lines.push(`Status: ${status.status}`);
+          if (status.description) lines.push(`Description: ${status.description}`);
+          if (status.pid) lines.push(`PID: ${status.pid}`);
+          if (status.since) lines.push(`Since: ${status.since}`);
+          lines.push("");
+          lines.push(status.raw);
+          // isError only when systemctl could not report on the unit at all (typo'd name,
+          // missing unit file, systemd unreachable). "Service exists but is stopped" is a
+          // legitimate state answer to "is this running?", not a failure -- callers gating
+          // on running vs. stopped should read status.active.
+          return { content: [{ type: "text", text: lines.join("\n") }], isError: status.unknown };
+        },
+        poolWait(timeoutMs),
+      );
     },
   );
 }
