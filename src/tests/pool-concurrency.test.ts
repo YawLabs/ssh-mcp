@@ -385,9 +385,11 @@ describe("ConnectionPool — maxPoolSize eviction", () => {
 
   // --- waitForCapacity: opt-in backpressure on top of the fail-fast acquire() ---
   //
-  // Every wait below uses a SHORT timeout and asserts the resolved value: `true` means the
-  // pool woke the waiter, `false` means it slept to the timeout. A missing notify therefore
-  // shows up as `false`, not as a hang.
+  // The real-timer waits below use a SHORT timeout and assert the resolved value: `true` means
+  // the pool woke the waiter, `false` means it slept to the timeout, so a missing notify shows
+  // up as `false`, not as a hang. The one fake-timer test parks on 60s timers the clock never
+  // reaches; it asserts vi.getTimerCount() BEFORE each await instead, so a missing notify fails
+  // on a count (the wait timer still armed) rather than hanging to the test timeout.
 
   it("rejects a full pool with a PoolFullError identified by its code, and a failed dial with neither", async () => {
     const pool = new ConnectionPool({ maxPoolSize: 1 });
@@ -501,14 +503,15 @@ describe("ConnectionPool — maxPoolSize eviction", () => {
       const wait = pool.waitForCapacity(60_000);
       expect(vi.getTimerCount()).toBe(1);
       pool.release(held); // arms the entry's idle timer, wakes the waiter
-      expect(await wait).toBe(true);
+      // Checked before awaiting: a missed wake leaves the wait timer armed beside the idle one.
       expect(vi.getTimerCount()).toBe(1); // only the idle timer: the wait timer was cleared
+      expect(await wait).toBe(true);
 
       const again = await pool.acquire({ host: "clear-held.example.com" });
       const parked = pool.waitForCapacity(60_000);
       pool.drain();
+      expect(vi.getTimerCount()).toBe(0); // before awaiting: drain() woke it and cleared its timer
       expect(await parked).toBe(true); // woken, not left to sit out 60s
-      expect(vi.getTimerCount()).toBe(0);
       await expect(pool.acquire({ host: "clear-after.example.com" })).rejects.toThrow(/drained/);
       // Already drained: resolves at once rather than arming a timer.
       expect(await pool.waitForCapacity(60_000)).toBe(true);

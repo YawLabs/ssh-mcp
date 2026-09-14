@@ -183,6 +183,11 @@ export class ConnectionPool {
 
   // The fail-fast acquire: one admission check, one dial (or a join on an in-flight one).
   private async acquireNow(config: SSHConfig): Promise<Client> {
+    // Checked BEFORE resolving: resolveConfig can run a synchronous `ssh -G` spawn, and a
+    // fan-out's workers reach here once per queued host after drain() wakes them, all in one
+    // microtask chain -- paying a spawn per host there would stall the shutdown timer behind it.
+    // The in-loop check below still covers a drain that lands during the dial.
+    if (this.drained) throw new Error("ConnectionPool was drained");
     const resolved = resolveOrDiagnose(config);
     const cc = resolved.connectConfig;
     const key = `${cc.username}@${cc.host}:${cc.port}#${authFingerprint(cc)}`;
@@ -226,25 +231,19 @@ export class ConnectionPool {
         // factory's `entries.set` and its `finally` `pending.delete` run in one
         // synchronous segment, and a failed dial runs only the delete, freeing its slot.
         if (this.entries.size + this.pending.size >= this.maxPoolSize) {
-          let evicted = false;
-          for (const [k, e] of this.entries) {
-            if (e.refCount === 0) {
-              if (e.idleTimer) clearTimeout(e.idleTimer);
-              try {
-                e.client.end();
-              } catch {
-                /* already closed */
-              }
-              this.entries.delete(k);
-              evicted = true;
-              break;
-            }
-          }
-          // No notifyCapacity() on eviction: this acquire takes the freed slot in the same
-          // synchronous segment (pending.set below), so nothing opened up for anyone else.
-          if (!evicted) {
+          const victim = this.findEvictable();
+          if (!victim) {
             throw new PoolFullError(this.maxPoolSize);
           }
+          if (victim.idleTimer) clearTimeout(victim.idleTimer);
+          try {
+            victim.client.end();
+          } catch {
+            /* already closed */
+          }
+          this.entries.delete(victim.key);
+          // No notifyCapacity() on eviction: this acquire takes the freed slot in the same
+          // synchronous segment (pending.set below), so nothing opened up for anyone else.
         }
 
         const promise = (async () => {
@@ -448,13 +447,19 @@ export class ConnectionPool {
     });
   }
 
-  // Mirrors acquire()'s admission test for a new key: below the cap, or an idle entry to evict.
+  // acquireNow()'s admission test for a new key: below the cap, or an entry to evict.
   private hasCapacity(): boolean {
-    if (this.entries.size + this.pending.size < this.maxPoolSize) return true;
+    return this.entries.size + this.pending.size < this.maxPoolSize || this.findEvictable() !== undefined;
+  }
+
+  // The eviction rule, in one place: the first entry (insertion order) no caller holds. Both
+  // acquireNow()'s eviction and hasCapacity() read it, so waitForCapacity's re-check can never
+  // disagree with what an acquire would actually evict.
+  private findEvictable(): PoolEntry | undefined {
     for (const e of this.entries.values()) {
-      if (e.refCount === 0) return true;
+      if (e.refCount === 0) return e;
     }
-    return false;
+    return undefined;
   }
 
   private notifyCapacity(): void {
