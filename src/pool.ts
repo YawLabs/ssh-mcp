@@ -14,14 +14,73 @@ export interface PoolOptions {
   /** Milliseconds before an idle connection is closed. Default: 60000 (60s) */
   idleTtlMs?: number;
   /**
-   * Maximum number of connections in the pool. Default: 100, overridable via the
+   * Maximum number of connections in the pool, counting dials still in flight.
+   * Default: 100, overridable via the
    * `SSH_MCP_MAX_POOL_SIZE` env var. When at capacity, the pool first tries to evict
-   * an idle entry; if every entry is in use, `acquire()` rejects with
-   * "Connection pool is full". Bump this for fan-out workloads against many distinct
-   * hosts (e.g. `ssh_multi_exec` across a large fleet).
+   * an idle entry; if no idle entry can be evicted (every slot is in use or dialing),
+   * `acquire()` rejects with a {@link PoolFullError} ("Connection pool is full") -- at once
+   * by default, or once `waitForCapacityMs` (see {@link AcquireOptions}) passes without winning a slot.
+   * Bump this for fan-out workloads against many distinct hosts (e.g. `ssh_multi_exec`
+   * across a large fleet, which runs at most this many hosts at once).
    */
   maxPoolSize?: number;
 }
+
+export interface AcquireOptions {
+  /**
+   * How long `acquire()` / `withConnection()` may wait for a slot when the pool is full,
+   * in milliseconds. Default 0: reject at once with a {@link PoolFullError}. With a budget,
+   * the caller parks (see `waitForCapacity`) and retries on every capacity signal until a
+   * slot is won or the budget is spent, then rejects with a {@link PoolFullError} whose
+   * message says "no slot became available to this call within <budget>ms". Only a capacity rejection is
+   * waited out; connect failures and a drained pool reject at once as before.
+   */
+  waitForCapacityMs?: number;
+}
+
+/** `code` of the error `acquire()` throws when no slot is free. Match on this, not on the message. */
+export const POOL_FULL_ERROR_CODE = "ERR_SSH_MCP_POOL_FULL";
+
+/**
+ * Thrown by `acquire()` when a new connection is needed and no slot is free: every slot is
+ * held by an in-use entry or an in-flight dial, and no idle entry can be evicted. Distinct
+ * from connect and exec failures so a caller that can wait (see `waitForCapacity`) retries
+ * only on this. `waitedMs` is set when the caller asked to wait and the budget ran out; the
+ * message then carries the "no slot became available to this call within <n>ms" suffix and a
+ * remedy sentence -- appended here, once, so no caller has to add it.
+ */
+export class PoolFullError extends Error {
+  readonly code = POOL_FULL_ERROR_CODE;
+  readonly maxPoolSize: number;
+  readonly waitedMs?: number;
+  constructor(maxPoolSize: number, waitedMs?: number) {
+    // This text reaches an MCP caller verbatim as the tool result, so it names the knob and,
+    // on the waited form, what to do. Only the "Connection pool is full (" prefix is stable;
+    // match on `code` / isPoolFullError(), never on the rest.
+    const base = `Connection pool is full (${maxPoolSize} connections in use or dialing, the SSH_MCP_MAX_POOL_SIZE cap)`;
+    super(
+      waitedMs === undefined
+        ? base
+        : // "became available to this call", not "freed up": every capacity signal wakes every
+          // parked caller, so a slot can free during the wait and still go to someone else.
+          `${base}; no slot became available to this call within ${Math.round(waitedMs)}ms. Retry once the calls holding the slots finish, or raise the cap (SSH_MCP_MAX_POOL_SIZE in the MCP server's environment).`,
+    );
+    this.name = "PoolFullError";
+    this.maxPoolSize = maxPoolSize;
+    if (waitedMs !== undefined) this.waitedMs = waitedMs;
+  }
+}
+
+/**
+ * True for the pool's capacity rejection. Checks `code` rather than `instanceof`, so it still
+ * holds when two copies of this module are loaded (the CLI and library bundles are separate).
+ */
+export function isPoolFullError(err: unknown): err is PoolFullError {
+  return typeof err === "object" && err !== null && (err as { code?: unknown }).code === POOL_FULL_ERROR_CODE;
+}
+
+// setTimeout clamps anything above a signed 32-bit millisecond count to 1ms.
+const MAX_TIMER_MS = 2_147_483_647;
 
 function defaultMaxPoolSize(): number {
   const raw = process.env.SSH_MCP_MAX_POOL_SIZE;
@@ -92,13 +151,52 @@ export class ConnectionPool {
   // factory closes the freshly-connected client instead of registering it.
   // Consumers must construct a new pool to use again.
   private drained = false;
+  // Callers parked in waitForCapacity(). Every site that can free a slot for a NEW key calls
+  // notifyCapacity(), which wakes all of them: an entry dropping to refCount 0 (it becomes
+  // evictable), an entry leaving the map (markDead, idle expiry), a dial failing without
+  // registering, and drain(). Waking all rather than one means a woken caller that does not
+  // take the slot (its retry fails for another reason, or joins a same-key dial) cannot
+  // strand the rest; the losers of a wake just find the pool full again and re-park.
+  private capacityWaiters = new Set<() => void>();
 
   constructor(options?: PoolOptions) {
     this.idleTtlMs = options?.idleTtlMs ?? 60_000;
     this.maxPoolSize = options?.maxPoolSize ?? defaultMaxPoolSize();
   }
 
-  async acquire(config: SSHConfig): Promise<Client> {
+  /**
+   * Checks out a connection for `config`, dialing one if needed. Fails fast on a full pool
+   * unless `options.waitForCapacityMs` is set, in which case the caller parks and retries on
+   * every capacity signal until it wins a slot or the budget is spent. The wait is bounded,
+   * never a reservation: a woken caller can lose the slot to another and simply parks again
+   * for whatever budget is left. The final rejection carries the budget in its message.
+   */
+  async acquire(config: SSHConfig, options?: AcquireOptions): Promise<Client> {
+    const budgetMs = options?.waitForCapacityMs ?? 0;
+    if (!(budgetMs > 0)) return this.acquireNow(config);
+    const deadline = performance.now() + budgetMs;
+    for (;;) {
+      try {
+        return await this.acquireNow(config);
+      } catch (err: unknown) {
+        if (!isPoolFullError(err)) throw err;
+        const remaining = deadline - performance.now();
+        if (remaining <= 0) throw new PoolFullError(this.maxPoolSize, budgetMs);
+        // Resolves at once when the slot freed before we parked, on any capacity signal, or
+        // when `remaining` runs out -- in which case the retry above is the one final attempt
+        // (a slot can free right at the boundary) before the budget is declared spent.
+        await this.waitForCapacity(remaining);
+      }
+    }
+  }
+
+  // The fail-fast acquire: one admission check, one dial (or a join on an in-flight one).
+  private async acquireNow(config: SSHConfig): Promise<Client> {
+    // Checked BEFORE resolving: resolveConfig can run a synchronous `ssh -G` spawn, and a
+    // fan-out's workers reach here once per queued host after drain() wakes them, all in one
+    // microtask chain -- paying a spawn per host there would stall the shutdown timer behind it.
+    // The in-loop check below still covers a drain that lands during the dial.
+    if (this.drained) throw new Error("ConnectionPool was drained");
     const resolved = resolveOrDiagnose(config);
     const cc = resolved.connectConfig;
     const key = `${cc.username}@${cc.host}:${cc.port}#${authFingerprint(cc)}`;
@@ -133,27 +231,32 @@ export class ConnectionPool {
       let inflight = this.pending.get(key);
       if (!inflight) {
         // Eviction is only needed when we're about to create a new entry.
-        if (this.entries.size >= this.maxPoolSize) {
-          let evicted = false;
-          for (const [k, e] of this.entries) {
-            if (e.refCount === 0) {
-              if (e.idleTimer) clearTimeout(e.idleTimer);
-              try {
-                e.client.end();
-              } catch {
-                /* already closed */
-              }
-              this.entries.delete(k);
-              evicted = true;
-              break;
-            }
+        //
+        // In-flight dials count against the cap: `entries.set` only runs after
+        // `connectWithProxy` resolves, so checking `entries.size` alone let N concurrent
+        // acquires to N distinct hosts all pass and open N connections past the limit.
+        // Same-key callers never reach this check (they join `pending` above), so a
+        // shared dial does not reject its own waiters. No slot is counted twice: the
+        // factory's `entries.set` and its `finally` `pending.delete` run in one
+        // synchronous segment, and a failed dial runs only the delete, freeing its slot.
+        if (this.entries.size + this.pending.size >= this.maxPoolSize) {
+          const victim = this.findEvictable();
+          if (!victim) {
+            throw new PoolFullError(this.maxPoolSize);
           }
-          if (!evicted) {
-            throw new Error(`Connection pool is full (${this.maxPoolSize} active connections)`);
+          if (victim.idleTimer) clearTimeout(victim.idleTimer);
+          try {
+            victim.client.end();
+          } catch {
+            /* already closed */
           }
+          this.entries.delete(victim.key);
+          // No notifyCapacity() on eviction: this acquire takes the freed slot in the same
+          // synchronous segment (pending.set below), so nothing opened up for anyone else.
         }
 
         const promise = (async () => {
+          let registered = false;
           try {
             const client = await connectWithProxy(resolved);
             // If drain() ran while we were dialing, do not register this client
@@ -181,6 +284,7 @@ export class ConnectionPool {
               }
               if (this.entries.get(key) === entry) {
                 this.entries.delete(key);
+                this.notifyCapacity();
               }
             };
             client.on("close", markDead);
@@ -188,9 +292,15 @@ export class ConnectionPool {
             client.on("error", markDead);
 
             this.entries.set(key, entry);
+            registered = true;
             return client;
           } finally {
             this.pending.delete(key);
+            // A failed dial frees its slot outright. A successful one only moves it from
+            // `pending` to `entries`, so waking waiters there would free nothing -- and would
+            // send them into the window before this acquire takes its ref, where the new
+            // refCount-0 entry still looks evictable.
+            if (!registered) this.notifyCapacity();
           }
         })();
         // `resolved` here is this caller's, and it is the one the factory above dials
@@ -244,8 +354,15 @@ export class ConnectionPool {
               // already closed
             }
             this.entries.delete(entry.key);
+            // Redundant under today's admission rule -- the entry was already evictable, so
+            // the notify below (and waitForCapacity's re-check) covered anyone who could be
+            // parked -- and kept so that every site removing an entry notifies, which is the
+            // invariant a changed eviction rule would rely on.
+            this.notifyCapacity();
           }, this.idleTtlMs);
           entry.idleTimer.unref();
+          // An idle entry is evictable, so a new host fits from this point on.
+          this.notifyCapacity();
         }
         return;
       }
@@ -260,8 +377,9 @@ export class ConnectionPool {
     }
   }
 
-  async withConnection<T>(config: SSHConfig, fn: (client: Client) => Promise<T>): Promise<T> {
-    const client = await this.acquire(config);
+  /** `acquire()` + `fn` + `release()`, with the same optional bounded wait for a slot. */
+  async withConnection<T>(config: SSHConfig, fn: (client: Client) => Promise<T>, options?: AcquireOptions): Promise<T> {
+    const client = await this.acquire(config, options);
     try {
       return await fn(client);
     } finally {
@@ -285,10 +403,94 @@ export class ConnectionPool {
     }
     this.entries.clear();
     this.pending.clear();
+    // Parked callers must not sit out their timeout against a pool that will never free a
+    // slot: wake them, and their retry sees the drained pool and rejects.
+    this.notifyCapacity();
+  }
+
+  /**
+   * Parks until the pool's capacity may have changed, for a caller whose `acquire()` just
+   * rejected with a {@link PoolFullError} and that would rather wait than fail. This is the
+   * primitive behind `acquire()`'s `waitForCapacityMs` option; a bare `acquire()` never waits.
+   *
+   * Resolves `true` when a slot may be free (woken by a release, an entry closing or expiring,
+   * a failed dial, or `drain()`), or at once if a new host would fit right now or the pool is
+   * already drained. Resolves `false` after `timeoutMs` with nothing having changed. Never
+   * rejects. A `true` is a hint, not a reservation: another caller can take the slot first,
+   * so retry `acquire()` and wait again on another `PoolFullError`. The timer is cleared on
+   * wake and unref'd, so a parked caller never holds the process open.
+   *
+   * Aborting `signal` ends the park early with `false`, as if the timer had run out; an
+   * already-aborted signal resolves `false` without parking, unless the pool is drained or a
+   * new host would fit right now. A wake that lands first still resolves `true`. A caller that
+   * gives up on its own (`ssh_multi_exec` declaring the call starved) aborts rather than racing
+   * this promise against another: the race would add a promise hop to every wake.
+   */
+  waitForCapacity(timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const settle = (woken: boolean) => {
+        if (timer !== undefined) clearTimeout(timer);
+        this.capacityWaiters.delete(wake);
+        signal?.removeEventListener("abort", abort);
+        resolve(woken);
+      };
+      // Resolved synchronously from notifyCapacity(), with no extra promise hop: a waiter's
+      // continuation must be queued before the releasing caller's own, which is what puts a
+      // single-host call next in line inside a fan-out.
+      const wake = () => settle(true);
+      const abort = () => settle(false);
+      this.capacityWaiters.add(wake);
+      if (this.drained) {
+        wake();
+        return;
+      }
+      // Re-check AFTER registering. The caller's acquire() rejected some microtasks before
+      // this call, and a slot freed in between notified nobody; without this check the
+      // caller would sleep through capacity that is already there.
+      if (this.hasCapacity()) {
+        wake();
+        return;
+      }
+      if (!(timeoutMs > 0) || signal?.aborted) {
+        abort();
+        return;
+      }
+      timer = setTimeout(abort, Math.min(timeoutMs, MAX_TIMER_MS));
+      timer.unref();
+      signal?.addEventListener("abort", abort, { once: true });
+    });
+  }
+
+  // acquireNow()'s admission test for a new key: below the cap, or an entry to evict.
+  private hasCapacity(): boolean {
+    return this.entries.size + this.pending.size < this.maxPoolSize || this.findEvictable() !== undefined;
+  }
+
+  // The eviction rule, in one place: the first entry (insertion order) no caller holds. Both
+  // acquireNow()'s eviction and hasCapacity() read it, so waitForCapacity's re-check can never
+  // disagree with what an acquire would actually evict.
+  private findEvictable(): PoolEntry | undefined {
+    for (const e of this.entries.values()) {
+      if (e.refCount === 0) return e;
+    }
+    return undefined;
+  }
+
+  private notifyCapacity(): void {
+    if (this.capacityWaiters.size === 0) return;
+    const waiters = [...this.capacityWaiters];
+    this.capacityWaiters.clear();
+    for (const wake of waiters) wake();
   }
 
   get size(): number {
     return this.entries.size;
+  }
+
+  /** The connection cap (`maxPoolSize`), counting pooled entries plus in-flight dials. */
+  get maxSize(): number {
+    return this.maxPoolSize;
   }
 
   get stats(): { active: number; idle: number } {

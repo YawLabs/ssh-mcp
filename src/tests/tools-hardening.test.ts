@@ -823,6 +823,50 @@ describe("the env-prefix docs describe the key check, not just value quoting", (
   });
 });
 
+describe("the pool wait is stated where a caller can see it before spending it", () => {
+  // Every pool-backed tool parks on a full pool (tools.ts `poolWait`). The error text names
+  // the wait only once it has been spent, so the descriptions have to say it up front, and
+  // name the knob (SSH_MCP_MAX_POOL_SIZE) that changes it.
+  const SFTP_TOOLS = [
+    "ssh_read_file",
+    "ssh_write_file",
+    "ssh_upload",
+    "ssh_download",
+    "ssh_ls",
+    "ssh_stat",
+    "ssh_mkdir",
+    "ssh_delete",
+  ];
+  const TIMEOUT_TOOLS = ["ssh_exec", "ssh_find", "ssh_tail", "ssh_service_status"];
+
+  it.each(TIMEOUT_TOOLS)("%s's `timeout` says it also bounds the wait for a pool slot", (name) => {
+    const description = (getTool(name).schema.timeout as { description?: string }).description ?? "";
+    expect(description).toMatch(/^Command timeout in milliseconds \(default: 30000\)/);
+    expect(description).toMatch(/waits for a free connection-pool slot/);
+    expect(description).toContain("SSH_MCP_MAX_POOL_SIZE");
+  });
+
+  it.each(SFTP_TOOLS)("%s (no `timeout` parameter) says it waits up to 30s for a slot", (name) => {
+    const { description, schema } = getTool(name);
+    expect(schema.timeout).toBeUndefined(); // the reason the note is on the description
+    // 30s is DEFAULT_TIMEOUT_MS, the budget tools-remote-handlers pins these tools passing.
+    expect(description).toContain("waits up to 30s for a free slot");
+    expect(description).toContain("SSH_MCP_MAX_POOL_SIZE");
+  });
+
+  it("ssh_multi_exec says `timeout` is per host, states the cap, and gives the remedy", () => {
+    const { description, schema } = getTool("ssh_multi_exec");
+    expect(description).toContain("Runs at most SSH_MCP_MAX_POOL_SIZE hosts at once (default 100)");
+    expect(description).toContain("`timeout` is per host");
+    // The starvation rule in plain words: BOTH conditions, in this order.
+    expect(description).toMatch(/none of its own hosts holds a slot and a full `timeout` has passed/);
+    expect(description).toMatch(/or raise SSH_MCP_MAX_POOL_SIZE/);
+    const timeoutDescription = (schema.timeout as { description?: string }).description ?? "";
+    expect(timeoutDescription).toMatch(/^Per-host command timeout/);
+    expect(timeoutDescription).toMatch(/not the whole call/);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Branches v8 coverage showed were never executed. Small, but each is a line an
 // operator actually reads, and none had a single test through the handler.

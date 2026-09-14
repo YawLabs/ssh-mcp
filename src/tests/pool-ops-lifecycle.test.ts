@@ -7,19 +7,23 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // Mock ONLY connectWithProxy. resolveConfig, exec, hostVerifier, etc. keep their real
 // implementations, so both the pool's lifecycle logic and multiExec's use of the real
 // exec() channel state machine run for real. Same boundary as pool-concurrency.test.ts.
+// resolveConfig is wrapped in a pass-through spy (the real function still runs) so a test can
+// count which hosts the pool resolved.
 vi.mock("../ssh.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../ssh.js")>();
   return {
     ...actual,
     connectWithProxy: vi.fn(),
+    resolveConfig: vi.fn(actual.resolveConfig),
   };
 });
 
 import { find, type MultiExecHost, multiExec, serviceStatus } from "../ops.js";
-import { ConnectionPool } from "../pool.js";
-import { connectWithProxy } from "../ssh.js";
+import { ConnectionPool, PoolFullError } from "../pool.js";
+import { connectWithProxy, exec, resolveConfig } from "../ssh.js";
 
 const mockedConnect = vi.mocked(connectWithProxy);
+const resolveSpy = vi.mocked(resolveConfig);
 
 // ---------------------------------------------------------------------------
 // GAP 3 — multiExec mixed success/failure fan-out
@@ -195,6 +199,692 @@ describe("multiExec — mixed success/failure fan-out", () => {
     expect(results.map((r) => r.host)).toEqual(["a.test", "b.test", "c.test"]);
     expect(results.map((r) => r.error)).toEqual(["boom a", "boom b", "boom c"]);
     expect(results.every((r) => r.code === -1)).toBe(true);
+  });
+});
+
+describe("multiExec — fan-out wider than the pool cap", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+    mockedConnect.mockReset();
+  });
+
+  it("completes every host as slots free up on a REAL pool, never opening more than maxSize connections, in input order", async () => {
+    // The pool counts in-flight dials against maxPoolSize, so firing all six hosts at
+    // once would fail four of them with "Connection pool is full". multiExec must pace
+    // the fan-out to the cap and let each released (idle) entry be evicted for the next.
+    const CAP = 2;
+    const hosts: MultiExecHost[] = Array.from({ length: 6 }, (_, i) => ({ host: `wave-${i}.test` }));
+    let open = 0;
+    let peak = 0;
+    mockedConnect.mockImplementation(async (resolved) => {
+      const host = String(resolved.connectConfig.host);
+      const idx = hosts.findIndex((h) => h.host === host);
+      if (idx < 0) throw new Error(`test bug: unexpected host ${host}`);
+      open++;
+      peak = Math.max(peak, open);
+      const client = makeQuietClient() as EventEmitter & { endCalls: number; end: () => void; exec: unknown };
+      client.end = () => {
+        if (client.endCalls++ === 0) open--;
+      };
+      client.exec = (_command: string, cb: (err: Error | null, stream: unknown) => void) => {
+        const stream = new EventEmitter() as EventEmitter & { stderr: EventEmitter };
+        stream.stderr = new EventEmitter();
+        cb(null, stream);
+        // Later hosts finish sooner, so completion order is NOT input order.
+        setTimeout(
+          () => {
+            stream.emit("data", Buffer.from(`out:${host}\n`));
+            stream.emit("close", 0);
+          },
+          (hosts.length - idx) * 5,
+        );
+      };
+      return client as never;
+    });
+
+    const pool = new ConnectionPool({ maxPoolSize: CAP });
+    try {
+      const results = await multiExec(pool, hosts, "hostname");
+
+      expect(results.map((r) => r.error)).toEqual(hosts.map(() => undefined));
+      expect(results.map((r) => r.host)).toEqual(hosts.map((h) => h.host));
+      // Each host's OWN output sits at its own index.
+      expect(results.map((r) => r.stdout)).toEqual(hosts.map((h) => `out:${h.host}\n`));
+      expect(mockedConnect).toHaveBeenCalledTimes(hosts.length);
+      // Parallel up to the cap, and never past it.
+      expect(peak).toBe(CAP);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("runs every host concurrently when the pool exposes no usable maxSize", async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const barePool = {
+      async withConnection<T>(_config: unknown, fn: (client: never) => Promise<T>): Promise<T> {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        await new Promise((r) => setTimeout(r, 5));
+        inFlight--;
+        return fn(scriptedClient({ stdout: "ok\n" }) as never);
+      },
+    } as unknown as ConnectionPool;
+
+    const results = await multiExec(barePool, [{ host: "x.test" }, { host: "y.test" }, { host: "z.test" }], "true");
+
+    expect(results.map((r) => r.host)).toEqual(["x.test", "y.test", "z.test"]);
+    expect(peak).toBe(3);
+  });
+});
+
+describe("multiExec — waits for pool capacity held by OTHER callers", () => {
+  // The pool is shared by every tool. multiExec pacing its own workers to the cap does not
+  // stop a slot held elsewhere from rejecting its acquires; those rejections must be waited
+  // out and retried, not recorded as the host's result -- recording them used to fail the
+  // rest of the queue within microtasks, one rejected host after another.
+  const DIAL_MS = 10;
+  const EXEC_MS = 20;
+
+  /** Dials take DIAL_MS, every command takes `execMs` and prints `out:<host>`. Tracks open/peak. */
+  function timedConnects(execMs = EXEC_MS) {
+    const stats = { open: 0, peak: 0 };
+    mockedConnect.mockImplementation(async (resolved) => {
+      const host = String(resolved.connectConfig.host);
+      await new Promise((r) => setTimeout(r, DIAL_MS));
+      stats.open++;
+      stats.peak = Math.max(stats.peak, stats.open);
+      const client = makeQuietClient() as EventEmitter & { endCalls: number; end: () => void; exec: unknown };
+      client.end = () => {
+        if (client.endCalls++ === 0) stats.open--;
+      };
+      client.exec = (_command: string, cb: (err: Error | null, stream: unknown) => void) => {
+        const stream = new EventEmitter() as EventEmitter & { stderr: EventEmitter };
+        stream.stderr = new EventEmitter();
+        cb(null, stream);
+        setTimeout(() => {
+          stream.emit("data", Buffer.from(`out:${host}\n`));
+          stream.emit("close", 0);
+        }, execMs);
+      };
+      return client as never;
+    });
+    return stats;
+  }
+
+  const fleet = (prefix: string, n: number): MultiExecHost[] =>
+    Array.from({ length: n }, (_, i) => ({ host: `${prefix}-${i}.test` }));
+
+  // resolveConfig memoizes a synchronous `ssh -G` spawn per host (hundreds of ms each on
+  // Windows, far more under load). Resolving a fleet up front keeps those stalls out of a
+  // real-timer run, so a short `timeout` there bounds the pool wait and nothing else.
+  const warmResolve = (hosts: MultiExecHost[]) => {
+    for (const h of hosts) resolveConfig(h);
+  };
+  // Every dial's host, in dial order.
+  const dialOrder = () => mockedConnect.mock.calls.map(([resolved]) => String(resolved.connectConfig.host));
+
+  beforeEach(() => {
+    vi.useRealTimers();
+    mockedConnect.mockReset();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("completes every host while one slot is held outside the fan-out", async () => {
+    const stats = timedConnects();
+    const pool = new ConnectionPool({ maxPoolSize: 3 });
+    try {
+      // e.g. a long-running ssh_exec holding one of the three slots for the whole fan-out.
+      const held = await pool.acquire({ host: "held-outside.test" });
+      const hosts = fleet("outside", 9);
+      warmResolve(hosts);
+
+      // A short budget, so a lost release notify fails on an assertion, not on the test timeout.
+      const results = await multiExec(pool, hosts, "hostname", 2_000);
+
+      expect(results.map((r) => r.error)).toEqual(hosts.map(() => undefined));
+      expect(results.map((r) => r.stdout)).toEqual(hosts.map((h) => `out:${h.host}\n`));
+      expect(stats.peak).toBeLessThanOrEqual(3);
+      // The results alone do not prove the wake: with release() notifying nobody, the worker
+      // parked on outside-2 still finishes once its timer runs out and its re-park's capacity
+      // re-check finds an idle entry -- after its siblings have run every other host. Woken by
+      // the first release, it dials before the last host does.
+      const dials = dialOrder();
+      expect(dials.indexOf(hosts[2].host)).toBeLessThan(dials.indexOf(hosts[8].host));
+      pool.release(held);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("completes both of two concurrent fan-outs that together need twice the cap", async () => {
+    timedConnects();
+    const pool = new ConnectionPool({ maxPoolSize: 4 });
+    try {
+      const first = fleet("first", 8);
+      const second = fleet("second", 8);
+      warmResolve([...first, ...second]);
+
+      // A short budget, so a lost release notify fails on the error arrays, not on the test timeout.
+      const [a, b] = await Promise.all([
+        multiExec(pool, first, "hostname", 2_000),
+        multiExec(pool, second, "hostname", 2_000),
+      ]);
+
+      expect(a.map((r) => r.error)).toEqual(first.map(() => undefined));
+      expect(b.map((r) => r.error)).toEqual(second.map(() => undefined));
+      expect(b.map((r) => r.stdout)).toEqual(second.map((h) => `out:${h.host}\n`));
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("still records 'Connection pool is full' once the call has gone timeoutMs without a slot", async () => {
+    // multiExec and the pool's wait loop measure the bound with performance.now(). Vitest's
+    // fake clock covers it (the default toFake is everything but nextTick / queueMicrotask),
+    // so advancing the clock moves the deadline too; a narrower toFake would leave the retry
+    // loop re-parking on real time and this test would hang instead of settling at the bound.
+    vi.useFakeTimers();
+    mockedConnect.mockImplementation(async () => makeQuietClient() as never);
+    const pool = new ConnectionPool({ maxPoolSize: 1 });
+    try {
+      const held = await pool.acquire({ host: "hog.test" }); // never released during the wait
+      const BOUND = 1_000;
+      let settled = false;
+      const run = multiExec(pool, [{ host: "starved.test" }], "true", BOUND).then((r) => {
+        settled = true;
+        return r;
+      });
+
+      await vi.advanceTimersByTimeAsync(BOUND - 1);
+      expect(settled).toBe(false); // still waiting inside the bound
+
+      await vi.advanceTimersByTimeAsync(1);
+      // Settled at the bound, checked BEFORE awaiting: a wait that overruns it must fail here,
+      // not hang to the test timeout with the fake clock never advanced again.
+      expect(settled).toBe(true);
+      const [result] = await run;
+      expect(result).toMatchObject({ host: "starved.test", code: -1 });
+      expect(result.error).toMatch(/Connection pool is full/);
+      expect(result.error).toContain(`no slot became available to this call within ${BOUND}ms`);
+      expect(mockedConnect).toHaveBeenCalledTimes(1); // the starved host never dialed
+      // The wait timer is gone -- nothing left armed behind the recorded result.
+      expect(vi.getTimerCount()).toBe(0);
+      pool.release(held);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("does not hang when the pool is drained while hosts are waiting for a slot", async () => {
+    // Asserted on TIME, not only on the error text: a parked worker whose wait merely ran out
+    // retries against the drained pool and records /drained/ just the same, so only settling
+    // right at drain() -- with the clock nowhere near the bound -- proves drain() woke it.
+    vi.useFakeTimers();
+    mockedConnect.mockImplementation(async () => makeQuietClient() as never);
+    const pool = new ConnectionPool({ maxPoolSize: 1 });
+    try {
+      await pool.acquire({ host: "hog-until-shutdown.test" });
+      const BOUND = 60_000;
+      let settled = false;
+      const run = multiExec(pool, [{ host: "queued-1.test" }, { host: "queued-2.test" }], "true", BOUND).then((r) => {
+        settled = true;
+        return r;
+      });
+      await vi.advanceTimersByTimeAsync(5); // let the worker hit the full pool and park
+      expect(settled).toBe(false);
+      expect(vi.getTimerCount()).toBe(1); // parked: its wait timer is the only one armed
+
+      pool.drain();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBe(true); // 1ms after drain(), 59,994ms short of the bound
+      const results = await run;
+      expect(results.map((r) => r.host)).toEqual(["queued-1.test", "queued-2.test"]);
+      for (const r of results) expect(r.error).toBe("ConnectionPool was drained");
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("stops resolving the queued hosts once drain() lands mid-fan-out", async () => {
+    // resolveConfig can run a synchronous `ssh -G` spawn per host. drain() wakes the parked
+    // workers, and each then runs through every queued host in one microtask chain; a drained
+    // check that sat below the resolve paid one spawn per queued host there, stalling the
+    // process's shutdown timer behind it. Only the first host of each worker may be resolved.
+    vi.useFakeTimers();
+    mockedConnect.mockImplementation(async () => makeQuietClient() as never);
+    const pool = new ConnectionPool({ maxPoolSize: 2 });
+    try {
+      await Promise.all(fleet("hog", 2).map((h) => pool.acquire(h))); // held until shutdown
+      const hosts = fleet("drained-queue", 6);
+      resolveSpy.mockClear();
+      let settled = false;
+      const run = multiExec(pool, hosts, "true", 60_000).then((r) => {
+        settled = true;
+        return r;
+      });
+      await vi.advanceTimersByTimeAsync(5); // both workers hit the full pool and park
+      const resolvedHosts = () => resolveSpy.mock.calls.map(([config]) => config.host);
+      expect(resolvedHosts()).toEqual([hosts[0].host, hosts[1].host]);
+
+      pool.drain();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBe(true);
+      const results = await run;
+      expect(results.map((r) => r.error)).toEqual(hosts.map(() => "ConnectionPool was drained"));
+      // Neither the woken retries nor the four queued hosts were resolved again.
+      expect(resolvedHosts()).toEqual([hosts[0].host, hosts[1].host]);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("a single-host call arriving mid-fan-out takes the next freed slot instead of being refused for the whole run", async () => {
+    // The shared pool's other tenants: a fan-out's workers release and re-acquire within one
+    // microtask drain, so a fail-fast caller landing from a macrotask found the pool full at
+    // every probe of a 9-host / cap-3 run (measured: rejected at t=5..125ms of ~135ms). With a
+    // wait budget it is next in line: notifyCapacity() resolves it synchronously inside
+    // release(), so its continuation is queued BEFORE the releasing worker's own, and its
+    // retry takes the slot before that worker reaches its next host.
+    const stats = timedConnects();
+    const pool = new ConnectionPool({ maxPoolSize: 3 });
+    try {
+      const hosts = fleet("fanout", 9);
+      warmResolve([...hosts, { host: "single.test" }]);
+      let fanOutSettled = false;
+      const fanOut = multiExec(pool, hosts, "hostname").then((r) => {
+        fanOutSettled = true;
+        return r;
+      });
+
+      // Arrive from a macrotask while the first wave is mid-command: every slot is held.
+      await new Promise((r) => setTimeout(r, DIAL_MS + EXEC_MS / 2));
+      // The default is still fail-fast (the precondition: the pool really is full right now).
+      await expect(pool.withConnection({ host: "single.test" }, async () => "never")).rejects.toThrow(PoolFullError);
+
+      // Next in line, it wins a slot within one command of arriving. A short budget, so a lost
+      // release notify fails on `fanOutSettled` below, not on the test timeout.
+      const single = await pool.withConnection({ host: "single.test" }, (client) => exec(client, "hostname", 1_000), {
+        waitForCapacityMs: 2_000,
+      });
+      expect(single.stdout).toBe("out:single.test\n");
+      expect(fanOutSettled).toBe(false); // it ran INSIDE the fan-out, not after it
+
+      const results = await fanOut;
+      expect(results.map((r) => r.error)).toEqual(hosts.map(() => undefined));
+      expect(stats.peak).toBeLessThanOrEqual(3);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("a starved call settles after ONE timeout, not one per host, and reports every host without attempting it", async () => {
+    // The budget is call-level: a per-host budget on a serial worker queue made a call whose
+    // pool freed nothing settle only after ceil(hosts / cap) timeouts, every host reporting
+    // pool-full in turn (measured: cap 4, 4 slots held elsewhere, 40 hosts, 1000ms -> 10000ms).
+    vi.useFakeTimers();
+    mockedConnect.mockImplementation(async () => makeQuietClient() as never);
+    const pool = new ConnectionPool({ maxPoolSize: 4 });
+    try {
+      const held = await Promise.all(fleet("hog", 4).map((h) => pool.acquire(h))); // held elsewhere
+      const hosts = fleet("starved", 40);
+      const BOUND = 1_000;
+      const attempts = vi.spyOn(pool, "withConnection");
+      const start = performance.now();
+      let settledAt: number | undefined;
+      const run = multiExec(pool, hosts, "true", BOUND).then((r) => {
+        settledAt = performance.now();
+        return r;
+      });
+
+      await vi.advanceTimersByTimeAsync(BOUND - 1);
+      expect(settledAt).toBeUndefined(); // still inside the one budget
+      // Run the clock well past the old ceil(40 / 4) x BOUND = 10 x BOUND, so a per-host budget
+      // fails on the measured number below rather than on the test timeout.
+      await vi.advanceTimersByTimeAsync(11 * BOUND);
+      expect(settledAt).toBeDefined(); // before awaiting: a regression fails here, not on the test timeout
+      const results = await run;
+      // One timeout for the call, not one per worker-turn.
+      expect((settledAt ?? Number.NaN) - start).toBe(BOUND);
+
+      expect(results.map((r) => r.host)).toEqual(hosts.map((h) => h.host));
+      for (const r of results) {
+        expect(r.code).toBe(-1);
+        expect(r.error).toBe(
+          `Connection pool is full (4 connections in use or dialing, the SSH_MCP_MAX_POOL_SIZE cap); no slot became available to this call within ${BOUND}ms. Retry once the calls holding the slots finish, or raise the cap (SSH_MCP_MAX_POOL_SIZE in the MCP server's environment).`,
+        );
+      }
+      // Only the first host of each of the min(hosts, cap) workers was ever handed to the pool;
+      // the 36 queued behind them were recorded from the starved call without a pool call.
+      expect(attempts).toHaveBeenCalledTimes(4);
+      expect(mockedConnect).toHaveBeenCalledTimes(4); // the hogs only
+      expect(vi.getTimerCount()).toBe(0);
+      for (const c of held) pool.release(c);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("settles at the starvation verdict, not one timeout later, when the workers reach the pool after a stall", async () => {
+    // A stall longer than the budget (a cold `ssh -G` per host of the first wave, any blocked
+    // event loop) before the workers reach the park loop: each but the last finds the budget
+    // spent while a sibling still counts as holding a slot -- it is between its rejection and
+    // its park -- so it parks for a fresh budget, and the last declares the call starved.
+    // Nothing in the pool changes to wake those fresh parks, so unless the verdict ends them
+    // the call settles a full budget after it, with the same all-pool-full results (measured at
+    // T = 100: stall over at +202ms, call settled at +318ms). Real timers: the stall is a
+    // busy-wait, which fake timers cannot model.
+    mockedConnect.mockImplementation(async () => makeQuietClient() as never);
+    const pool = new ConnectionPool({ maxPoolSize: 3 });
+    try {
+      const held = await Promise.all(fleet("stall-hog", 3).map((h) => pool.acquire(h))); // every slot
+      const hosts = fleet("stalled", 6);
+      warmResolve(hosts); // the busy-wait below is the only stall
+      const T = 200;
+      let settledAt: number | undefined;
+      const run = multiExec(pool, hosts, "true", T).then((r) => {
+        settledAt = performance.now();
+        return r;
+      });
+      // Every worker has been refused synchronously and is suspended before its first await.
+      const stallStart = performance.now();
+      while (performance.now() - stallStart < 2 * T) {
+        // Busy-wait: the workers' rejections are queued behind this block.
+      }
+      const stallEnd = performance.now();
+
+      const results = await run;
+      expect(results.map((r) => /^Connection pool is full \(/.test(r.error ?? ""))).toEqual(hosts.map(() => true));
+      expect(mockedConnect).toHaveBeenCalledTimes(3); // the hogs only
+      // Settled on microtasks after the stall; an unaborted fresh park would add a whole T.
+      expect((settledAt ?? Number.NaN) - stallEnd).toBeLessThan(T / 2);
+      for (const c of held) pool.release(c);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  /**
+   * Instant or scripted dials for the self-starvation tests. `slowDials` dial through a fake-clock
+   * setTimeout of `dialMs`; every other dial resolves in microtasks, with NO timer, after
+   * `dialTicks` microtask hops (default 0). A host in `failDials` then rejects with
+   * "connect ETIMEDOUT" instead of connecting. Commands print `out:<host>` and close on a
+   * microtask, except on `hangs`, whose stream never closes, so exec() runs to its own timeout.
+   */
+  function ownHostConnects(opts: {
+    hangs?: Set<string>;
+    slowDials?: Set<string>;
+    failDials?: Set<string>;
+    dialMs?: number;
+    dialTicks?: number;
+  }) {
+    mockedConnect.mockImplementation(async (resolved) => {
+      const host = String(resolved.connectConfig.host);
+      if (opts.slowDials?.has(host)) await new Promise((r) => setTimeout(r, opts.dialMs));
+      else for (let i = 0; i < (opts.dialTicks ?? 0); i++) await Promise.resolve();
+      if (opts.failDials?.has(host)) throw new Error("connect ETIMEDOUT");
+      const client = makeQuietClient() as EventEmitter & { endCalls: number; end: () => void; exec: unknown };
+      client.exec = (_command: string, cb: (err: Error | null, stream: unknown) => void) => {
+        const stream = new EventEmitter() as EventEmitter & { stderr: EventEmitter };
+        stream.stderr = new EventEmitter();
+        cb(null, stream);
+        if (opts.hangs?.has(host)) return;
+        queueMicrotask(() => {
+          stream.emit("data", Buffer.from(`out:${host}\n`));
+          stream.emit("close", 0);
+        });
+      };
+      return client as never;
+    });
+  }
+
+  const poolFullCount = (results: { error?: string }[]) =>
+    results.filter((r) => /^Connection pool is full \(/.test(r.error ?? "")).length;
+  // Distinct hosts, not a call count: with instant dials a woken retry can evict another host's
+  // just-registered entry before that host takes its ref, so a host may be dialed more than once.
+  const dialedHosts = () => new Set(mockedConnect.mock.calls.map(([resolved]) => String(resolved.connectConfig.host)));
+
+  it("is never starved by its OWN hosts running to the command timeout while a slot is held elsewhere", async () => {
+    // The parked worker's budget is stamped when a sibling's fn starts, BEFORE exec() arms its
+    // own timer, so the wait ran out at (or a hair before) the moment the sibling's slot came
+    // back, and the call reported its whole queue pool-full although the only slots it could not
+    // get were its own. The rule now: no starvation verdict while any of the call's hosts holds a
+    // slot. The parked worker's deadline and the hanging hosts' exec timers share one due time
+    // (both measured from the fn start), and under fake timers a tie fires in creation order. So
+    // the dials are INSTANT -- no timer -- but take 50 microtask hops: the queued host's
+    // rejection and park finish first, its wait timer is created before the exec timers, and it
+    // fires first at T, which is the ordering that starved the call. A dial through setTimeout
+    // (even 1ms), or one that connects before the park, flips the order and hides the bug.
+    vi.useFakeTimers();
+    const T = 200;
+    const hosts = fleet("own-hang", 9);
+    const hangs = new Set([hosts[0].host, hosts[1].host]);
+    ownHostConnects({ hangs, dialTicks: 50 });
+    const pool = new ConnectionPool({ maxPoolSize: 3 });
+    try {
+      const held = await pool.acquire({ host: "held-outside.test" }); // one of the three slots
+      let settledAt: number | undefined;
+      const start = performance.now();
+      const run = multiExec(pool, hosts, "hostname", T).then((r) => {
+        settledAt = performance.now();
+        return r;
+      });
+
+      await vi.advanceTimersByTimeAsync(10 * T);
+      expect(settledAt).toBeDefined();
+      const results = await run;
+
+      expect(results.map((r) => r.error)).toEqual(
+        hosts.map((h) => (hangs.has(h.host) ? `Command timed out after ${T}ms` : undefined)),
+      );
+      expect(results.map((r) => r.stdout)).toEqual(hosts.map((h) => (hangs.has(h.host) ? "" : `out:${h.host}\n`)));
+      expect(poolFullCount(results)).toBe(0);
+      expect(dialedHosts()).toEqual(new Set(["held-outside.test", ...hosts.map((h) => h.host)])); // every host dialed
+      // The queued hosts ran the moment the hanging ones gave their slots back.
+      expect((settledAt ?? Number.NaN) - start).toBe(T);
+      pool.release(held);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("is never starved by its OWN hosts still dialing while a slot is held elsewhere", async () => {
+    // A dial in flight holds a slot but stamps no progress until its fn starts, so a first wave
+    // of dials slower than the budget starved the call at exactly one timeout: 7 of these 9
+    // hosts reported pool-full without a dial. A counter around fn alone does not see a dial;
+    // the rule counts every worker of the call that is not parked on the pool.
+    vi.useFakeTimers();
+    const T = 1_000;
+    const SLOW_DIAL = 3_000;
+    const hosts = fleet("own-dial", 9);
+    const slowDials = new Set([hosts[0].host, hosts[1].host]);
+    ownHostConnects({ slowDials, dialMs: SLOW_DIAL });
+    const pool = new ConnectionPool({ maxPoolSize: 3 });
+    try {
+      const held = await pool.acquire({ host: "held-outside.test" });
+      let settledAt: number | undefined;
+      const start = performance.now();
+      const run = multiExec(pool, hosts, "hostname", T).then((r) => {
+        settledAt = performance.now();
+        return r;
+      });
+
+      await vi.advanceTimersByTimeAsync(2 * SLOW_DIAL);
+      expect(settledAt).toBeDefined();
+      const results = await run;
+
+      expect(results.map((r) => r.error)).toEqual(hosts.map(() => undefined));
+      expect(results.map((r) => r.stdout)).toEqual(hosts.map((h) => `out:${h.host}\n`));
+      expect(poolFullCount(results)).toBe(0);
+      expect(dialedHosts()).toEqual(new Set(["held-outside.test", ...hosts.map((h) => h.host)]));
+      expect((settledAt ?? Number.NaN) - start).toBe(SLOW_DIAL);
+      pool.release(held);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("is not starved the moment its own slow dial FAILS and another caller takes the slot it gave back", async () => {
+    // A failed dial hands its slot back, which is progress. Unstamped, the call's last progress
+    // was its own start, 3x the budget ago, so the instant a foreign caller won that slot the
+    // parked hosts read the call as starved and reported pool-full with no wait at all.
+    vi.useFakeTimers();
+    const T = 1_000;
+    const SLOW_DIAL = 3_000;
+    const hosts = fleet("own-fail", 3);
+    const doomed = new Set([hosts[0].host]);
+    ownHostConnects({ slowDials: doomed, failDials: doomed, dialMs: SLOW_DIAL });
+    const pool = new ConnectionPool({ maxPoolSize: 2 });
+    try {
+      const held = await pool.acquire({ host: "held-outside.test" });
+      let settledAt: number | undefined;
+      const start = performance.now();
+      const run = multiExec(pool, hosts, "hostname", T).then((r) => {
+        settledAt = performance.now();
+        return r;
+      });
+      // Another caller queues behind the dial on a long budget. The call's parked worker re-parks
+      // on every timeout, so this caller is first in line when the dial fails, and wins the slot.
+      let foreignSettled = false;
+      const foreign = pool.acquire({ host: "foreign-waiter.test" }, { waitForCapacityMs: 60_000 }).finally(() => {
+        foreignSettled = true;
+      });
+
+      await vi.advanceTimersByTimeAsync(SLOW_DIAL);
+      expect(foreignSettled).toBe(true); // before awaiting: a lost wake fails here, not on the test timeout
+      const foreignClient = await foreign;
+      expect(settledAt).toBeUndefined(); // still waiting with a fresh budget, not starved
+
+      await vi.advanceTimersByTimeAsync(T / 2);
+      pool.release(foreignClient);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settledAt).toBeDefined();
+      const results = await run;
+
+      expect(results[0].error).toMatch(/ETIMEDOUT/);
+      expect(results.slice(1).map((r) => r.error)).toEqual([undefined, undefined]);
+      expect(results.slice(1).map((r) => r.stdout)).toEqual(hosts.slice(1).map((h) => `out:${h.host}\n`));
+      expect(poolFullCount(results)).toBe(0);
+      expect((settledAt ?? Number.NaN) - start).toBe(SLOW_DIAL + T / 2);
+      pool.release(held);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("still starves on schedule once its other workers have LEFT the queue, not only while they are parked", async () => {
+    // Rule 2 counts the workers still taking hosts, not the pool cap. Here the first worker
+    // finishes the only other host and leaves, a foreign caller takes the slot it gave back,
+    // and the last host is genuinely starved: it must report pool-full one budget after that
+    // release. Measured against `limit`, the departed worker would count as holding a slot
+    // forever and the call would never settle.
+    vi.useFakeTimers();
+    const T = 1_000;
+    const DIAL = 1_500;
+    const hosts = fleet("left-queue", 2);
+    ownHostConnects({ slowDials: new Set([hosts[0].host]), dialMs: DIAL });
+    const pool = new ConnectionPool({ maxPoolSize: 2 });
+    try {
+      const held = await pool.acquire({ host: "held-outside.test" });
+      let settledAt: number | undefined;
+      const start = performance.now();
+      const run = multiExec(pool, hosts, "hostname", T).then((r) => {
+        settledAt = performance.now();
+        return r;
+      });
+      // Queues behind the dial on a long budget; the call's parked worker re-parks at T, so this
+      // caller is first in line when the first host gives its slot back, and keeps that slot.
+      let foreignSettled = false;
+      const foreign = pool.acquire({ host: "foreign-waiter.test" }, { waitForCapacityMs: 60_000 }).finally(() => {
+        foreignSettled = true;
+      });
+
+      await vi.advanceTimersByTimeAsync(DIAL);
+      expect(foreignSettled).toBe(true); // before awaiting: a lost wake fails here, not on the test timeout
+      const foreignClient = await foreign;
+      expect(settledAt).toBeUndefined();
+
+      await vi.advanceTimersByTimeAsync(T);
+      expect(settledAt).toBeDefined();
+      const results = await run;
+
+      expect(results[0]).toMatchObject({ stdout: `out:${hosts[0].host}\n`, code: 0 });
+      expect(results[0].error).toBeUndefined();
+      expect(results[1].error).toMatch(/^Connection pool is full \(/);
+      expect((settledAt ?? Number.NaN) - start).toBe(DIAL + T);
+      pool.release(foreignClient);
+      pool.release(held);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("never trips the bound while the fan-out keeps moving, however long the whole run takes", async () => {
+    // Progress resets the budget: with one usable slot for three workers, two are parked at
+    // every moment and a host starts or finishes every 310ms, so a 500ms budget is never
+    // spent even though the run lasts 1860ms. A budget measured from the call's START would
+    // starve it at 500ms with most of the fleet undone. Three workers rather than two on
+    // purpose: every wake has one winner and one LOSER that re-parks, and a budget measured
+    // per host from its FIRST rejection (rather than from the call's last progress) leaves
+    // that loser on its stale deadline -- it starves at 500ms while the winner is still
+    // running, which two workers can never show because there is never a loser.
+    vi.useFakeTimers();
+    const EXEC = 300;
+    const BOUND = 500;
+    timedConnects(EXEC);
+    const pool = new ConnectionPool({ maxPoolSize: 3 });
+    try {
+      // Two of the three slots, held elsewhere. Their dials are fake-clock setTimeouts too.
+      const holding = Promise.all(fleet("hog", 2).map((h) => pool.acquire(h)));
+      await vi.advanceTimersByTimeAsync(DIAL_MS);
+      const held = await holding;
+      const hosts = fleet("moving", 6);
+      const start = performance.now();
+      let settledAt: number | undefined;
+      const run = multiExec(pool, hosts, "hostname", BOUND).then((r) => {
+        settledAt = performance.now();
+        return r;
+      });
+
+      await vi.advanceTimersByTimeAsync(hosts.length * (DIAL_MS + EXEC) + 100);
+      expect(settledAt).toBeDefined(); // before awaiting: a regression fails here, not on the test timeout
+      const results = await run;
+
+      expect(results.map((r) => r.error)).toEqual(hosts.map(() => undefined));
+      expect(results.map((r) => r.stdout)).toEqual(hosts.map((h) => `out:${h.host}\n`));
+      // Strictly serial through the one free slot: dial + command per host, nothing overlapped.
+      expect((settledAt ?? Number.NaN) - start).toBe(hosts.length * (DIAL_MS + EXEC));
+      expect(settledAt !== undefined && settledAt - start > BOUND).toBe(true);
+      for (const c of held) pool.release(c);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("records a capacity rejection at once from a pool-like that cannot be waited on", async () => {
+    // multiExec parks on `pool.waitForCapacity`. A pool-like that rejects with a PoolFullError
+    // but has no such method must not send the worker into a retry spin for the rest of the
+    // budget: with real timers that would be 1000ms of hot looping per host.
+    let calls = 0;
+    const failFast = {
+      maxSize: 2,
+      async withConnection() {
+        calls++;
+        throw new PoolFullError(2);
+      },
+    } as unknown as ConnectionPool;
+    const hosts = fleet("nowait", 5);
+
+    const start = performance.now();
+    const results = await multiExec(failFast, hosts, "true", 1_000);
+
+    expect(performance.now() - start).toBeLessThan(500); // settled on microtasks, not the budget
+    expect(calls).toBe(hosts.length); // one attempt per host, no retries
+    expect(results.map((r) => r.error)).toEqual(
+      hosts.map(() => "Connection pool is full (2 connections in use or dialing, the SSH_MCP_MAX_POOL_SIZE cap)"),
+    );
   });
 });
 
