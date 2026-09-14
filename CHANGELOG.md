@@ -5,24 +5,92 @@ All notable changes to `@yawlabs/ssh-mcp` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-> **Note:** this file starts at the entry below. Releases before it were shipped
-> without changelog entries -- see the
+> **Note:** this file starts at 0.13.0. Releases before it were shipped without
+> changelog entries -- see the
 > [tag list](https://github.com/YawLabs/ssh-mcp/tags) and the GitHub release notes
-> for those versions. `release.sh` sources its release body from the matching
-> `## [x.y.z]` heading here, so an absent entry silently falls back to raw
-> commit subjects.
+> for those versions. `release.sh` gives every release a `## [x.y.z]` heading
+> here -- promoting `[Unreleased]` when it has content, otherwise generating one
+> from the commit subjects since the previous tag -- and sources the GitHub
+> release notes from that section.
 
 ## [Unreleased]
+
+### Changed
+- npm and MCP Registry listing metadata: bugs URL, core keywords, and server.json title/repository/websiteUrl
+- `release.sh` writes a `## [x.y.z]` changelog entry for every release — promoting `[Unreleased]` when it has content, otherwise generating one from the commit subjects since the previous tag — moves the Keep-a-Changelog link references along when a file has them, and takes the GitHub release notes from that entry instead of from `git log` subjects. Before this the script never touched CHANGELOG.md at all: documented work sat under `[Unreleased]` while the versions that shipped it went out with no entry (0.14.0 through 0.16.0 below are backfilled), and every GitHub release page showed raw commit subjects.
+
+## [0.16.0] — 2026-09-13
+
+Release tooling and README only; no change to the published server.
+
+### Changed
+- `release.sh` waits for npm to serve the new version before publishing to the MCP Registry. `npm publish` returns as soon as the registry accepts the tarball, but the version is not yet readable from npm's CDN-backed read path, and the MCP Registry validates a publish by reading it — 0.15.3's registry step failed with `version '0.15.3' was not found (status: 404)` and needed a second run. The wait polls the exact URL the registry's npm validator fetches (scope slash encoded as `%2F`) with `curl` rather than `npm view`, whose metadata cache can outlast the condition; it warns rather than fails on timeout, so `mcp-publisher` still reports its own precise error; `SKIP_NPM_WAIT=1` bypasses it and `NPM_WAIT_TIMEOUT_S` retunes the 300s default (#45).
+- README: the X follow badge moved from the top badge row to the bottom of the page (#46).
+
+## [0.15.3] — 2026-09-13
+
+### Fixed
+- **The launcher always uses the newest oam, and the minimum is now the latest release, 0.15.2** (raised from 0.9.0). It used to take the FIRST oam binary it found and only then check its version, so a stale copy in an earlier location hid a current one: with oam 0.9.0 in `~/.oam/bin` and 0.15.2 on `PATH`, it ran 0.9.0 — and an unrunnable file in an earlier location meant no oam at all. Every oam binary it can see is now asked for its version, and the newest at or above 0.15.2 wins; on a tie the installed copy still beats `PATH`.
+- **An oam host older than the floor no longer serves the server itself.** When a client ran `oam run bin/ssh-mcp.mjs` with an old oam and discovery found nothing usable, the server ran on that old oam. When a newer oam WAS found, the handoff inherited stdio, which an oam older than 0.9.0 does not honor, so the MCP handshake never answered (measured on a real oam 0.8.2 host with aws-mcp's launcher, which this one shares). An old host now hands off with piped stdio to the newest usable oam, or to Node on `PATH`, or exits with an error when there is neither. If the chosen oam then cannot be spawned (deleted or replaced after its version check), the launcher still falls back: a failed spawn emits `close` with the negative errno, so piping, signal forwarding and the exit mirror all wait for the child's `spawn` event rather than exiting the launcher in the middle of the fallback. The in-process path from 0.15.2 for a host at the floor still holds; the floor it names is now 0.15.2.
+- **A bad `OAM_BIN` is reported, and discovery carries on.** A path that does not exist, an oam below the floor, or a binary that will not run is named on stderr and the launcher goes on to discovery, instead of treating `OAM_BIN` as the only candidate — where a path that did not exist fell back to Node silently.
+- **`SSH_MCP_RUNTIME=node` now always means Node.** Launched under `oam run`, it hands off to Node on `PATH` rather than staying on oam.
+- Each `oam --version` probe is bounded at 5s, so a wedged binary on `PATH` cannot hang the launch.
+
+### Changed
+- README: the Runtime selection section now covers the launcher being started by oam itself (`oam run bin/ssh-mcp.mjs`, which is how Yaw MCP starts an `npx @yawlabs/ssh-mcp` entry when a recent oam is installed) as well as by Node — the in-process serve on a current oam, the handoff from an older one, and what each `SSH_MCP_RUNTIME` value does on each host — and describes the discovery order, the 0.15.2 floor, and the failed-spawn fallback above (#43, #44).
+
+## [0.15.2] — 2026-09-12
+
+### Fixed
+- The launcher no longer spawns a nested oam when it is already running on one. A host that resolves this package's `bin` and launches `oam run bin/ssh-mcp.mjs` — Yaw MCP does, and so does oam's sidecar regression matrix — got a second runtime underneath the first, because the launcher discovered and spawned oam without asking what it was already hosted on: one server, two runtime boots (measured on Windows as `oam.exe` with a nested `oam.exe` + `conhost.exe`). When `process.versions.oam` clears the same 0.9.0 floor a discovered binary must, the server is now imported into the host process — no discovery, no `oam --version` probe — and `SSH_MCP_RUNTIME=oam` counts the host as the oam it demands. A host oam below the floor keeps the discovery path. Nothing is lost by serving in-process: this launcher has no `--permission` sandbox, so the spawn never passed oam any runtime flags.
+
+### Changed
+- README documents `SSH_MCP_RUNTIME` and `OAM_BIN` in a new Runtime selection section (closes #37). The launcher's error messages told users to set them, but the README never mentioned either. The section covers the three runtime values and that `auto` is the default, `OAM_BIN` taking priority over discovery and the order discovery searches when it is unset, the oam minimum, when `auto` falls back silently versus with a note on stderr (and that `SSH_MCP_RUNTIME=oam` exits with status 1 in each of those cases), and an example `env` block (#42).
+- `biome.json`'s `$schema` synced to the Biome version `package-lock.json` installs, 2.4.15, so editor validation matches the binary that runs (#41).
+
+## [0.15.1] — 2026-09-11
+
+Package metadata, lint tooling and README only; no change to the published server.
+
+### Changed
+- npm listing: `homepage` points at https://yaw.sh/mcp-servers/ssh-mcp/, the description leads with what people search for, and the keywords were expanded to 16 terms, every claim checked against the README (#40).
+- `npm run lint` is a trustworthy gate on Windows ARM64. Some `@biomejs/cli-win32-arm64` builds crash on every check-shaped run — 2.5.4 exits 139, while 2.4.16 and 2.5.13 run correctly — which turned the release's lint step into a crash with no result. `scripts/lint.mjs` now runs Biome at the version `package-lock.json` installs and, when the native build for this host is unusable, provisions the x64 build of the same version into a gitignored cache and runs that under emulation. The exit code is Biome's own, so a non-zero result is a real finding. The `SKIP_LINT` comment in `release.sh` no longer claims CI catches lint regressions; this repo has no CI (#39).
+- README: X follow badge added to the badge row (#36).
+
+## [0.15.0] — 2026-08-31
+
+A full read of every source and test file, then three rounds of adversarial review over the resulting fixes. Tests go from 177 to 858, and `npm run build` works again on a fresh install (#35).
+
+### Security
+- **Command injection via environment variable names in `ssh_exec` and `ssh_multi_exec`.** Values were shell-quoted but keys were interpolated raw, so `env: {"A=1; reboot #": "x"}` produced `A=1; reboot #='x' <cmd>` and the remote ran `reboot`; it also slipped past a substring whitelist. Keys are now validated against the POSIX name grammar and rejected before the policy gate or any host is contacted.
+- **The command policy failed open.** An all-malformed `SSH_MCP_COMMAND_WHITELIST` compiled to zero patterns, which the guard read as "no policy configured", so a single typo silently allowed everything. It now fails closed with a message naming the bad pattern. An unconfigured server still allows everything, unchanged.
+- **Host-key algorithms are ordered from `known_hosts`.** An ecdsa-only entry no longer reads as a MITM when the server offers ed25519. The list is a permutation of ssh2's own defaults, so no reachable host becomes unconnectable, and it resolves in both the ESM dist and the bundled SEA binary.
+- `@cert-authority` and `@revoked` marker lines in `known_hosts` are no longer parsed as host keys, which yielded a junk key blob.
+
+### Fixed
+- **ProxyJump specs were never parsed.** `ssh -G` emits the value verbatim, so a bastion on a non-default port dialled a hostname containing the port and failed DNS; the bracketed-IPv6 form connected on the wrong port with host-key checking silently degraded to accept-anything. ProxyJump is now covered against real SSH servers (ssh2's own `Server`: full handshakes and `direct-tcpip` channels, no Docker) in the normal suite.
+- **The identity walk took the first readable file, not the first usable one**, then stopped: a zero-byte key, or the classic `IdentityFile ~/.ssh/id_ed25519.pub` typo, shadowed the real key behind it and killed identity auth with no fallback.
+- `ssh_delete` used `stat`, which follows symlinks: a symlink to a directory dispatched to `rmdir` on the link, and a dangling symlink could not be deleted at all.
+- **`ssh_stat`'s advertised `isSymbolicLink` flag was dead** for the same reason, so it could never be true. The type now comes from `lstat`, the metadata from `stat`.
+- `ssh_diagnose`'s SSH config check never stripped `#` comments, so `Host bastion # jump box for prod` wrongly matched `prod`; and on a CRLF config the stripper never fired at all.
+- `ssh_known_hosts_fix` removed nothing on IPv6 hosts while still appending a new key, leaving the stale key in the file and still trusted. It also claimed removals that never happened (`ssh-keygen -R` exits 0 on a miss) and reported an absent `known_hosts` as a failure.
+- `ssh_diagnose` reported an unreachable ssh-agent as healthy for any `ssh-add` failure it did not recognize by wording.
+- `npm run build` had been failing at the declaration step on any fresh install since the TypeScript 7 bump; it only appeared to work from a stale `node_modules`. `tsc` now emits the declarations, so `dist/` ships per-file `.d.ts` files instead of one bundled `server.d.ts`; the exports map still resolves for value and type-only imports.
+- Biome pinned to 2.4.15 in the lockfile. 2.5.4 segfaults on win32-arm64, which had been masking three real findings — an import that should be `import type`, unsorted imports, and two formatting diffs — now applied.
+
+### Changed
+- `ssh_git_check` rejects an explicitly-empty `host` or `user`. Previously `{host: ""}` fell through a truthiness fallback and silently probed `github.com`, bypassing the hostname check every sibling tool routes through.
+- `ssh_stat` reports `symlink -> directory` where it previously reported just `directory`, and a dangling symlink now returns a result where it used to error.
+- README and CLAUDE.md corrected to what the code does: auth resolution is not a strict first-match chain, host-key handling is trust-always rather than TOFU, the command policy does not cover the SFTP mutation tools, and the server exposes 21 tools, not 18.
+- `.gitignore` excludes `.npmrc`, so a project-local automation token — which `npm config set --location=project` writes — cannot be committed by a stray `git add -A`.
+- `release.sh` no longer recommends `npm login --auth-type=web` when npm auth fails: web login overwrites the automation token in `~/.npmrc` with a 2FA-bound session, so the advice broke the next release. The prerequisites and the publish-failure message now point at restoring an automation token, and explain that npm answers an unauthorized publish with 404 rather than 401.
+
+## [0.14.1] — 2026-08-23
 
 ### Added
 - Test coverage for `bin/ssh-mcp.mjs`, which had none — every defect fixed in this release was found by review and verified by hand. The launcher runs on import rather than exporting anything, so the tests execute it against a throwaway layout (a copy of the real launcher plus a stub `dist/index.js`) and assert which path it took: runtime selection and argv passthrough, the entry-point repoint, `oam`-mode failing loudly, unreadable-vs-outdated diagnosis, shim detection and `.exe` preference on Windows, and a guard against control characters in the source. Signal forwarding and grace-window escalation are covered POSIX-only, since Windows has no deliverable signals to assert against.
 
 ### Fixed
-- **The launcher always uses the newest oam, and the minimum is now the latest release, 0.15.2** (raised from 0.9.0). It used to take the FIRST oam binary it found and only then check its version, so a stale copy in an earlier location hid a current one: with oam 0.9.0 in `~/.oam/bin` and 0.15.2 on `PATH`, it ran 0.9.0 — and an unrunnable file in an earlier location meant no oam at all. Every oam binary it can see is now asked for its version, and the newest at or above 0.15.2 wins; on a tie the installed copy still beats `PATH`.
-- **An oam host older than the floor no longer serves the server itself.** When a client ran `oam run bin/ssh-mcp.mjs` with an old oam and discovery found nothing usable, the server ran on that old oam. When a newer oam WAS found, the handoff inherited stdio, which an oam older than 0.9.0 does not honor, so the MCP handshake never answered (measured on a real oam 0.8.2 host with aws-mcp's launcher, which this one shares). An old host now hands off with piped stdio to the newest usable oam, or to Node on `PATH`, or exits with an error when there is neither. If the chosen oam then cannot be spawned (deleted or replaced after its version check), the launcher still falls back: a failed spawn emits `close` with the negative errno, so piping, signal forwarding and the exit mirror all wait for the child's `spawn` event rather than exiting the launcher in the middle of the fallback. The in-process entry below for a host at the floor still holds; the floor it names is now 0.15.2.
-- **A bad `OAM_BIN` is reported, and discovery carries on.** A path that does not exist, an oam below the floor, or a binary that will not run is named on stderr and the launcher goes on to discovery, instead of treating `OAM_BIN` as the only candidate — where a path that did not exist fell back to Node silently.
-- **`SSH_MCP_RUNTIME=node` now always means Node.** Launched under `oam run`, it hands off to Node on `PATH` rather than staying on oam.
-- Each `oam --version` probe is bounded at 5s, so a wedged binary on `PATH` cannot hang the launch.
 - Launcher no longer dies with a raw stack trace when `spawn` fails synchronously. Node throws (rather than emitting `error`) for some unexecutable targets — notably a `.cmd`/`.bat` on Windows, which it rejects with `EINVAL` unless `shell: true` — and the `error` listener is registered *after* the `spawn` call, so it could never observe that throw. The documented fall-back-to-Node contract was broken in exactly the case it exists for. Both failure modes now route through one handler.
 - Windows runtime discovery scans `PATH` for `oam.exe` only, instead of walking every `PATHEXT` entry. The installed-location checks already looked for `oam.exe` alone, so the two discovery paths disagreed: `PATH` could hand back an `oam.cmd` this launcher cannot execute, which then surfaced as a misleading "older than 0.9.0 — run `oam self-update`" error. Discovery and execution now accept the same shapes, and a real `oam.exe` further along `PATH` is found instead of being shadowed by a shim. A skipped shim is still **reported**: an npm-style install puts `oam.cmd` on `PATH`, and silently ignoring it made auto mode degrade with no explanation and `SSH_MCP_RUNTIME=oam` claim nothing was found — both of which send someone to reinstall an oam they already have. The message now names the shim and says why it cannot be used.
 - A wedged child no longer leaves the launcher hanging with no escape hatch. Registering a handler suppresses Node's default terminate-on-signal, and `child.killed` records only that `kill()` was *called* — never that the child is gone — so gating on it swallowed every signal after the first. Escalation is now driven by a **timer** armed on the first signal, not by counting signals: one press is enough, and a child still alive after a 2s grace window is killed on schedule. Counting was ambiguous — a supervisor routinely sends `SIGINT` then `SIGTERM` milliseconds apart, and a terminal Ctrl-C reaches the whole process group, so reading "a second signal" as impatience would `SIGKILL` a child that was already shutting down cleanly, skipping its `process.on("exit")` backstop and leaking any ssh-agent the server spawned. Using a timer rather than timestamp arithmetic also removes a wall-clock dependency, since a clock step could otherwise mis-gate the window in either direction.
@@ -31,11 +99,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The child `error` handler no longer discards its promise with `void`. A failing in-process fallback surfaced as an unhandled rejection — replacing the launcher's own diagnostic with a raw stack trace — and now reports and sets a non-zero exit code. Both `launchFailed` call sites share one reporter so the synchronous and event-driven paths cannot drift.
 - An oam binary that cannot be run is no longer reported as an old one. `oamVersion` returns `null` for several distinct causes — not executable, wrong architecture, a shim Node refuses, deleted since the stat, or a `--version` format this launcher does not parse — and every one of them produced "is older than oam 0.9.0. Run `oam self-update`", pointing the user at the single cause it definitely was not. The two cases now carry separate wording and separate remedies, and the too-old message reports the version actually detected.
 - Removed a literal backspace byte (`U+0008`) from the runtime-discovery comment in `bin/ssh-mcp.mjs`, present since 0.13.0 and therefore in the published package. The Windows installer path was written as `%LOCALAPPDATA%\oam\bin` and round-tripped through escape processing, which dropped the first backslash and turned `\b` into a real control character — rendering the line as `%LOCALAPPDATA%oamin` and making git treat the file as binary, so its diff could not be reviewed. Lint, `tsc` and the tests passed either way.
-- The launcher no longer spawns a nested oam when it is already running on one. A host that resolves this package's `bin` and launches `oam run bin/ssh-mcp.mjs` — Yaw MCP does, and so does oam's sidecar regression matrix — got a second runtime underneath the first, because the launcher discovered and spawned oam without asking what it was already hosted on: one server, two runtime boots (measured on Windows as `oam.exe` with a nested `oam.exe` + `conhost.exe`). When `process.versions.oam` clears the same 0.9.0 floor a discovered binary must, the server is now imported into the host process — no discovery, no `oam --version` probe — and `SSH_MCP_RUNTIME=oam` counts the host as the oam it demands. A host oam below the floor keeps the discovery path. Nothing is lost by serving in-process: this launcher has no `--permission` sandbox, so the spawn never passed oam any runtime flags.
 
 ### Changed
 - `scripts/build-binary.mjs`: dropped the stale comment claiming the bundle entry is derived from `bin` "regardless of the server's entry filename". It contradicted the pinned `srcEntry` constant directly below it, and this script is copy-pasted across the `@yawlabs/*` servers, so the contradiction travelled with it.
-- npm and MCP Registry listing metadata: bugs URL, core keywords, and server.json title/repository/websiteUrl
+
+## [0.14.0] — 2026-08-08
+
+### Added
+- A release-metadata test asserts that `server.json` and `package.json` agree — the top-level `version`, every `packages[].version`, and `mcpName` against `server.json`'s `name` — so a desynced MCP Registry entry aborts the release at the test step instead of shipping. `server.json` carries the version twice and `release.sh` bumps it separately from `package.json`, so an edit that updates one and not the other is visible to users and invisible to the release; the check earned its keep in tailscale-mcp, where it caught exactly that skew mid-release (#31).
+
+### Changed
+- **The launcher requires oam 0.9.0 or newer.** It probes `oam --version`; below the floor, `auto` falls back to Node with a note on stderr and `SSH_MCP_RUNTIME=oam` is a hard error. Older oam ran `child_process.execFile` arguments through a shell, accepted an exec `timeout` and ignored it, truncated `spawnSync` at `maxBuffer` while reporting success, and treated stdio `inherit`/`ignore` as `pipe` — this server shells out, so those were reachable bugs rather than theoretical ones. The launcher header now also says why there is no `--permission` sandbox: the server opens outbound SSH to hosts the caller names and needs key material and `known_hosts`, so nothing meaningful is left to deny.
 
 ## [0.13.0] — 2026-08-07
 
