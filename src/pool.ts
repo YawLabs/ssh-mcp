@@ -19,7 +19,7 @@ export interface PoolOptions {
    * `SSH_MCP_MAX_POOL_SIZE` env var. When at capacity, the pool first tries to evict
    * an idle entry; if no idle entry can be evicted (every slot is in use or dialing),
    * `acquire()` rejects with a {@link PoolFullError} ("Connection pool is full") -- at once
-   * by default, or after `waitForCapacityMs` (see {@link AcquireOptions}) with no slot freed.
+   * by default, or once `waitForCapacityMs` (see {@link AcquireOptions}) passes without winning a slot.
    * Bump this for fan-out workloads against many distinct hosts (e.g. `ssh_multi_exec`
    * across a large fleet, which runs at most this many hosts at once).
    */
@@ -32,7 +32,7 @@ export interface AcquireOptions {
    * in milliseconds. Default 0: reject at once with a {@link PoolFullError}. With a budget,
    * the caller parks (see `waitForCapacity`) and retries on every capacity signal until a
    * slot is won or the budget is spent, then rejects with a {@link PoolFullError} whose
-   * message ends in "no slot freed up within <budget>ms". Only a capacity rejection is
+   * message says "no slot became available to this call within <budget>ms". Only a capacity rejection is
    * waited out; connect failures and a drained pool reject at once as before.
    */
   waitForCapacityMs?: number;
@@ -46,16 +46,25 @@ export const POOL_FULL_ERROR_CODE = "ERR_SSH_MCP_POOL_FULL";
  * held by an in-use entry or an in-flight dial, and no idle entry can be evicted. Distinct
  * from connect and exec failures so a caller that can wait (see `waitForCapacity`) retries
  * only on this. `waitedMs` is set when the caller asked to wait and the budget ran out; the
- * message then carries the "no slot freed up within <n>ms" suffix -- appended here, once, so
- * no caller has to add it.
+ * message then carries the "no slot became available to this call within <n>ms" suffix and a
+ * remedy sentence -- appended here, once, so no caller has to add it.
  */
 export class PoolFullError extends Error {
   readonly code = POOL_FULL_ERROR_CODE;
   readonly maxPoolSize: number;
   readonly waitedMs?: number;
   constructor(maxPoolSize: number, waitedMs?: number) {
-    const base = `Connection pool is full (${maxPoolSize} connections in use or dialing)`;
-    super(waitedMs === undefined ? base : `${base}; no slot freed up within ${Math.round(waitedMs)}ms`);
+    // This text reaches an MCP caller verbatim as the tool result, so it names the knob and,
+    // on the waited form, what to do. Only the "Connection pool is full (" prefix is stable;
+    // match on `code` / isPoolFullError(), never on the rest.
+    const base = `Connection pool is full (${maxPoolSize} connections in use or dialing, the SSH_MCP_MAX_POOL_SIZE cap)`;
+    super(
+      waitedMs === undefined
+        ? base
+        : // "became available to this call", not "freed up": every capacity signal wakes every
+          // parked caller, so a slot can free during the wait and still go to someone else.
+          `${base}; no slot became available to this call within ${Math.round(waitedMs)}ms. Retry once the calls holding the slots finish, or raise SSH_MCP_MAX_POOL_SIZE in the server's environment.`,
+    );
     this.name = "PoolFullError";
     this.maxPoolSize = maxPoolSize;
     if (waitedMs !== undefined) this.waitedMs = waitedMs;

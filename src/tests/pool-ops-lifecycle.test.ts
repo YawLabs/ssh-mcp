@@ -386,7 +386,7 @@ describe("multiExec — waits for pool capacity held by OTHER callers", () => {
       const [result] = await run;
       expect(result).toMatchObject({ host: "starved.test", code: -1 });
       expect(result.error).toMatch(/Connection pool is full/);
-      expect(result.error).toContain(`no slot freed up within ${BOUND}ms`);
+      expect(result.error).toContain(`no slot became available to this call within ${BOUND}ms`);
       expect(mockedConnect).toHaveBeenCalledTimes(1); // the starved host never dialed
       // The wait timer is gone -- nothing left armed behind the recorded result.
       expect(vi.getTimerCount()).toBe(0);
@@ -528,7 +528,7 @@ describe("multiExec — waits for pool capacity held by OTHER callers", () => {
       for (const r of results) {
         expect(r.code).toBe(-1);
         expect(r.error).toBe(
-          `Connection pool is full (4 connections in use or dialing); no slot freed up within ${BOUND}ms`,
+          `Connection pool is full (4 connections in use or dialing, the SSH_MCP_MAX_POOL_SIZE cap); no slot became available to this call within ${BOUND}ms. Retry once the calls holding the slots finish, or raise SSH_MCP_MAX_POOL_SIZE in the server's environment.`,
         );
       }
       // Only the first host of each of the min(hosts, cap) workers was ever handed to the pool;
@@ -819,7 +819,7 @@ describe("multiExec — waits for pool capacity held by OTHER callers", () => {
     expect(performance.now() - start).toBeLessThan(500); // settled on microtasks, not the budget
     expect(calls).toBe(hosts.length); // one attempt per host, no retries
     expect(results.map((r) => r.error)).toEqual(
-      hosts.map(() => "Connection pool is full (2 connections in use or dialing)"),
+      hosts.map(() => "Connection pool is full (2 connections in use or dialing, the SSH_MCP_MAX_POOL_SIZE cap)"),
     );
   });
 });

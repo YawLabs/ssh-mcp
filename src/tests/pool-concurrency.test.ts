@@ -535,13 +535,17 @@ describe("ConnectionPool — maxPoolSize eviction", () => {
       expect(spent).toBeInstanceOf(PoolFullError);
       expect(isPoolFullError(spent)).toBe(true);
       expect((spent as PoolFullError).waitedMs).toBe(20);
+      // The text reaches an MCP caller verbatim as the tool result, so both forms name the knob
+      // and the waited form says what to do.
       expect((spent as Error).message).toBe(
-        "Connection pool is full (1 connections in use or dialing); no slot freed up within 20ms",
+        "Connection pool is full (1 connections in use or dialing, the SSH_MCP_MAX_POOL_SIZE cap); no slot became available to this call within 20ms. Retry once the calls holding the slots finish, or raise SSH_MCP_MAX_POOL_SIZE in the server's environment.",
       );
       expect(mockedConnect).toHaveBeenCalledTimes(1); // never dialed
       // A bare acquire() is unchanged: fail-fast, no suffix.
       const bare = await pool.acquire({ host: "budget-next.example.com" }).catch((e: unknown) => e);
-      expect((bare as Error).message).toBe("Connection pool is full (1 connections in use or dialing)");
+      expect((bare as Error).message).toBe(
+        "Connection pool is full (1 connections in use or dialing, the SSH_MCP_MAX_POOL_SIZE cap)",
+      );
       expect((bare as PoolFullError).waitedMs).toBeUndefined();
 
       // Parked, then woken by the release; its retry evicts the idle entry and wins the slot.

@@ -41,7 +41,9 @@ const TimeoutSchema = z
   .int()
   .positive()
   .optional()
-  .describe("Command timeout in milliseconds (default: 30000)");
+  .describe(
+    "Command timeout in milliseconds (default: 30000). Also the longest the call waits for a free connection-pool slot (SSH_MCP_MAX_POOL_SIZE, default 100) before the command starts; the wait and the command are bounded separately.",
+  );
 
 const EnvSchema = z
   .record(z.string(), z.string())
@@ -71,6 +73,11 @@ const DEFAULT_TIMEOUT_MS = 30000;
  * `timeout` parameter (the SFTP tools) wait the same 30s the others default to.
  */
 const poolWait = (timeoutMs: number = DEFAULT_TIMEOUT_MS) => ({ waitForCapacityMs: timeoutMs });
+
+// Appended to every SFTP tool description. Those tools take no `timeout`, so TimeoutSchema's
+// note about the pool wait never reaches them; without this a caller would learn of the 30s
+// wait only from the error text once it had already been spent.
+const SFTP_POOL_WAIT_NOTE = ` If the connection pool is full (SSH_MCP_MAX_POOL_SIZE, default 100), waits up to ${DEFAULT_TIMEOUT_MS / 1000}s for a free slot before starting.`;
 
 // Standard note appended to every tool description that command policy does NOT cover.
 // See the SCOPE LIMIT block in src/policy.ts -- a blacklist is not whole-server coverage,
@@ -163,7 +170,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_read_file",
-    "Read a file from a remote host via SFTP.",
+    `Read a file from a remote host via SFTP.${SFTP_POOL_WAIT_NOTE}`,
     {
       ...connectionParams,
       path: z
@@ -188,7 +195,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_write_file",
-    `Write content to a file on a remote host via SFTP. Creates or overwrites the file.${POLICY_EXEMPT_NOTE}`,
+    `Write content to a file on a remote host via SFTP. Creates or overwrites the file.${SFTP_POOL_WAIT_NOTE}${POLICY_EXEMPT_NOTE}`,
     {
       ...connectionParams,
       path: AbsoluteRemotePathSchema.describe("Absolute path to the remote file. Must start with /."),
@@ -213,7 +220,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_upload",
-    `Upload a local file to a remote host via SFTP.${POLICY_EXEMPT_NOTE}`,
+    `Upload a local file to a remote host via SFTP.${SFTP_POOL_WAIT_NOTE}${POLICY_EXEMPT_NOTE}`,
     {
       ...connectionParams,
       localPath: z.string().describe("Path to the local file to upload"),
@@ -233,7 +240,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_download",
-    "Download a file from a remote host to local filesystem via SFTP.",
+    `Download a file from a remote host to local filesystem via SFTP.${SFTP_POOL_WAIT_NOTE}`,
     {
       ...connectionParams,
       remotePath: AbsoluteRemotePathSchema.describe("Absolute path to the remote file. Must start with /."),
@@ -253,7 +260,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_ls",
-    "List files in a directory on a remote host via SFTP.",
+    `List files in a directory on a remote host via SFTP.${SFTP_POOL_WAIT_NOTE}`,
     {
       ...connectionParams,
       path: AbsoluteRemotePathSchema.describe("Absolute path to the remote directory. Must start with /."),
@@ -279,7 +286,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_stat",
-    "Get metadata for a file or directory on a remote host via SFTP. Returns size, permissions (octal), uid/gid, mtime/atime, and the path type. Symlinks are reported as `symlink -> <target kind>`: the type describes the link itself while size/mode/mtime describe its TARGET, and a dangling symlink is reported rather than erroring. Use this instead of parsing `ls -la` output.",
+    `Get metadata for a file or directory on a remote host via SFTP. Returns size, permissions (octal), uid/gid, mtime/atime, and the path type. Symlinks are reported as \`symlink -> <target kind>\`: the type describes the link itself while size/mode/mtime describe its TARGET, and a dangling symlink is reported rather than erroring. Use this instead of parsing \`ls -la\` output.${SFTP_POOL_WAIT_NOTE}`,
     {
       ...connectionParams,
       path: AbsoluteRemotePathSchema.describe("Absolute path to the remote file or directory. Must start with /."),
@@ -312,7 +319,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_mkdir",
-    `Create a directory on a remote host via SFTP. Set \`recursive: true\` to create parent directories as needed (like \`mkdir -p\`). Existing intermediate dirs are tolerated; an existing leaf path is still an error. Unlike the other SFTP tools, the path may be relative.${POLICY_EXEMPT_NOTE}`,
+    `Create a directory on a remote host via SFTP. Set \`recursive: true\` to create parent directories as needed (like \`mkdir -p\`). Existing intermediate dirs are tolerated; an existing leaf path is still an error. Unlike the other SFTP tools, the path may be relative.${SFTP_POOL_WAIT_NOTE}${POLICY_EXEMPT_NOTE}`,
     {
       ...connectionParams,
       path: z
@@ -339,7 +346,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_delete",
-    `Delete a file or empty directory on a remote host via SFTP. Auto-detects the path type and calls the right SFTP op (unlink for files/symlinks, rmdir for empty dirs). Recursive directory delete is intentionally NOT supported -- for that, use ssh_exec with \`rm -rf\` explicitly so the destructive intent is visible in the tool trace.${POLICY_EXEMPT_NOTE}`,
+    `Delete a file or empty directory on a remote host via SFTP. Auto-detects the path type and calls the right SFTP op (unlink for files/symlinks, rmdir for empty dirs). Recursive directory delete is intentionally NOT supported -- for that, use ssh_exec with \`rm -rf\` explicitly so the destructive intent is visible in the tool trace.${SFTP_POOL_WAIT_NOTE}${POLICY_EXEMPT_NOTE}`,
     {
       ...connectionParams,
       path: AbsoluteRemotePathSchema.describe(
@@ -577,7 +584,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_multi_exec",
-    "Execute a command on multiple remote hosts in parallel: up to SSH_MCP_MAX_POOL_SIZE hosts at once (default 100), a larger list proceeding as slots free up. The connection pool is shared with every other tool; when it is full the call waits for slots, and gives up only after one `timeout` passes with no host of this call starting or finishing -- the host waiting at that point and every host still queued then report `Connection pool is full`. Returns results per host. Use this instead of calling ssh_exec multiple times — it's faster and shows results side by side. Use `env` to set environment variables for this call without modifying the command string. Subject to SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST if configured (policy is checked once, against the env-prefixed command, before fan-out).",
+    "Execute a command on multiple remote hosts in parallel. Runs at most SSH_MCP_MAX_POOL_SIZE hosts at once (default 100) and works through a longer list as slots free up. `timeout` is per host: it bounds each host's command, not the whole call, so with the pool to itself a call can take up to about ceil(hosts / cap) x `timeout`, plus connect time. The connection pool is shared with every other tool; when it is full this call waits for slots instead of failing, and gives up only when none of its own hosts holds a slot and a full `timeout` has passed with none of them starting or finishing. The host waiting at that point and every host still queued then report `Connection pool is full`; the queued ones are never attempted. Rerun those hosts once the other calls finish, or raise SSH_MCP_MAX_POOL_SIZE. Returns results per host. Use this instead of calling ssh_exec multiple times — it's faster and shows results side by side. Use `env` to set environment variables for this call without modifying the command string. Subject to SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST if configured (policy is checked once, against the env-prefixed command, before fan-out).",
     {
       hosts: z.array(z.string()).describe("List of SSH hostnames or IPs"),
       command: z.string().describe("Shell command to execute on all hosts"),
@@ -586,7 +593,11 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       privateKeyPath: KeyPathSchema,
       password: PasswordSchema,
       env: EnvSchema,
-      timeout: TimeoutSchema,
+      // Not the shared text: here the pool wait is the call-level no-progress budget, not a
+      // wait before one command starts.
+      timeout: TimeoutSchema.describe(
+        "Per-host command timeout in milliseconds (default: 30000): bounds each host's command, not the whole call. Also the call's no-progress budget on a full pool (see the tool description).",
+      ),
     },
     async ({ hosts, command, port, username, privateKeyPath, password, env, timeout }) => {
       // Same env-prefix + policy semantics as ssh_exec: one prefixed command string, checked
