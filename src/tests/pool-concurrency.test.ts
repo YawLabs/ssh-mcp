@@ -520,6 +520,52 @@ describe("ConnectionPool — maxPoolSize eviction", () => {
     }
   });
 
+  it("acquire({ waitForCapacityMs }) parks for a slot; a spent budget names itself; a connect failure is not waited out", async () => {
+    const pool = new ConnectionPool({ maxPoolSize: 1 });
+    try {
+      const held = await pool.acquire({ host: "budget-held.example.com" });
+
+      // Budget spent: still a PoolFullError (same code), now carrying the budget in its message.
+      const spent = await pool
+        .acquire({ host: "budget-next.example.com" }, { waitForCapacityMs: 20 })
+        .catch((e: unknown) => e);
+      expect(spent).toBeInstanceOf(PoolFullError);
+      expect(isPoolFullError(spent)).toBe(true);
+      expect((spent as PoolFullError).waitedMs).toBe(20);
+      expect((spent as Error).message).toBe(
+        "Connection pool is full (1 connections in use or dialing); no slot freed up within 20ms",
+      );
+      expect(mockedConnect).toHaveBeenCalledTimes(1); // never dialed
+      // A bare acquire() is unchanged: fail-fast, no suffix.
+      const bare = await pool.acquire({ host: "budget-next.example.com" }).catch((e: unknown) => e);
+      expect((bare as Error).message).toBe("Connection pool is full (1 connections in use or dialing)");
+      expect((bare as PoolFullError).waitedMs).toBeUndefined();
+
+      // Parked, then woken by the release; its retry evicts the idle entry and wins the slot.
+      let settled = false;
+      const parked = pool.acquire({ host: "budget-next.example.com" }, { waitForCapacityMs: 1_000 }).then((c) => {
+        settled = true;
+        return c;
+      });
+      await new Promise((r) => setTimeout(r, 5));
+      expect(settled).toBe(false);
+      pool.release(held);
+      const next = await parked;
+      expect(mockedConnect).toHaveBeenCalledTimes(2);
+      expect((held as any).endCalls).toBe(1);
+      pool.release(next);
+
+      // A connect failure is not a capacity signal: rejected at once, no retry on the budget.
+      mockedConnect.mockRejectedValueOnce(new Error("connect ECONNREFUSED"));
+      await expect(pool.acquire({ host: "budget-refused.example.com" }, { waitForCapacityMs: 5_000 })).rejects.toThrow(
+        /ECONNREFUSED/,
+      );
+      expect(mockedConnect).toHaveBeenCalledTimes(3);
+    } finally {
+      pool.drain();
+    }
+  });
+
   // defaultMaxPoolSize() reads process.env on every ConnectionPool construction, so a
   // stubbed env plus the file-level (already mocked) ConnectionPool is enough -- no
   // module reset or re-import needed.

@@ -16,8 +16,8 @@ vi.mock("../ssh.js", async (importOriginal) => {
 });
 
 import { find, type MultiExecHost, multiExec, serviceStatus } from "../ops.js";
-import { ConnectionPool } from "../pool.js";
-import { connectWithProxy } from "../ssh.js";
+import { ConnectionPool, PoolFullError } from "../pool.js";
+import { connectWithProxy, exec } from "../ssh.js";
 
 const mockedConnect = vi.mocked(connectWithProxy);
 
@@ -282,8 +282,8 @@ describe("multiExec — waits for pool capacity held by OTHER callers", () => {
   const DIAL_MS = 10;
   const EXEC_MS = 20;
 
-  /** Dials take DIAL_MS, every command takes EXEC_MS and prints `out:<host>`. Tracks open/peak. */
-  function timedConnects() {
+  /** Dials take DIAL_MS, every command takes `execMs` and prints `out:<host>`. Tracks open/peak. */
+  function timedConnects(execMs = EXEC_MS) {
     const stats = { open: 0, peak: 0 };
     mockedConnect.mockImplementation(async (resolved) => {
       const host = String(resolved.connectConfig.host);
@@ -301,7 +301,7 @@ describe("multiExec — waits for pool capacity held by OTHER callers", () => {
         setTimeout(() => {
           stream.emit("data", Buffer.from(`out:${host}\n`));
           stream.emit("close", 0);
-        }, EXEC_MS);
+        }, execMs);
       };
       return client as never;
     });
@@ -355,11 +355,11 @@ describe("multiExec — waits for pool capacity held by OTHER callers", () => {
     }
   });
 
-  it("still records 'Connection pool is full' once a host has waited its timeoutMs without a slot", async () => {
-    // multiExec measures the per-host bound with performance.now(). Vitest's fake clock covers
-    // it (the default toFake is everything but nextTick / queueMicrotask), so advancing the
-    // clock moves the deadline too; a narrower toFake would leave the retry loop re-parking
-    // on real time and this test would hang instead of settling at the bound.
+  it("still records 'Connection pool is full' once the call has gone timeoutMs without a slot", async () => {
+    // multiExec and the pool's wait loop measure the bound with performance.now(). Vitest's
+    // fake clock covers it (the default toFake is everything but nextTick / queueMicrotask),
+    // so advancing the clock moves the deadline too; a narrower toFake would leave the retry
+    // loop re-parking on real time and this test would hang instead of settling at the bound.
     vi.useFakeTimers();
     mockedConnect.mockImplementation(async () => makeQuietClient() as never);
     const pool = new ConnectionPool({ maxPoolSize: 1 });
@@ -402,6 +402,153 @@ describe("multiExec — waits for pool capacity held by OTHER callers", () => {
     const results = await run;
     expect(results.map((r) => r.host)).toEqual(["queued-1.test", "queued-2.test"]);
     for (const r of results) expect(r.error).toMatch(/drained/);
+  });
+
+  it("a single-host call arriving mid-fan-out takes the next freed slot instead of being refused for the whole run", async () => {
+    // The shared pool's other tenants: a fan-out's workers release and re-acquire within one
+    // microtask drain, so a fail-fast caller landing from a macrotask found the pool full at
+    // every probe of a 9-host / cap-3 run (measured: rejected at t=5..125ms of ~135ms). With a
+    // wait budget it is next in line: notifyCapacity() resolves it synchronously inside
+    // release(), so its continuation is queued BEFORE the releasing worker's own, and its
+    // retry takes the slot before that worker reaches its next host.
+    const stats = timedConnects();
+    const pool = new ConnectionPool({ maxPoolSize: 3 });
+    try {
+      const hosts = fleet("fanout", 9);
+      let fanOutSettled = false;
+      const fanOut = multiExec(pool, hosts, "hostname").then((r) => {
+        fanOutSettled = true;
+        return r;
+      });
+
+      // Arrive from a macrotask while the first wave is mid-command: every slot is held.
+      await new Promise((r) => setTimeout(r, DIAL_MS + EXEC_MS / 2));
+      // The default is still fail-fast (the precondition: the pool really is full right now).
+      await expect(pool.withConnection({ host: "single.test" }, async () => "never")).rejects.toThrow(PoolFullError);
+
+      const single = await pool.withConnection({ host: "single.test" }, (client) => exec(client, "hostname", 1_000), {
+        waitForCapacityMs: 30_000,
+      });
+      expect(single.stdout).toBe("out:single.test\n");
+      expect(fanOutSettled).toBe(false); // it ran INSIDE the fan-out, not after it
+
+      const results = await fanOut;
+      expect(results.map((r) => r.error)).toEqual(hosts.map(() => undefined));
+      expect(stats.peak).toBeLessThanOrEqual(3);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("a starved call settles after ONE timeout, not one per host, and reports every host without attempting it", async () => {
+    // The budget is call-level: a per-host budget on a serial worker queue made a call whose
+    // pool freed nothing settle only after ceil(hosts / cap) timeouts, every host reporting
+    // pool-full in turn (measured: cap 4, 4 slots held elsewhere, 40 hosts, 1000ms -> 10000ms).
+    vi.useFakeTimers();
+    mockedConnect.mockImplementation(async () => makeQuietClient() as never);
+    const pool = new ConnectionPool({ maxPoolSize: 4 });
+    try {
+      const held = await Promise.all(fleet("hog", 4).map((h) => pool.acquire(h))); // held elsewhere
+      const hosts = fleet("starved", 40);
+      const BOUND = 1_000;
+      const attempts = vi.spyOn(pool, "withConnection");
+      const start = performance.now();
+      let settledAt: number | undefined;
+      const run = multiExec(pool, hosts, "true", BOUND).then((r) => {
+        settledAt = performance.now();
+        return r;
+      });
+
+      await vi.advanceTimersByTimeAsync(BOUND - 1);
+      expect(settledAt).toBeUndefined(); // still inside the one budget
+      // Run the clock well past the old ceil(40 / 4) x BOUND = 10 x BOUND, so a per-host budget
+      // fails on the measured number below rather than on the test timeout.
+      await vi.advanceTimersByTimeAsync(11 * BOUND);
+      const results = await run;
+      // One timeout for the call, not one per worker-turn.
+      expect((settledAt ?? Number.NaN) - start).toBe(BOUND);
+
+      expect(results.map((r) => r.host)).toEqual(hosts.map((h) => h.host));
+      for (const r of results) {
+        expect(r.code).toBe(-1);
+        expect(r.error).toBe(
+          `Connection pool is full (4 connections in use or dialing); no slot freed up within ${BOUND}ms`,
+        );
+      }
+      // Only the first host of each of the min(hosts, cap) workers was ever handed to the pool;
+      // the 36 queued behind them were recorded from the starved call without a pool call.
+      expect(attempts).toHaveBeenCalledTimes(4);
+      expect(mockedConnect).toHaveBeenCalledTimes(4); // the hogs only
+      expect(vi.getTimerCount()).toBe(0);
+      for (const c of held) pool.release(c);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("never trips the bound while the fan-out keeps moving, however long the whole run takes", async () => {
+    // Progress resets the budget: with one usable slot for three workers, two are parked at
+    // every moment and a host starts or finishes every 310ms, so a 500ms budget is never
+    // spent even though the run lasts 1860ms. A budget measured from the call's START would
+    // starve it at 500ms with most of the fleet undone. Three workers rather than two on
+    // purpose: every wake has one winner and one LOSER that re-parks, and a budget measured
+    // per host from its FIRST rejection (rather than from the call's last progress) leaves
+    // that loser on its stale deadline -- it starves at 500ms while the winner is still
+    // running, which two workers can never show because there is never a loser.
+    vi.useFakeTimers();
+    const EXEC = 300;
+    const BOUND = 500;
+    timedConnects(EXEC);
+    const pool = new ConnectionPool({ maxPoolSize: 3 });
+    try {
+      // Two of the three slots, held elsewhere. Their dials are fake-clock setTimeouts too.
+      const holding = Promise.all(fleet("hog", 2).map((h) => pool.acquire(h)));
+      await vi.advanceTimersByTimeAsync(DIAL_MS);
+      const held = await holding;
+      const hosts = fleet("moving", 6);
+      const start = performance.now();
+      let settledAt: number | undefined;
+      const run = multiExec(pool, hosts, "hostname", BOUND).then((r) => {
+        settledAt = performance.now();
+        return r;
+      });
+
+      await vi.advanceTimersByTimeAsync(hosts.length * (DIAL_MS + EXEC) + 100);
+      const results = await run;
+
+      expect(results.map((r) => r.error)).toEqual(hosts.map(() => undefined));
+      expect(results.map((r) => r.stdout)).toEqual(hosts.map((h) => `out:${h.host}\n`));
+      // Strictly serial through the one free slot: dial + command per host, nothing overlapped.
+      expect((settledAt ?? Number.NaN) - start).toBe(hosts.length * (DIAL_MS + EXEC));
+      expect(settledAt !== undefined && settledAt - start > BOUND).toBe(true);
+      for (const c of held) pool.release(c);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("records a capacity rejection at once from a pool-like that never honors the wait budget", async () => {
+    // `waitedMs` on the error is the pool's own word that it waited. A pool-like that rejects
+    // with a PoolFullError without waiting must not send the worker into a retry spin for the
+    // rest of the budget: with real timers that would be 1000ms of hot looping per host.
+    let calls = 0;
+    const failFast = {
+      maxSize: 2,
+      async withConnection() {
+        calls++;
+        throw new PoolFullError(2);
+      },
+    } as unknown as ConnectionPool;
+    const hosts = fleet("nowait", 5);
+
+    const start = performance.now();
+    const results = await multiExec(failFast, hosts, "true", 1_000);
+
+    expect(performance.now() - start).toBeLessThan(500); // settled on microtasks, not the budget
+    expect(calls).toBe(hosts.length); // one attempt per host, no retries
+    expect(results.map((r) => r.error)).toEqual(
+      hosts.map(() => "Connection pool is full (2 connections in use or dialing)"),
+    );
   });
 });
 

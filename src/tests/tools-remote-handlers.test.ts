@@ -80,11 +80,14 @@ vi.mock("../ssh.js", async (importOriginal) => {
 
 /** Every config object the handlers hand to withConnection, in call order. */
 const seenConnections: unknown[] = [];
+/** The pool options handed alongside each of those configs (the capacity wait budget). */
+const seenPoolOptions: unknown[] = [];
 
 /** ConnectionPool subclass that never touches the network, and records the resolved config. */
 class RecordingPool extends ConnectionPool {
-  override async withConnection<T>(config: any, fn: (client: any) => Promise<T>): Promise<T> {
+  override async withConnection<T>(config: any, fn: (client: any) => Promise<T>, options?: unknown): Promise<T> {
     seenConnections.push(config);
+    seenPoolOptions.push(options);
     return fn({});
   }
 }
@@ -174,6 +177,7 @@ function service(overrides: Partial<ServiceStatus> = {}): ServiceStatus {
 
 beforeEach(() => {
   seenConnections.length = 0;
+  seenPoolOptions.length = 0;
   for (const spy of [
     findSpy,
     multiExecSpy,
@@ -738,6 +742,64 @@ describe("timeout defaulting reaches the callee", () => {
     // readyTimeout, not a per-call one. Pinned so the "defaults to 30000" claim is scoped
     // to the tools that actually have the parameter.
     expect("timeout" in getTool(name).schema).toBe(declared);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Every single-host tool asks the pool to WAIT for a slot, not fail fast
+// ---------------------------------------------------------------------------
+
+describe("every single-host tool hands withConnection a capacity wait budget", () => {
+  // The pool is shared with ssh_multi_exec, whose workers release and re-acquire within one
+  // microtask drain; a fail-fast single-host call landing mid-fan-out was refused for the
+  // whole run. The budget is the tool's own command timeout where it has one, and that
+  // timeout's 30000 default for the SFTP tools, which have no timeout parameter.
+
+  /** Calls the tool and returns the options its handler passed to withConnection. */
+  async function poolOptionsFor(name: string, args: Record<string, unknown>): Promise<unknown> {
+    // Four callees (exec, tail, makeDir, deleteFile) are not mocked in this file, so the
+    // handler's fn fails on the `{}` client -- AFTER the pool call this test looks at. A
+    // handler that never reaches withConnection leaves nothing recorded and fails below.
+    await call(name, args).catch(() => undefined);
+    expect(seenPoolOptions).toHaveLength(1);
+    return seenPoolOptions[0];
+  }
+
+  const EVERY_SINGLE_HOST_TOOL: [tool: string, args: Record<string, unknown>][] = [
+    ["ssh_exec", { command: "uptime" }],
+    ["ssh_read_file", { path: "/etc/hostname" }],
+    ["ssh_write_file", { path: "/tmp/x", content: "x" }],
+    ["ssh_upload", { localPath: "x", remotePath: "/tmp/x" }],
+    ["ssh_download", { remotePath: "/tmp/x", localPath: "x" }],
+    ["ssh_ls", { path: "/tmp" }],
+    ["ssh_stat", { path: "/tmp" }],
+    ["ssh_mkdir", { path: "/tmp/d" }],
+    ["ssh_delete", { path: "/tmp/x" }],
+    ["ssh_find", { path: "/var/log" }],
+    ["ssh_tail", { path: "/var/log/syslog" }],
+    ["ssh_service_status", { service: "nginx" }],
+  ];
+
+  it.each(
+    EVERY_SINGLE_HOST_TOOL,
+  )("%s waits up to 30000ms for a slot when the caller sets no timeout", async (name, args) => {
+    statFileSpy.mockResolvedValue(stats());
+    listDirSpy.mockResolvedValue([]);
+    readFileSpy.mockResolvedValue("");
+    findSpy.mockResolvedValue([]);
+    serviceStatusSpy.mockResolvedValue(service());
+    expect(await poolOptionsFor(name, { ...HOST, ...args })).toEqual({ waitForCapacityMs: 30000 });
+  });
+
+  it.each([
+    ["ssh_exec", { command: "uptime" }],
+    ["ssh_find", { path: "/var/log" }],
+    ["ssh_tail", { path: "/var/log/syslog" }],
+    ["ssh_service_status", { service: "nginx" }],
+  ] as [string, Record<string, unknown>][])("%s waits exactly as long as its explicit timeout", async (name, args) => {
+    findSpy.mockResolvedValue([]);
+    serviceStatusSpy.mockResolvedValue(service());
+    expect(await poolOptionsFor(name, { ...HOST, ...args, timeout: 4321 })).toEqual({ waitForCapacityMs: 4321 });
   });
 });
 

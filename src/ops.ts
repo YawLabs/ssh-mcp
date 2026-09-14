@@ -1,5 +1,5 @@
 import type { Client } from "ssh2";
-import { type ConnectionPool, isPoolFullError } from "./pool.js";
+import { type ConnectionPool, isPoolFullError, PoolFullError } from "./pool.js";
 import { exec } from "./ssh.js";
 
 // POSIX single-quote wrapping. Used by every helper that interpolates user input into
@@ -53,40 +53,73 @@ export async function multiExec(
   // slots held by other calls (a concurrent ssh_multi_exec, a long ssh_exec) make our
   // acquires reject with PoolFullError. That rejection is backpressure, not a host failure:
   // recording it and moving on used to fail the rest of the queue within microtasks, because
-  // every following host was rejected the same way. So on a capacity rejection -- and only
-  // that; connect and exec errors are recorded as before -- the worker parks until the pool
-  // signals a slot may be free and retries the SAME host.
+  // every following host was rejected the same way. So a capacity rejection -- and only
+  // that; connect and exec errors are recorded as before -- is waited out inside the pool
+  // (`waitForCapacityMs`), which retries the SAME host on every capacity signal.
   //
-  // Bound: a host waits at most `timeoutMs` in total for a slot (the same budget its command
-  // gets, so a host's worst case is two timeouts: one queued, one running), measured from its
-  // first rejection. Past that it records "Connection pool is full" as its result.
-  const waitForCapacity = (pool as Partial<Pick<ConnectionPool, "waitForCapacity">>).waitForCapacity;
-  const canWait = typeof waitForCapacity === "function";
+  // Bound: ONE budget for the whole call, `timeoutMs` (the command timeout), measured from
+  // the call's last progress -- the last time any host of this call was handed a slot or
+  // gave one back. Every wait is handed only what is left of that budget, so a call whose
+  // pool frees nothing ends after ~one timeout of no progress: the host waiting at that
+  // point records "Connection pool is full", and every host still queued behind it records
+  // the same error at once without being attempted (no slot has freed in a full timeout;
+  // later hosts cannot do better). A fan-out that keeps moving never trips it, however long
+  // it runs, because each host that starts or finishes resets the budget. Trade-off, made
+  // deliberately: the previous per-host budget let a call whose slots freed only after
+  // 2.5x timeout still complete its later hosts -- at the cost of a starved 40-host call
+  // settling only after ceil(40 / cap) timeouts (10s at cap 4, timeout 1s), each host
+  // waiting its own full budget in turn.
+  let lastProgressAt = performance.now();
+  // Once set, the call is starved: every host still queued reports this without a dial.
+  let starvedError: string | undefined;
+
+  const poolFull = (host: string, error: string): MultiExecResult => ({
+    host,
+    stdout: "",
+    stderr: "",
+    code: -1,
+    error,
+  });
 
   const runHost = async (hostConfig: MultiExecHost): Promise<MultiExecResult> => {
-    let deadline: number | undefined;
     for (;;) {
+      if (starvedError !== undefined) return poolFull(hostConfig.host, starvedError);
+      const budget = lastProgressAt + timeoutMs - performance.now();
       try {
-        return await pool.withConnection(hostConfig, async (client) => {
-          const result = await exec(client, command, timeoutMs);
-          // Spreading the whole ExecResult carries `signal` (and the truncation flags) through
-          // per-host without re-listing every field; `signal` is declared on MultiExecResult so
-          // the ssh_multi_exec formatter can actually see it.
-          return { host: hostConfig.host, ...result };
-        });
+        return await pool.withConnection(
+          hostConfig,
+          async (client) => {
+            lastProgressAt = performance.now(); // a slot was granted: progress
+            try {
+              const result = await exec(client, command, timeoutMs);
+              // Spreading the whole ExecResult carries `signal` (and the truncation flags) through
+              // per-host without re-listing every field; `signal` is declared on MultiExecResult so
+              // the ssh_multi_exec formatter can actually see it.
+              return { host: hostConfig.host, ...result };
+            } finally {
+              // A slot is about to be given back: progress too, or a worker coming off a
+              // command longer than `timeoutMs` would read the call as starved the moment a
+              // foreign caller won the slot it just released.
+              lastProgressAt = performance.now();
+            }
+          },
+          { waitForCapacityMs: budget },
+        );
       } catch (reason: unknown) {
-        let message = reason instanceof Error ? reason.message : String(reason);
-        if (isPoolFullError(reason)) {
-          const now = performance.now();
-          deadline ??= now + timeoutMs;
-          const remaining = deadline - now;
-          if (canWait && remaining > 0) {
-            await pool.waitForCapacity(remaining);
-            continue;
-          }
-          if (canWait) message += `; no slot freed up within ${timeoutMs}ms`;
+        // `waitedMs` is the pool's own word that it waited out the budget it was handed; a
+        // capacity rejection without it came from a pool that did not wait (a pool-like that
+        // ignores the option), and retrying against that would spin, so it is recorded at
+        // once like any other error. A budget already spent is the same as a wait spent.
+        if (isPoolFullError(reason) && (reason.waitedMs !== undefined || budget <= 0)) {
+          // Progress elsewhere in the call during this wait: a fresh remainder, same host.
+          if (lastProgressAt + timeoutMs - performance.now() > 0) continue;
+          // The pool's suffix names the budget it was handed, which is only the remainder for
+          // this host; report the call-level bound instead, the same text for every host.
+          starvedError ??= new PoolFullError(reason.maxPoolSize, timeoutMs).message;
+          return poolFull(hostConfig.host, starvedError);
         }
-        return { host: hostConfig.host, stdout: "", stderr: "", code: -1, error: message };
+        const message = reason instanceof Error ? reason.message : String(reason);
+        return poolFull(hostConfig.host, message);
       }
     }
   };

@@ -18,11 +18,24 @@ export interface PoolOptions {
    * Default: 100, overridable via the
    * `SSH_MCP_MAX_POOL_SIZE` env var. When at capacity, the pool first tries to evict
    * an idle entry; if no idle entry can be evicted (every slot is in use or dialing),
-   * `acquire()` rejects at once with a {@link PoolFullError} ("Connection pool is full").
+   * `acquire()` rejects with a {@link PoolFullError} ("Connection pool is full") -- at once
+   * by default, or after `waitForCapacityMs` (see {@link AcquireOptions}) with no slot freed.
    * Bump this for fan-out workloads against many distinct hosts (e.g. `ssh_multi_exec`
    * across a large fleet, which runs at most this many hosts at once).
    */
   maxPoolSize?: number;
+}
+
+export interface AcquireOptions {
+  /**
+   * How long `acquire()` / `withConnection()` may wait for a slot when the pool is full,
+   * in milliseconds. Default 0: reject at once with a {@link PoolFullError}. With a budget,
+   * the caller parks (see `waitForCapacity`) and retries on every capacity signal until a
+   * slot is won or the budget is spent, then rejects with a {@link PoolFullError} whose
+   * message ends in "no slot freed up within <budget>ms". Only a capacity rejection is
+   * waited out; connect failures and a drained pool reject at once as before.
+   */
+  waitForCapacityMs?: number;
 }
 
 /** `code` of the error `acquire()` throws when no slot is free. Match on this, not on the message. */
@@ -32,15 +45,20 @@ export const POOL_FULL_ERROR_CODE = "ERR_SSH_MCP_POOL_FULL";
  * Thrown by `acquire()` when a new connection is needed and no slot is free: every slot is
  * held by an in-use entry or an in-flight dial, and no idle entry can be evicted. Distinct
  * from connect and exec failures so a caller that can wait (see `waitForCapacity`) retries
- * only on this.
+ * only on this. `waitedMs` is set when the caller asked to wait and the budget ran out; the
+ * message then carries the "no slot freed up within <n>ms" suffix -- appended here, once, so
+ * no caller has to add it.
  */
 export class PoolFullError extends Error {
   readonly code = POOL_FULL_ERROR_CODE;
   readonly maxPoolSize: number;
-  constructor(maxPoolSize: number) {
-    super(`Connection pool is full (${maxPoolSize} connections in use or dialing)`);
+  readonly waitedMs?: number;
+  constructor(maxPoolSize: number, waitedMs?: number) {
+    const base = `Connection pool is full (${maxPoolSize} connections in use or dialing)`;
+    super(waitedMs === undefined ? base : `${base}; no slot freed up within ${Math.round(waitedMs)}ms`);
     this.name = "PoolFullError";
     this.maxPoolSize = maxPoolSize;
+    if (waitedMs !== undefined) this.waitedMs = waitedMs;
   }
 }
 
@@ -137,7 +155,34 @@ export class ConnectionPool {
     this.maxPoolSize = options?.maxPoolSize ?? defaultMaxPoolSize();
   }
 
-  async acquire(config: SSHConfig): Promise<Client> {
+  /**
+   * Checks out a connection for `config`, dialing one if needed. Fails fast on a full pool
+   * unless `options.waitForCapacityMs` is set, in which case the caller parks and retries on
+   * every capacity signal until it wins a slot or the budget is spent. The wait is bounded,
+   * never a reservation: a woken caller can lose the slot to another and simply parks again
+   * for whatever budget is left. The final rejection carries the budget in its message.
+   */
+  async acquire(config: SSHConfig, options?: AcquireOptions): Promise<Client> {
+    const budgetMs = options?.waitForCapacityMs ?? 0;
+    if (!(budgetMs > 0)) return this.acquireNow(config);
+    const deadline = performance.now() + budgetMs;
+    for (;;) {
+      try {
+        return await this.acquireNow(config);
+      } catch (err: unknown) {
+        if (!isPoolFullError(err)) throw err;
+        const remaining = deadline - performance.now();
+        if (remaining <= 0) throw new PoolFullError(this.maxPoolSize, budgetMs);
+        // Resolves at once when the slot freed before we parked, on any capacity signal, or
+        // when `remaining` runs out -- in which case the retry above is the one final attempt
+        // (a slot can free right at the boundary) before the budget is declared spent.
+        await this.waitForCapacity(remaining);
+      }
+    }
+  }
+
+  // The fail-fast acquire: one admission check, one dial (or a join on an in-flight one).
+  private async acquireNow(config: SSHConfig): Promise<Client> {
     const resolved = resolveOrDiagnose(config);
     const cc = resolved.connectConfig;
     const key = `${cc.username}@${cc.host}:${cc.port}#${authFingerprint(cc)}`;
@@ -324,8 +369,9 @@ export class ConnectionPool {
     }
   }
 
-  async withConnection<T>(config: SSHConfig, fn: (client: Client) => Promise<T>): Promise<T> {
-    const client = await this.acquire(config);
+  /** `acquire()` + `fn` + `release()`, with the same optional bounded wait for a slot. */
+  async withConnection<T>(config: SSHConfig, fn: (client: Client) => Promise<T>, options?: AcquireOptions): Promise<T> {
+    const client = await this.acquire(config, options);
     try {
       return await fn(client);
     } finally {
@@ -356,8 +402,8 @@ export class ConnectionPool {
 
   /**
    * Parks until the pool's capacity may have changed, for a caller whose `acquire()` just
-   * rejected with a {@link PoolFullError} and that would rather wait than fail. `acquire()`
-   * itself never waits; this is opt-in.
+   * rejected with a {@link PoolFullError} and that would rather wait than fail. This is the
+   * primitive behind `acquire()`'s `waitForCapacityMs` option; a bare `acquire()` never waits.
    *
    * Resolves `true` when a slot may be free (woken by a release, an entry closing or expiring,
    * a failed dial, or `drain()`), or at once if a new host would fit right now or the pool is

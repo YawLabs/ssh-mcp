@@ -55,7 +55,7 @@ export type { FindOptions, MultiExecHost, MultiExecResult, ServiceStatus } from 
 export { find, multiExec, serviceStatus, tail } from "./ops.js";
 export type { PolicyContext } from "./policy.js";
 export { enforcePolicy, isPolicyConfigured } from "./policy.js";
-export type { PoolOptions } from "./pool.js";
+export type { AcquireOptions, PoolOptions } from "./pool.js";
 export { ConnectionPool, isPoolFullError, POOL_FULL_ERROR_CODE, PoolFullError } from "./pool.js";
 // HostKeyRejection / HostKeyRejectionReason are named by the public ResolvedConfig,
 // so a consumer cannot fully type that value without them.
