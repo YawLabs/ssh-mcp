@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **`@modelcontextprotocol/sdk` is now `^1.30.0` (was `^1.29.0`), and `npm audit` is clean.** The SDK is a runtime dependency, so the new floor reaches every install of this package, not just this repo's toolchain. The lockfile moves the SDK's transitive packages past their advisories: `fast-uri` 3.1.2 -> 3.1.7, `ip-address` 10.2.0 -> 10.7.0, `qs` 6.15.2 -> 6.16.0, `hono` 4.12.25 -> 4.13.7 and `@hono/node-server` 1.19.14 -> 2.1.1. None of them is bundled into the published `dist/` — the SDK stays external, so a consumer's copies come from their own install — and `fast-uri` (via `ajv`) is the only one the stdio server loads; a fresh install already resolves 3.1.7, while an existing lockfile that pinned 3.1.2, inside the advised range, needs `npm update`.
+
 ## [0.16.1] — 2026-09-14
 
 ### Changed
