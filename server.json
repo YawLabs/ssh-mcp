@@ -9,12 +9,12 @@
     "id": "1205491307"
   },
   "websiteUrl": "https://yaw.sh/mcp-servers/ssh-mcp/",
-  "version": "0.16.0",
+  "version": "0.16.1",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@yawlabs/ssh-mcp",
-      "version": "0.16.0",
+      "version": "0.16.1",
       "transport": {
         "type": "stdio"
       }

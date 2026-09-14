@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.1] — 2026-09-14
+
 ### Changed
 - npm and MCP Registry listing metadata: bugs URL, core keywords, and server.json title/repository/websiteUrl
 - `release.sh` writes a `## [x.y.z]` changelog entry for every release — promoting `[Unreleased]` when it has content, otherwise generating one from the commit subjects since the previous tag — moves the Keep-a-Changelog link references along when a file has them, and takes the GitHub release notes from that entry instead of from `git log` subjects. Before this the script never touched CHANGELOG.md at all: documented work sat under `[Unreleased]` while the versions that shipped it went out with no entry (0.14.0 through 0.16.0 below are backfilled), and every GitHub release page showed raw commit subjects.
