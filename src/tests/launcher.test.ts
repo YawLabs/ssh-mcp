@@ -207,7 +207,7 @@ describe("launcher: oam mode is a hard requirement", () => {
     const r = run(makeLayout(), { mode: "oam" });
     expect(r.status).toBe(1);
     expect(r.stdout).not.toContain(MARKER);
-    expect(r.stderr).toMatch(/no usable oam \(0\.15\.2 or newer\) was found/);
+    expect(r.stderr).toMatch(/no usable oam \(0\.18\.0 or newer\) was found/);
     expect(r.stderr).toMatch(/Install oam from https:\/\/oamjs\.org/);
   });
 
@@ -364,11 +364,11 @@ describe("launcher: runtimePlan()", () => {
     // asking what it was already running on. `auto` and `oam` both have to take
     // the shortcut -- `oam` demands oam, and the host already is one.
     //
-    // 0.15.2 pins the floor as inclusive (it IS the supported release), and
-    // 0.100.0 pins a numeric compare: it sorts BEFORE 0.15.2 as a string, so a
+    // 0.18.0 pins the floor as inclusive (it IS the supported release), and
+    // 0.100.0 pins a numeric compare: it sorts BEFORE 0.18.0 as a string, so a
     // compare over the raw text would treat a newer oam as too old.
     for (const mode of ["auto", "oam"]) {
-      for (const hostOam of ["0.15.2", "0.16.0", "0.100.0", "1.0.0", "0.16.0-dev"]) {
+      for (const hostOam of ["0.18.0", "0.19.0", "0.100.0", "1.0.0", "0.19.0-dev"]) {
         expect(runtimePlan({ mode, hostOam }), `mode=${mode} hostOam=${hostOam}`).toBe("in-process");
       }
     }
@@ -380,7 +380,7 @@ describe("launcher: runtimePlan()", () => {
     // anything older than the latest release is not what the server is
     // verified on.
     for (const mode of ["auto", "oam"]) {
-      for (const hostOam of ["0.15.1", "0.9.0", "0.8.2", "0.0.1"]) {
+      for (const hostOam of ["0.17.0", "0.15.2", "0.9.0", "0.8.2", "0.0.1"]) {
         expect(runtimePlan({ mode, hostOam }), `mode=${mode} hostOam=${hostOam}`).toBe("discover");
       }
     }
@@ -398,7 +398,7 @@ describe("launcher: runtimePlan()", () => {
 
   it("runs SSH_MCP_RUNTIME=node on Node: in-process on a Node host, handed off from any oam host", () => {
     expect(runtimePlan({ mode: "node", hostOam: undefined })).toBe("in-process");
-    for (const hostOam of ["0.8.2", "0.15.2", "1.0.0", "dev"]) {
+    for (const hostOam of ["0.8.2", "0.18.0", "1.0.0", "dev"]) {
       expect(runtimePlan({ mode: "node", hostOam }), `hostOam=${hostOam}`).toBe("handoff-node");
     }
   });
@@ -409,25 +409,25 @@ describe("launcher: pickNewest()", () => {
   const at = (path: string, version: number[] | null): Candidate => ({ path, version });
 
   it("pins the floor to the latest oam release", () => {
-    expect(floor).toEqual([0, 15, 2]);
+    expect(floor).toEqual([0, 18, 0]);
   });
 
   it("takes the newest usable oam, not the first one found", () => {
     // The bug: discovery stopped at the first binary that existed, so an older
     // copy in an earlier location (the installed dir is searched before PATH)
     // hid a newer one later.
-    const chosen = pickNewest([at("installed", [0, 15, 2]), at("path-a", [0, 16, 0]), at("path-b", [0, 15, 9])]);
+    const chosen = pickNewest([at("installed", [0, 18, 0]), at("path-a", [0, 19, 0]), at("path-b", [0, 18, 9])]);
     expect(chosen?.path).toBe("path-a");
   });
 
   it("compares numerically and keeps search order on a tie", () => {
-    expect(pickNewest([at("a", [0, 16, 0]), at("b", [0, 100, 0])])?.path).toBe("b");
-    expect(pickNewest([at("first", [0, 15, 2]), at("second", [0, 15, 2])])?.path).toBe("first");
+    expect(pickNewest([at("a", [0, 19, 0]), at("b", [0, 100, 0])])?.path).toBe("b");
+    expect(pickNewest([at("first", [0, 18, 0]), at("second", [0, 18, 0])])?.path).toBe("first");
   });
 
   it("skips binaries below the floor or with no readable version", () => {
-    expect(pickNewest([at("old", [0, 9, 0]), at("broken", null), at("good", [0, 15, 2])])?.path).toBe("good");
-    expect(pickNewest([at("old", [0, 15, 1]), at("broken", null)])).toBeNull();
+    expect(pickNewest([at("old", [0, 9, 0]), at("broken", null), at("good", [0, 18, 0])])?.path).toBe("good");
+    expect(pickNewest([at("old", [0, 17, 0]), at("broken", null)])).toBeNull();
     expect(pickNewest([])).toBeNull();
   });
 });
@@ -452,7 +452,7 @@ describe("launcher: already hosted on oam", () => {
       `serves in-process instead of spawning a nested oam (SSH_MCP_RUNTIME=${mode})`,
       () => {
         const layout = makeLayout();
-        const r = run(layout, { mode, hostOam: "0.15.2", oamBin: process.execPath, args: ["--version", "extra"] });
+        const r = run(layout, { mode, hostOam: "0.18.0", oamBin: process.execPath, args: ["--version", "extra"] });
         expect(r.status, JSON.stringify(r)).toBe(0);
         const payload = stubPayload(r.stdout);
         // Same entry-point repoint and argv passthrough as the Node fallback:
@@ -460,7 +460,7 @@ describe("launcher: already hosted on oam", () => {
         expect(payload.argv1).toBe(join(layout, "dist", "index.js"));
         expect(payload.args).toEqual(["--version", "extra"]);
         expect(payload.pid).toBe(r.pid);
-        expect(payload.oam).toBe("0.15.2");
+        expect(payload.oam).toBe("0.18.0");
         // No discovery ran, so there is no discovery diagnostic.
         expect(r.stderr).toBe("");
       },
@@ -474,7 +474,7 @@ describe("launcher: already hosted on oam", () => {
       // PATH, OAM_BIN and every installed location are empty, which on Node is
       // the "no usable oam" hard failure. On an oam host at the floor that
       // requirement is already met.
-      const r = run(makeLayout(), { mode: "oam", hostOam: "0.15.2" });
+      const r = run(makeLayout(), { mode: "oam", hostOam: "0.18.0" });
       expect(r.status, JSON.stringify(r)).toBe(0);
       expect(r.stdout).toContain(MARKER);
       expect(r.stderr).not.toMatch(/no usable oam/);
@@ -485,7 +485,7 @@ describe("launcher: already hosted on oam", () => {
   it(
     "still discovers and spawns when the host oam is below the floor",
     () => {
-      const r = run(makeLayout(), { mode: "auto", hostOam: "0.15.1", oamBin: process.execPath });
+      const r = run(makeLayout(), { mode: "auto", hostOam: "0.17.0", oamBin: process.execPath });
       expect(r.stdout, `a below-floor host must not shortcut, got ${JSON.stringify(r)}`).not.toContain(MARKER);
       expect(r.status).not.toBe(0);
       // The spawned child failed, not the launcher: every launcher diagnostic
@@ -512,7 +512,7 @@ describe("launcher: an oam host below the floor never serves", () => {
       expect(payload.pid, "served by a child, not on the old host").not.toBe(r.pid);
       expect(payload.oam).toBeNull();
       expect(r.stderr).toMatch(
-        /this process is oam 0\.9\.0, older than 0\.15\.2, and no newer oam was found; running on .*node(\.exe)? instead/,
+        /this process is oam 0\.9\.0, older than 0\.18\.0, and no newer oam was found; running on .*node(\.exe)? instead/,
       );
     },
     TIMEOUT_MS,
@@ -597,7 +597,7 @@ describe("launcher: an oam host below the floor never serves", () => {
       // A newer oam WAS found; it just would not start. The handoff note must
       // not then claim that nothing was found.
       expect(r.stderr).toMatch(
-        /older than 0\.15\.2, and the newer oam would not start; running on .*node(\.exe)? instead/,
+        /older than 0\.18\.0, and the newer oam would not start; running on .*node(\.exe)? instead/,
       );
       expect(r.stderr).not.toMatch(/no newer oam was found/);
       const payload = stubPayload(r.stdout);
@@ -615,7 +615,7 @@ describe("launcher: SSH_MCP_RUNTIME=node always means Node", () => {
     "hands off to Node even on a supported oam host",
     () => {
       const layout = makeLayout();
-      const r = run(layout, { mode: "node", hostOam: "0.15.2", pathDirs: [nodeDir(layout)], args: ["extra"] });
+      const r = run(layout, { mode: "node", hostOam: "0.18.0", pathDirs: [nodeDir(layout)], args: ["extra"] });
       expect(r.status, JSON.stringify(r)).toBe(0);
       const payload = stubPayload(r.stdout);
       expect(payload.pid).not.toBe(r.pid);
@@ -630,10 +630,10 @@ describe("launcher: SSH_MCP_RUNTIME=node always means Node", () => {
   it(
     "exits 1 with a Node remedy when there is no Node on PATH",
     () => {
-      const r = run(makeLayout(), { mode: "node", hostOam: "0.15.2" });
+      const r = run(makeLayout(), { mode: "node", hostOam: "0.18.0" });
       expect(r.status, JSON.stringify(r)).toBe(1);
       expect(r.stdout).not.toContain(MARKER);
-      expect(r.stderr).toMatch(/SSH_MCP_RUNTIME=node on oam 0\.15\.2, and no Node was found on PATH/);
+      expect(r.stderr).toMatch(/SSH_MCP_RUNTIME=node on oam 0\.18\.0, and no Node was found on PATH/);
       expect(r.stderr).toMatch(/Put Node on PATH/);
       expect(r.stderr).not.toMatch(/self-update/);
     },
@@ -700,7 +700,7 @@ describe("launcher: signal handling (POSIX only)", () => {
   const OAM_SH = [
     "#!/bin/sh",
     // The launcher probes `--version` first; answer at the floor so the gate passes.
-    'case "$1" in --version) echo "oam 0.15.2"; exit 0;; esac',
+    'case "$1" in --version) echo "oam 0.18.0"; exit 0;; esac',
     "shift", // drop the leading "run"
     'exec node "$OAM_CHILD"',
     "",
