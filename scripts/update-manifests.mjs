@@ -33,6 +33,11 @@ const expand = (p) => (p.startsWith('~') ? join(homedir(), p.slice(1)) : p);
 
 const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf-8'));
 const version = arg('version', pkg.version);
+// version lands in a release tag, file contents and the generated Ruby, so it must be the
+// plain semver it claims to be before anything is built from it.
+if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
+  throw new Error(`--version must be a semver like 1.2.3 or 1.2.3-rc.1, got ${JSON.stringify(version)}`);
+}
 const tag = `v${version}`;
 
 // Manifest repo paths: resolved in priority order:
@@ -50,6 +55,12 @@ const push = process.argv.includes('--push');
 // --- everything below is derived from package.json (copy-paste generic) ------
 const pkgShort = pkg.name.split('/').pop(); // scoop install name + bucket file
 const cmd = Object.keys(pkg.bin ?? {})[0] ?? pkgShort; // the on-PATH command
+// cmd names files and the Ruby class, and the formula's test block runs `<cmd> --version`
+// through a shell, so it must be a plain command token. Letter-first and dot-free, because
+// className below must come out a valid Ruby constant (`2fa` and `foo.bar` would not).
+if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(cmd)) {
+  throw new Error(`command name must be a letter followed by [A-Za-z0-9_-], got ${JSON.stringify(cmd)}`);
+}
 const repoSlug =
   (pkg.repository?.url ?? '')
     .replace(/^git\+/, '')
@@ -79,7 +90,9 @@ execFileSync('gh', ['release', 'download', tag, '--repo', repoSlug, '-p', '*.sha
 const hashes = {};
 for (const file of readdirSync(shaDir)) {
   const [hex, name] = readFileSync(join(shaDir, file), 'utf-8').trim().split(/\s+/);
-  hashes[name] = hex;
+  // The sidecar is downloaded release content: accept only a real sha256 digest.
+  if (!/^[0-9a-f]{64}$/i.test(hex ?? '')) throw new Error(`${file} does not hold a sha256 hex digest`);
+  hashes[name] = hex.toLowerCase();
 }
 function hashFor(asset) {
   const h = hashes[asset];
@@ -110,27 +123,31 @@ const scoopManifest = {
 };
 
 // 3. Homebrew formula (CLI -> formula, NOT cask).
-const licenseLine = proprietary ? 'license :cannot_represent' : `license "${pkg.license}"`;
+// Escape a value for a Ruby double-quoted string literal. Backslash and `"` end or alter
+// the literal, and `#` starts interpolation (`#{...}` runs Ruby when the formula loads).
+// One pass over the original string, so no backslash this adds is escaped again.
+const rb = (value) => String(value).replace(/[\\"#]/g, (c) => `\\${c}`);
+const licenseLine = proprietary ? 'license :cannot_represent' : `license "${rb(pkg.license)}"`;
 const formula = `class ${className} < Formula
-  desc "${(pkg.description ?? '').replace(/"/g, '\\"')}"
-  homepage "${homepage}"
-  version "${version}"
+  desc "${rb((pkg.description ?? '').replace(/\s*[\r\n]+\s*/g, ' '))}"
+  homepage "${rb(homepage)}"
+  version "${rb(version)}"
   ${licenseLine}
 
   on_macos do
     on_arm do
-      url "${dl(ASSETS.macArm64)}", using: :nounzip
+      url "${rb(dl(ASSETS.macArm64))}", using: :nounzip
       sha256 "${hashFor(ASSETS.macArm64)}"
     end
     on_intel do
-      url "${dl(ASSETS.macX64)}", using: :nounzip
+      url "${rb(dl(ASSETS.macX64))}", using: :nounzip
       sha256 "${hashFor(ASSETS.macX64)}"
     end
   end
 
   on_linux do
     on_intel do
-      url "${dl(ASSETS.linuxX64)}", using: :nounzip
+      url "${rb(dl(ASSETS.linuxX64))}", using: :nounzip
       sha256 "${hashFor(ASSETS.linuxX64)}"
     end
   end

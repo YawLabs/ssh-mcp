@@ -57,6 +57,8 @@ const sshChildName = (p: unknown): string | null => {
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
+  const fakeFds = new Map<number, string>();
+  let nextFakeFd = 1_000_000;
   return {
     ...actual,
     appendFileSync: (...args: unknown[]) => appendSpy(...args),
@@ -73,14 +75,28 @@ vi.mock("node:fs", async (importOriginal) => {
       if (mockSshFiles && isSshDir(p)) return Object.keys(mockSshFiles);
       return (actual.readdirSync as (...a: unknown[]) => unknown)(p, ...rest);
     },
-    statSync: (p: unknown, ...rest: unknown[]) => {
+    // listSshKeys opens each candidate once and stats/reads through the descriptor, so a
+    // mocked ~/.ssh file gets a fake fd (far above any real one) that maps back to its name.
+    openSync: (p: unknown, ...rest: unknown[]) => {
       const name = sshChildName(p);
       if (mockSshFiles && name !== null && Object.hasOwn(mockSshFiles, name)) {
-        return { isFile: () => true } as unknown as ReturnType<typeof actual.statSync>;
+        const fd = nextFakeFd++;
+        fakeFds.set(fd, name);
+        return fd;
       }
-      return (actual.statSync as (...a: unknown[]) => unknown)(p, ...rest);
+      return (actual.openSync as (...a: unknown[]) => unknown)(p, ...rest);
+    },
+    fstatSync: (fd: unknown, ...rest: unknown[]) => {
+      if (fakeFds.has(fd as number)) return { isFile: () => true } as unknown as ReturnType<typeof actual.fstatSync>;
+      return (actual.fstatSync as (...a: unknown[]) => unknown)(fd, ...rest);
+    },
+    closeSync: (fd: unknown) => {
+      if (fakeFds.delete(fd as number)) return;
+      actual.closeSync(fd as number);
     },
     readFileSync: (p: unknown, ...rest: unknown[]) => {
+      const fdName = typeof p === "number" ? fakeFds.get(p) : undefined;
+      if (fdName !== undefined && mockSshFiles && Object.hasOwn(mockSshFiles, fdName)) return mockSshFiles[fdName];
       const name = sshChildName(p);
       if (mockConfig !== null && name === "config") return mockConfig;
       if (mockSshFiles && name !== null && Object.hasOwn(mockSshFiles, name)) return mockSshFiles[name];

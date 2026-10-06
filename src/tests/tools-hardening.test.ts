@@ -605,7 +605,11 @@ describe("the suggested tolerant pattern matches shellQuote's escaped-apostrophe
     // branch can consume the opening quote and hand the rest of the value to the tail.
     const suggested = new RegExp(suggestedPattern());
     expect(suggested.test("ATTACK=' ls ' reboot")).toBe(false);
-    const loneQuoteVariant = /^([A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|')+ )*ls( |$)/;
+    // Pinned as `(?:'|'[^' =]+')+`, not the literal `(?:'[^']*'|')+`: the literal form
+    // (and any variant whose quoted branch can span a space and `=`) backtracks
+    // exponentially on a repeated `A=' ` through the outer group. The bypass needs only the
+    // lone-quote branch, so narrowing the quoted branch keeps it pinned.
+    const loneQuoteVariant = /^([A-Za-z_][A-Za-z0-9_]*=(?:'|'[^' =]+')+ )*ls( |$)/;
     expect(loneQuoteVariant.test("ATTACK=' ls ' reboot")).toBe(true); // the bypass, pinned
   });
 
