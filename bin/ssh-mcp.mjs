@@ -40,7 +40,7 @@
  * named on stderr, and discovery carries on. It used to stop everything: a typo
  * in OAM_BIN meant Node, with no hint why. The discovered binaries that were
  * passed over, and any .cmd/.bat shim on PATH, are named only when NO usable
- * oam is found -- with 0.9.0 installed and 0.15.2 on PATH, stderr stays empty.
+ * oam is found -- with 0.9.0 installed and 0.18.0 on PATH, stderr stays empty.
  *
  * ALREADY RUNNING ON OAM
  * A host can resolve this package's `bin` and launch `oam run <this file>`
@@ -77,7 +77,7 @@
  * wired up here.
  *
  * MINIMUM OAM VERSION
- * The latest oam release, 0.15.2 -- bump OAM_MIN when oam ships a newer one.
+ * The latest oam release, 0.18.0 -- bump OAM_MIN when oam ships a newer one.
  * Only the current oam is used and verified; an older one is passed over.
  * The floor is not cosmetic: before 0.9.0 `child_process.execFile` ran its
  * arguments through a SHELL, `exec` accepted `timeout` and ignored it,
@@ -104,7 +104,7 @@ import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** Oldest oam whose `child_process` matches Node. See MINIMUM OAM VERSION above. */
-const OAM_MIN = [0, 15, 2];
+const OAM_MIN = [0, 18, 0];
 
 /**
  * Bound on each `oam --version` probe. A healthy oam answers in milliseconds;
