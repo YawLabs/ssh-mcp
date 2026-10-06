@@ -77,6 +77,51 @@ describe("find input validation", () => {
   });
 });
 
+describe("runtime validation of arguments spliced into the command unquoted", () => {
+  // find() and tail() are library exports: a JS caller is not bound by the TypeScript types,
+  // so anything placed on the command line without shellQuote must be checked at runtime.
+  // An empty object as the client proves the throw happens before any exec.
+  const noExec = {} as any;
+
+  it.each([["x"], ["f; id"], ["f d"], [""], [1]])("find rejects type %j", async (type) => {
+    await expect(find(noExec, { path: "/tmp", type: type as any })).rejects.toThrow("Invalid type");
+  });
+
+  it.each([
+    [-1],
+    [1.5],
+    [Number.NaN],
+    [Number.POSITIVE_INFINITY],
+    ["1; id"],
+    ["2"],
+    [null],
+  ])("find rejects maxdepth %j", async (maxdepth) => {
+    await expect(find(noExec, { path: "/tmp", maxdepth: maxdepth as any })).rejects.toThrow("Invalid maxdepth");
+  });
+
+  it.each([["minsize"], ["maxsize"]])("find rejects a non-string %s", async (field) => {
+    const evil = { toString: () => "1M; id", [Symbol.toPrimitive]: () => "1M; id" };
+    await expect(find(noExec, { path: "/tmp", [field]: evil } as any)).rejects.toThrow(`Invalid ${field}`);
+    await expect(find(noExec, { path: "/tmp", [field]: 5 } as any)).rejects.toThrow(`Invalid ${field}`);
+  });
+
+  it("find still builds the expected command for valid type and maxdepth", async () => {
+    const { client, lastCommand } = capturingClient({ stdout: "/tmp/a\n" });
+    await find(client, { path: "/tmp", type: "d", maxdepth: 0 });
+    expect(lastCommand()).toBe("find '/tmp' -maxdepth '0' -type 'd'");
+  });
+
+  it.each([[0], [-5], [2.5], [Number.NaN], ["10; id"], ["10"]])("tail rejects lines %j", async (lines) => {
+    await expect(tail(noExec, "/var/log/syslog", lines as any)).rejects.toThrow("Invalid lines");
+  });
+
+  it("tail still builds the expected command for a valid line count", async () => {
+    const { client, lastCommand } = capturingClient({ stdout: "x\n" });
+    await tail(client, "/var/log/syslog", 25);
+    expect(lastCommand()).toBe("tail -n 25 -- '/var/log/syslog'");
+  });
+});
+
 describe("find error surfacing", () => {
   it("surfaces stderr when find produced no stdout", async () => {
     const client = fakeClient({ stderr: "find: '/nope': No such file or directory", code: 1 });

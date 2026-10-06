@@ -1382,14 +1382,14 @@ describe("find — size predicates reach the command string", () => {
     const cap = commandCapturingClient({ stdout: "/var/log/huge.log\n/var/log/old.gz\n", code: 0 });
     const results = await find(cap.client, { path: "/var/log", minsize: "100M" });
 
-    expect(cap.lastCommand()).toBe("find '/var/log' -size +100M");
+    expect(cap.lastCommand()).toBe("find '/var/log' -size '+100M'");
     expect(results).toEqual(["/var/log/huge.log", "/var/log/old.gz"]);
   });
 
   it("emits `-size -N` for maxsize (files SMALLER than N)", async () => {
     const cap = commandCapturingClient({ stdout: "", code: 0 });
     await find(cap.client, { path: "/tmp", maxsize: "10M" });
-    expect(cap.lastCommand()).toBe("find '/tmp' -size -10M");
+    expect(cap.lastCommand()).toBe("find '/tmp' -size '-10M'");
   });
 
   it("emits both bounds, minsize first, in fixed order with the other predicates", async () => {
@@ -1404,15 +1404,15 @@ describe("find — size predicates reach the command string", () => {
       newer: "/etc/passwd",
     });
     expect(cap.lastCommand()).toBe(
-      "find '/srv' -maxdepth 3 -type f -name '*.log' -size +1M -size -500M -newer '/etc/passwd'",
+      "find '/srv' -maxdepth '3' -type 'f' -name '*.log' -size '+1M' -size '-500M' -newer '/etc/passwd'",
     );
   });
 
   it("passes the unit-suffixed and bare-number forms through unchanged", async () => {
     for (const [size, expected] of [
-      ["512c", "find '/data' -size +512c"],
-      ["1024", "find '/data' -size +1024"],
-      ["5G", "find '/data' -size +5G"],
+      ["512c", "find '/data' -size '+512c'"],
+      ["1024", "find '/data' -size '+1024'"],
+      ["5G", "find '/data' -size '+5G'"],
     ] as const) {
       const cap = commandCapturingClient({ stdout: "", code: 0 });
       await find(cap.client, { path: "/data", minsize: size });
@@ -1550,6 +1550,29 @@ describe("ConnectionPool — the dead-race retry loop", () => {
     try {
       await expect(pool.acquire({ host: "flapping.test" })).rejects.toThrow(/after 3 attempts/);
       expect(mockedConnect).toHaveBeenCalledTimes(3);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("names the target in the give-up message but never the pool key's auth fingerprint", async () => {
+    // The pool key carries a fingerprint of the credential. It is keyed per process, but it
+    // is still internal: the message an MCP caller sees names user@host:port and stops there.
+    mockedConnect.mockImplementation(async () => makeSelfClosingClient() as never);
+
+    const pool = new ConnectionPool();
+    try {
+      const err = await pool
+        .acquire({ host: "flapping.test", port: 2222, username: "deploy", password: "hunter2" })
+        .then(
+          () => undefined,
+          (e: unknown) => e as Error,
+        );
+      expect(err?.message).toMatch(
+        /^Failed to acquire SSH connection for deploy@flapping\.test:2222 after 3 attempts: /,
+      );
+      expect(err?.message).not.toContain("#");
+      expect(err?.message).not.toContain("hunter2");
     } finally {
       pool.drain();
     }

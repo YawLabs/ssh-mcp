@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHmac, type Hmac, randomBytes, scryptSync } from "node:crypto";
 import type { Client, ConnectConfig } from "ssh2";
 import { connectWithProxy, enhanceSshError, type ResolvedConfig, resolveConfig, type SSHConfig } from "./ssh.js";
 
@@ -96,23 +96,43 @@ function defaultMaxPoolSize(): number {
 // credential. Fold a short fingerprint of the resolved auth material into the key
 // so they get distinct entries. Same effective credential -> same fingerprint ->
 // reuse still works.
+//
+// The fingerprint is KEYED with a secret drawn once per process and never written
+// anywhere. A plain digest of the credential would be a verifier: anyone who saw a
+// pool key could test password guesses against it offline. Keyed, it is useless
+// outside this process, and it only has to be stable within one process, because
+// the pool itself lives no longer than that.
+const AUTH_FINGERPRINT_SECRET = randomBytes(32);
+
+// The password goes through scrypt rather than straight into the HMAC, so it is
+// never processed by a fast general-purpose digest. The secret above is what makes
+// the result unguessable; the KDF is defense in depth, so its cost is kept low
+// (a few ms per call, machine-dependent): this runs on every acquire() that carries
+// a password, pool hits included, synchronously, on the event loop.
+const PASSWORD_SCRYPT_COST = 1024;
+
+// Each field goes in as tag, 4-byte length, bytes. Without the length the field
+// boundaries are ambiguous: a private key ending in "a/sock" with no agent would
+// feed the HMAC the same bytes as the shorter key plus agent "/sock".
+function updateField(h: Hmac, tag: string, value: Buffer | string): void {
+  const bytes = typeof value === "string" ? Buffer.from(value, "utf8") : value;
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(bytes.length);
+  h.update(tag);
+  h.update(len);
+  h.update(bytes);
+}
+
 function authFingerprint(cc: ConnectConfig): string {
-  const h = createHash("sha256");
-  if (cc.privateKey) {
-    h.update("k");
-    h.update(cc.privateKey as Buffer | string);
-  }
+  const h = createHmac("sha256", AUTH_FINGERPRINT_SECRET);
+  if (cc.privateKey) updateField(h, "k", cc.privateKey as Buffer | string);
   if (cc.password !== undefined) {
-    h.update("p");
-    h.update(cc.password);
+    updateField(h, "p", scryptSync(cc.password, AUTH_FINGERPRINT_SECRET, 32, { N: PASSWORD_SCRYPT_COST }));
   }
   // ssh2 types `agent` as string | BaseAgent; resolveConfig only ever sets a string
   // socket path, so fingerprint that and ignore the (unused) object form.
-  if (typeof cc.agent === "string") {
-    h.update("a");
-    h.update(cc.agent);
-  }
-  return h.digest("hex").slice(0, 16);
+  if (typeof cc.agent === "string") updateField(h, "a", cc.agent);
+  return h.digest("hex").slice(0, 32);
 }
 
 // resolveConfig() does real I/O (readFileSync on privateKeyPath, `ssh -G`) and can
@@ -335,8 +355,10 @@ export class ConnectionPool {
       }
       return client;
     }
+    // Names the target, not `key`: the auth fingerprint is internal and stays out of
+    // anything that reaches a caller.
     throw new Error(
-      `Failed to acquire SSH connection for ${key} after ${MAX_ACQUIRE_ATTEMPTS} attempts: ${
+      `Failed to acquire SSH connection for ${cc.username}@${cc.host}:${cc.port} after ${MAX_ACQUIRE_ATTEMPTS} attempts: ${
         lastErr instanceof Error ? lastErr.message : String(lastErr)
       }`,
     );

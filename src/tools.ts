@@ -635,7 +635,12 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       path: z.string().describe("Directory to search in (e.g. /var/log, /home/user)"),
       name: z.string().optional().describe("Filename pattern with wildcards (e.g. '*.log', 'config.*')"),
       type: z.enum(["f", "d", "l"]).optional().describe("File type: f=file, d=directory, l=symlink"),
-      maxdepth: z.number().optional().describe("Maximum directory depth to search"),
+      maxdepth: z
+        .number()
+        .int()
+        .nonnegative()
+        .optional()
+        .describe("Maximum directory depth to search (0 = the path itself only)"),
       minsize: z.string().optional().describe("Minimum file size (e.g. '1M', '100k')"),
       maxsize: z.string().optional().describe("Maximum file size (e.g. '10M', '500k')"),
       newer: z

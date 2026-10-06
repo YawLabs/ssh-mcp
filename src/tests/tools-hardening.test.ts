@@ -428,7 +428,7 @@ describe("find leading-dash defense is portable across find implementations", ()
 
   it("still emits the option flags after the rewritten path operand", async () => {
     const cmd = await runFind({ path: "-weird", name: "*.log", type: "f", maxdepth: 2 });
-    expect(cmd).toBe("find './-weird' -maxdepth 2 -type f -name '*.log'");
+    expect(cmd).toBe("find './-weird' -maxdepth '2' -type 'f' -name '*.log'");
   });
 
   it("keeps shell-injection quoting on the path (the rewrite does not replace shellQuote)", async () => {
