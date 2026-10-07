@@ -326,23 +326,23 @@ for (const check of report.checks) {
 
 ## Runtime selection
 
-The `ssh-mcp` command — what `npx @yawlabs/ssh-mcp` runs — is a small launcher. It prefers the [oam](https://oamjs.org) runtime and otherwise runs the server on Node, so oam is optional. Its minimum is the **latest oam release, currently 0.15.2**, and it never serves on an older oam.
+The `ssh-mcp` command — what `npx @yawlabs/ssh-mcp` runs — is a small launcher. It prefers the [oam](https://oamjs.org) runtime and otherwise runs the server on Node, so oam is optional. Its minimum is the **latest oam release, currently 0.18.0**, and it never serves on an older oam.
 
 Two environment variables control the choice; set them in your MCP client's `env` block:
 
 - `SSH_MCP_RUNTIME` — which runtime to use. Case-insensitive; any value other than `oam` or `node` behaves as `auto`.
-  - `auto` (default) — use the newest oam it can find at 0.15.2 or newer, otherwise run on Node.
+  - `auto` (default) — use the newest oam it can find at 0.18.0 or newer, otherwise run on Node.
   - `oam` — require oam. Fails loudly: if no usable oam is found, the launcher prints what it found and why each one was passed over to stderr, and exits with status 1 instead of starting the server.
   - `node` — always Node. The launcher does not look for oam, and `OAM_BIN` is ignored.
-- `OAM_BIN` — path to an oam binary to use in preference to discovery, when it is 0.15.2 or newer. If it does not exist, is older, or will not run, the launcher says so on stderr and carries on with discovery.
+- `OAM_BIN` — path to an oam binary to use in preference to discovery, when it is 0.18.0 or newer. If it does not exist, is older, or will not run, the launcher says so on stderr and carries on with discovery.
 
-Discovery looks in `%LOCALAPPDATA%\oam\bin` (Windows only), then `~/.oam/bin`, then every directory on `PATH`; asks every oam binary it finds for its version; and uses the newest one at 0.15.2 or newer. On a tie the one found first wins, so an installed copy beats one on `PATH`. On Windows only `oam.exe` counts: an `oam.cmd`/`oam.bat` shim on `PATH` is never run, and is named on stderr when no usable oam is found.
+Discovery looks in `%LOCALAPPDATA%\oam\bin` (Windows only), then `~/.oam/bin`, then every directory on `PATH`; asks every oam binary it finds for its version; and uses the newest one at 0.18.0 or newer. On a tie the one found first wins, so an installed copy beats one on `PATH`. On Windows only `oam.exe` counts: an `oam.cmd`/`oam.bat` shim on `PATH` is never run, and is named on stderr when no usable oam is found.
 
-By default an unusable oam is not an error. When Node starts the launcher (`npx` or a global install, run directly by your MCP client), `auto` mode falls back to Node — silently when there was nothing to find, or with a note on stderr naming each oam (and `OAM_BIN`) it passed over and why: older than 0.15.2, not runnable, or a shim. A chosen oam that then fails to start is named on stderr too. When an older oam starts the launcher, the handoff to Node is always noted on stderr (see below). With `SSH_MCP_RUNTIME=oam`, each of these cases exits with status 1 instead.
+By default an unusable oam is not an error. When Node starts the launcher (`npx` or a global install, run directly by your MCP client), `auto` mode falls back to Node — silently when there was nothing to find, or with a note on stderr naming each oam (and `OAM_BIN`) it passed over and why: older than 0.18.0, not runnable, or a shim. A chosen oam that then fails to start is named on stderr too. When an older oam starts the launcher, the handoff to Node is always noted on stderr (see below). With `SSH_MCP_RUNTIME=oam`, each of these cases exits with status 1 instead.
 
 When the launcher is itself started by oam (`oam run <path>/bin/ssh-mcp.mjs`, which is how Yaw MCP starts an `npx @yawlabs/ssh-mcp` entry when a recent oam is installed):
 
-- On oam 0.15.2 or newer it runs the server on that oam, in the same process. Nothing is discovered or spawned, `OAM_BIN` is not read, and `SSH_MCP_RUNTIME=oam` counts it as the oam it requires.
+- On oam 0.18.0 or newer it runs the server on that oam, in the same process. Nothing is discovered or spawned, `OAM_BIN` is not read, and `SSH_MCP_RUNTIME=oam` counts it as the oam it requires.
 - On an older oam it never runs the server there. It hands the server off to the newest usable oam it can find, or to Node on `PATH`, or exits with status 1 when there is neither (`SSH_MCP_RUNTIME=oam` exits with status 1 rather than handing off to Node).
 - With `SSH_MCP_RUNTIME=node` it hands the server off to Node on `PATH`, whatever the oam version.
 
@@ -366,7 +366,7 @@ On Windows, add the same `env` block to the `cmd /c` form from [Quick start](#qu
 
 - Node.js 18+
 - SSH client installed (for diagnostics and environment management)
-- Optional: [oam](https://oamjs.org) 0.15.2+ — see [Runtime selection](#runtime-selection)
+- Optional: [oam](https://oamjs.org) 0.18.0+ — see [Runtime selection](#runtime-selection)
 
 ## License
 

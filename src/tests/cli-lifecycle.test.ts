@@ -487,7 +487,7 @@ describe("launcher: every oam found is asked, and the newest wins", () => {
       mode: "auto",
       pathDirs,
       spy: true,
-      fakeVersions: { [installed]: "0.15.2", [newest]: "0.16.0", [middle]: "0.15.9" },
+      fakeVersions: { [installed]: "0.18.0", [newest]: "0.19.0", [middle]: "0.18.9" },
     });
     expect(r.status, JSON.stringify(r)).toBe(0);
     expect(spawnedWith(layout).cmd).toBe(newest);
@@ -549,7 +549,7 @@ describe("launcher: every oam found is asked, and the newest wins", () => {
 
 describe("launcher: the argv handed to oam", () => {
   // process.execPath passes the REAL version gate (`node --version` reports a
-  // semver well above the 0.15.2 floor); the spy only replaces the spawn.
+  // semver well above the 0.18.0 floor); the spy only replaces the spawn.
   it("passes `run <server> --` and forwards host args after the separator", () => {
     const layout = makeLauncherLayout();
     const r = runLauncher(layout, { mode: "oam", oamBin: process.execPath, spy: true, args: ["--version", "extra"] });
@@ -594,7 +594,7 @@ describe("launcher: the argv handed to oam", () => {
     const node = join(nodeDir, isWin ? "node.exe" : "node");
     // Only has to EXIST: Node on PATH is found by stat, and the spy runs nothing.
     writeFileSync(node, "");
-    const r = runLauncher(layout, { mode: "node", pathDirs: [nodeDir], spy: true, hostOam: "0.15.2", args: ["x"] });
+    const r = runLauncher(layout, { mode: "node", pathDirs: [nodeDir], spy: true, hostOam: "0.18.0", args: ["x"] });
     const call = spawnedWith(layout);
     expect(call.cmd).toBe(node);
     // Node takes the entry directly: no `run`, no separator.
