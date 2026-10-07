@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.3] — 2026-10-07
+
 ### Security
 - **The connection pool no longer derives its key from a plain SHA-256 of the password, and that key no longer reaches callers.** The pool keys each connection on its credentials so two calls with different auth never share one. That fingerprint was a truncated, unsalted SHA-256 of the password, and it appeared in the "Failed to acquire SSH connection for ..." error an MCP caller sees, so a weak password could be guessed offline from it. The fingerprint is now an HMAC-SHA256 keyed with a random secret drawn once per process; the password goes through scrypt first, and each field is length-framed. The error names `user@host:port` only. Fixes CodeQL `js/insufficient-password-hash`.
 - **`find()` and `tail()` check their arguments at runtime and quote every `find` operand.** Both are exported library API, and `type`, `maxdepth`, `minsize`, `maxsize` and `tail`'s `lines` were placed on the remote command line unquoted, trusting the TypeScript types that nothing enforces at runtime. `type` must now be `f`, `d` or `l`, `maxdepth` a non-negative integer, `minsize`/`maxsize` size strings, and `lines` a positive integer; anything else throws before a command is built. **Library callers:** a numeric string (`maxdepth: "2"`, `lines: "50"`) and `lines: 0` used to work and now throw. The MCP tools are unaffected; `ssh_find`'s `maxdepth` schema is now `int().nonnegative()`, matching the check. Fixes CodeQL `js/shell-command-constructed-from-input`.
