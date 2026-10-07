@@ -85,8 +85,13 @@ const sshChildName = (p: unknown): string | null => {
 };
 const stateFiles = (s: SshDirState): Record<string, string> => (s.kind === "missing" ? {} : s.files);
 
+// Fake descriptors handed out for mocked ~/.ssh files, hoisted so tests can assert every one
+// was closed. `notRegular` names entries whose fstat reports something other than a file.
+const fdState = vi.hoisted(() => ({ open: new Map<number, string>(), next: 1_000_000, notRegular: new Set<string>() }));
+
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
+  const fakeFds = fdState.open;
   return {
     ...actual,
     existsSync: (p: unknown) => {
@@ -104,14 +109,33 @@ vi.mock("node:fs", async (importOriginal) => {
       }
       return (actual.readdirSync as (...a: unknown[]) => unknown)(p, ...rest);
     },
-    statSync: (p: unknown, ...rest: unknown[]) => {
+    // listSshKeys opens each candidate once and stats/reads through the descriptor, so a
+    // mocked ~/.ssh file gets a fake fd (far above any real one) that maps back to its name.
+    openSync: (p: unknown, ...rest: unknown[]) => {
       const name = sshChildName(p);
       if (sshDir && name !== null && Object.hasOwn(stateFiles(sshDir), name)) {
-        return { isFile: () => true } as unknown as ReturnType<typeof actual.statSync>;
+        const fd = fdState.next++;
+        fakeFds.set(fd, name);
+        return fd;
       }
-      return (actual.statSync as (...a: unknown[]) => unknown)(p, ...rest);
+      return (actual.openSync as (...a: unknown[]) => unknown)(p, ...rest);
+    },
+    fstatSync: (fd: unknown, ...rest: unknown[]) => {
+      const fdName = fakeFds.get(fd as number);
+      if (fdName !== undefined) {
+        const isFile = !fdState.notRegular.has(fdName);
+        return { isFile: () => isFile } as unknown as ReturnType<typeof actual.fstatSync>;
+      }
+      return (actual.fstatSync as (...a: unknown[]) => unknown)(fd, ...rest);
+    },
+    closeSync: (fd: unknown) => {
+      if (fakeFds.delete(fd as number)) return;
+      actual.closeSync(fd as number);
     },
     readFileSync: (p: unknown, ...rest: unknown[]) => {
+      const fdName = typeof p === "number" ? fakeFds.get(p) : undefined;
+      if (fdName !== undefined && sshDir && Object.hasOwn(stateFiles(sshDir), fdName))
+        return stateFiles(sshDir)[fdName];
       const name = sshChildName(p);
       if (sshDir && name !== null && Object.hasOwn(stateFiles(sshDir), name)) return stateFiles(sshDir)[name];
       return (actual.readFileSync as (...a: unknown[]) => unknown)(p, ...rest);
@@ -417,6 +441,35 @@ function scanWith(opts: {
     return { fail: true, stderr: `unexpected subprocess: ${cmd} ${args.join(" ")}` };
   };
 }
+
+describe("listSshKeys reads each candidate through one descriptor", () => {
+  afterEach(() => {
+    fdState.notRegular.clear();
+  });
+
+  it("skips an entry that fstat reports is not a regular file", () => {
+    sshDir = { kind: "files", files: { id_ed25519: OPENSSH_PRIV, sockdir: OPENSSH_PRIV } };
+    fdState.notRegular.add("sockdir");
+    scanWith({
+      agent: { stdout: "The agent has no identities." },
+      fingerprint: () => ({ stdout: "256 SHA256:A x (ED25519)" }),
+    });
+    expect(listSshKeysDetailed().keys.map((k) => k.name)).toEqual(["id_ed25519"]);
+  });
+
+  it("closes every descriptor it opens: kept key, non-key file, and non-regular entry alike", () => {
+    sshDir = { kind: "files", files: { id_ed25519: OPENSSH_PRIV, notes: "just some text", sockdir: OPENSSH_PRIV } };
+    fdState.notRegular.add("sockdir");
+    scanWith({
+      agent: { stdout: "The agent has no identities." },
+      fingerprint: () => ({ stdout: "256 SHA256:A x (ED25519)" }),
+    });
+    const before = fdState.next;
+    listSshKeysDetailed();
+    expect(fdState.next - before).toBe(3); // one open per candidate...
+    expect(fdState.open.size).toBe(0); // ...and every one closed again
+  });
+});
 
 describe("listSshKeys correlates ssh-keygen fingerprints against the ssh-add set", () => {
   const FILES = { id_ed25519: OPENSSH_PRIV, work_rsa: OPENSSH_PRIV };

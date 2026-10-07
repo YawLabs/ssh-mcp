@@ -1,5 +1,14 @@
 import { execFileSync } from "node:child_process";
-import { appendFileSync, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  constants as fsConstants,
+  fstatSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isValidHostname, probeSshConnection, runArgs, SSH_NON_KEY_FILES } from "./diagnose.js";
@@ -176,7 +185,9 @@ export function ensureAgent(): AgentResult {
   };
 }
 
-function detectKeyType(filePath: string, fileName: string): string {
+// `content` is the private key file as listSshKeysDetailed already read it through its fd;
+// it is passed in rather than re-read here by path, which could see a different file.
+function detectKeyType(filePath: string, fileName: string, content: string): string {
   // Check the .pub file first — most reliable
   const pubPath = `${filePath}.pub`;
   if (existsSync(pubPath)) {
@@ -199,7 +210,6 @@ function detectKeyType(filePath: string, fileName: string): string {
 
   // Check content
   try {
-    const content = readFileSync(filePath, "utf8");
     if (content.includes("RSA PRIVATE KEY")) return "rsa";
     if (content.includes("EC PRIVATE KEY")) return "ecdsa";
     if (content.includes("DSA PRIVATE KEY")) return "dsa";
@@ -282,14 +292,22 @@ export function listSshKeysDetailed(): SshKeyListing {
     if (file.endsWith(".pub") || file.startsWith(".") || SSH_NON_KEY_FILES.has(file)) continue;
 
     const filePath = join(sshDir, file);
+    let fd: number | undefined;
     try {
-      const stat = statSync(filePath);
-      if (!stat.isFile()) continue;
+      // Open once, then stat and read through the descriptor, so the content checked for a
+      // key (and classified by detectKeyType) comes from the file that passed the
+      // regular-file check -- a by-path stat followed by a by-path read can be swapped in
+      // between. ssh-keygen still takes the path, so a swap there can only skew the reported
+      // type or fingerprint. O_NONBLOCK keeps the open from hanging on a FIFO and O_NOCTTY
+      // keeps a tty from becoming the controlling terminal; fstat then rejects both as not a
+      // regular file. Both flags are POSIX-only, and undefined on Windows.
+      fd = openSync(filePath, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0) | (fsConstants.O_NOCTTY ?? 0));
+      if (!fstatSync(fd).isFile()) continue;
 
-      const content = readFileSync(filePath, "utf8");
+      const content = readFileSync(fd, "utf8");
       if (!content.includes("PRIVATE KEY")) continue;
 
-      const type = detectKeyType(filePath, file);
+      const type = detectKeyType(filePath, file, content);
 
       // Get fingerprint
       let fingerprint: string | undefined;
@@ -304,6 +322,8 @@ export function listSshKeysDetailed(): SshKeyListing {
       keys.push({ name: file, path: filePath, type, fingerprint, loadedInAgent });
     } catch {
       // Skip unreadable files
+    } finally {
+      if (fd !== undefined) closeSync(fd);
     }
   }
 

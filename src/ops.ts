@@ -222,7 +222,29 @@ const VALID_FIND_SIZE = /^\d+[cwbkMG]?$/;
 // must stay untouched.
 const FIND_EXPRESSION_TOKENS = new Set(["(", ")", "!", ","]);
 
+const VALID_FIND_TYPES = new Set(["f", "d", "l"]);
+
+// find() and tail() are exported library API, so the TypeScript types on their arguments are
+// not enforced at runtime: a JS caller can hand `type` or `maxdepth` any value. Every
+// argument that is not free text is therefore checked here against an exact shape, so a bad
+// value fails with a clear error instead of reaching the remote shell.
+function isNonNegativeInteger(n: unknown): n is number {
+  return typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
+}
+
 export async function find(client: Client, options: FindOptions, timeoutMs = 30000): Promise<string[]> {
+  if (options.type !== undefined && !VALID_FIND_TYPES.has(options.type)) {
+    throw new Error(`Invalid type: "${String(options.type)}". Expected one of: f (file), d (directory), l (symlink)`);
+  }
+  if (options.maxdepth !== undefined && !isNonNegativeInteger(options.maxdepth)) {
+    throw new Error(`Invalid maxdepth: ${String(options.maxdepth)}. Expected a non-negative integer`);
+  }
+  if (options.minsize !== undefined && typeof options.minsize !== "string") {
+    throw new Error('Invalid minsize: expected a string such as "1M" or "100k"');
+  }
+  if (options.maxsize !== undefined && typeof options.maxsize !== "string") {
+    throw new Error('Invalid maxsize: expected a string such as "10M" or "500k"');
+  }
   if (options.minsize && !VALID_FIND_SIZE.test(options.minsize)) {
     throw new Error(
       `Invalid minsize format: "${options.minsize}". Expected: digits followed by optional c/w/b/k/M/G (e.g. "1M", "100k")`,
@@ -255,11 +277,14 @@ export async function find(client: Client, options: FindOptions, timeoutMs = 300
     options.path.startsWith("-") || FIND_EXPRESSION_TOKENS.has(options.path) ? `./${options.path}` : options.path;
   const args: string[] = [shellQuote(pathOperand)];
 
-  if (options.maxdepth !== undefined) args.push("-maxdepth", String(options.maxdepth));
-  if (options.type) args.push("-type", options.type);
+  // Every operand is quoted, the validated ones included: validation is what gives a bad
+  // value a clear error, quoting is what keeps the shell out of it even if a check is ever
+  // loosened.
+  if (options.maxdepth !== undefined) args.push("-maxdepth", shellQuote(String(options.maxdepth)));
+  if (options.type) args.push("-type", shellQuote(options.type));
   if (options.name) args.push("-name", shellQuote(options.name));
-  if (options.minsize) args.push("-size", `+${options.minsize}`);
-  if (options.maxsize) args.push("-size", `-${options.maxsize}`);
+  if (options.minsize) args.push("-size", shellQuote(`+${options.minsize}`));
+  if (options.maxsize) args.push("-size", shellQuote(`-${options.maxsize}`));
   if (options.newer) args.push("-newer", shellQuote(options.newer));
 
   const command = `find ${args.join(" ")}`;
@@ -285,6 +310,9 @@ export async function tail(
   grep?: string,
   timeoutMs = 30000,
 ): Promise<string> {
+  if (!isNonNegativeInteger(lines) || lines === 0) {
+    throw new Error(`Invalid lines: ${String(lines)}. Expected a positive integer`);
+  }
   // `--` so a path starting with `-` isn't parsed as a tail flag.
   let command = `tail -n ${lines} -- ${shellQuote(path)}`;
   if (grep) {
