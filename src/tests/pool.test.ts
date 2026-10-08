@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConnectionPool } from "../pool.js";
-import { readKnownHostsKeys, resolveConfig } from "../ssh.js";
+import { isStrictHostKeyMode, readKnownHostsKeys, resolveConfig } from "../ssh.js";
 
 describe("ConnectionPool", () => {
   it("creates a pool with default options", () => {
@@ -110,6 +110,7 @@ describe("hostVerifier (via resolveConfig)", () => {
 
   beforeEach(() => {
     vi.stubEnv("SSH_MCP_STRICT_HOST_KEY", "");
+    vi.stubEnv("SSH_MCP_STRICT_HOSTKEYS", "");
   });
   afterEach(() => {
     vi.unstubAllEnvs();
@@ -128,12 +129,41 @@ describe("hostVerifier (via resolveConfig)", () => {
     expect(verify(Buffer.from("fake-key-bytes"))).toBe(false);
   });
 
+  it("rejects unknown hosts when SSH_MCP_STRICT_HOSTKEYS=1 (the non-credential-shaped name)", () => {
+    vi.stubEnv("SSH_MCP_STRICT_HOSTKEYS", "1");
+    const resolved = resolveConfig({ host: UNKNOWN });
+    const verify = resolved.connectConfig.hostVerifier as (key: Buffer) => boolean;
+    expect(verify(Buffer.from("fake-key-bytes"))).toBe(false);
+  });
+
   it("strict mode is captured at resolveConfig time, not verify time", () => {
     // Verifier built with strict=false should keep accepting even if env flips later.
     const resolved = resolveConfig({ host: UNKNOWN });
     vi.stubEnv("SSH_MCP_STRICT_HOST_KEY", "1");
     const verify = resolved.connectConfig.hostVerifier as (key: Buffer) => boolean;
     expect(verify(Buffer.from("x"))).toBe(true);
+  });
+});
+
+describe("isStrictHostKeyMode", () => {
+  // Read the way Yaw MCP reads an opt-in: trimmed, case-insensitive 1/true. Only "1"
+  // used to count, so =true silently left strict mode off.
+  it.each(["1", "true", "TRUE", " True ", " 1\n"])("treats %j as on, under either name", (value) => {
+    expect(isStrictHostKeyMode({ SSH_MCP_STRICT_HOSTKEYS: value })).toBe(true);
+    expect(isStrictHostKeyMode({ SSH_MCP_STRICT_HOST_KEY: value })).toBe(true);
+  });
+
+  it.each(["", "0", "false", "yes", "on", "2"])("treats %j as off", (value) => {
+    expect(isStrictHostKeyMode({ SSH_MCP_STRICT_HOSTKEYS: value, SSH_MCP_STRICT_HOST_KEY: value })).toBe(false);
+  });
+
+  it("is off when neither name is set", () => {
+    expect(isStrictHostKeyMode({})).toBe(false);
+  });
+
+  it("either name alone turns it on (the old name keeps working)", () => {
+    expect(isStrictHostKeyMode({ SSH_MCP_STRICT_HOST_KEY: "1", SSH_MCP_STRICT_HOSTKEYS: "" })).toBe(true);
+    expect(isStrictHostKeyMode({ SSH_MCP_STRICT_HOSTKEYS: "1", SSH_MCP_STRICT_HOST_KEY: "0" })).toBe(true);
   });
 });
 

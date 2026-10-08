@@ -138,6 +138,7 @@ const {
   formatDiagnostics,
   listDir,
   readFile,
+  readFileRange,
   resolveConfig,
   statFile,
   uploadFile,
@@ -262,14 +263,14 @@ const MB = 1024 * 1024;
 // ---------------------------------------------------------------- gap 1
 
 describe("readFile size guard", () => {
-  it("refuses an oversize file, names the head/tail escape hatch, and never reads the bytes", async () => {
+  it("refuses an oversize file, names the offset/length escape hatch, and never reads the bytes", async () => {
     const { client, probe } = fakeSftpClient({
       stat: () => ({ size: 3.5 * MB }),
       readFile: () => Buffer.from("should never be read"),
     });
 
     await expect(readFile(client, "/var/log/huge.log", MB)).rejects.toThrow(
-      "File is 3.5 MB, exceeds 1 MB limit. Use ssh_exec with head/tail to read a portion.",
+      "File is 3.5 MB, exceeds 1 MB limit. Read it a page at a time with ssh_read_file's offset and length arguments (byte offsets; the file is 3670016 bytes).",
     );
     // The guard is worthless if the transfer already happened: the whole point is
     // that neither a 3.5 MB string nor a 3.5 MB MCP frame is ever materialized.
@@ -328,6 +329,84 @@ describe("readFile size guard", () => {
       readFile: () => Buffer.from(text, "utf8"),
     });
     await expect(readFile(client, "/srv/notes.txt")).resolves.toBe(text);
+  });
+});
+
+describe("readFileRange -- the paged half of ssh_read_file", () => {
+  /** An sftp holding `content`, whose read() hands back at most `chunk` bytes per call. */
+  function rangeClient(content: Buffer, chunk = Number.POSITIVE_INFINITY) {
+    const probe = { reads: [] as Array<[number, number]>, opened: 0, closed: 0, ended: 0 };
+    const handle = Buffer.from("h");
+    const sftp = {
+      stat: (_p: string, cb: (e: any, st?: any) => void) =>
+        queueMicrotask(() => cb(undefined, { size: content.length })),
+      open: (_p: string, _flags: string, cb: (e: any, h?: Buffer) => void) => {
+        probe.opened++;
+        queueMicrotask(() => cb(undefined, handle));
+      },
+      read: (_h: Buffer, buf: Buffer, off: number, len: number, pos: number, cb: (e: any, n?: number) => void) => {
+        probe.reads.push([pos, len]);
+        const n = Math.max(0, Math.min(len, chunk, content.length - pos));
+        content.copy(buf, off, pos, pos + n);
+        // ssh2 reports an SFTP EOF status with NO byte count.
+        queueMicrotask(() => cb(undefined, n === 0 ? undefined : n));
+      },
+      close: (_h: Buffer, cb: () => void) => {
+        probe.closed++;
+        queueMicrotask(cb);
+      },
+      end: () => {
+        probe.ended++;
+      },
+    };
+    return { client: { sftp: (cb: (e: any, s: any) => void) => cb(null, sftp) } as any, probe };
+  }
+
+  it("returns the requested bytes with the offset, count and file size", async () => {
+    const { client, probe } = rangeClient(Buffer.from("0123456789"));
+    await expect(readFileRange(client, "/f", 2, 4)).resolves.toEqual({
+      text: "2345",
+      offset: 2,
+      bytesRead: 4,
+      size: 10,
+    });
+    expect(probe.closed).toBe(1);
+    expect(probe.ended).toBe(1);
+  });
+
+  it("loops over short reads until the page is full", async () => {
+    const { client, probe } = rangeClient(Buffer.from("abcdefghij"), 3);
+    const page = await readFileRange(client, "/f", 0, 10);
+    expect(page.text).toBe("abcdefghij");
+    expect(probe.reads.map(([pos]) => pos)).toEqual([0, 3, 6, 9]);
+  });
+
+  it("clamps a page that runs past the end of the file", async () => {
+    const { client } = rangeClient(Buffer.from("abcdef"));
+    const page = await readFileRange(client, "/f", 4, 100);
+    expect(page).toEqual({ text: "ef", offset: 4, bytesRead: 2, size: 6 });
+  });
+
+  it("an offset at or past the end reads nothing and never opens the file", async () => {
+    const { client, probe } = rangeClient(Buffer.from("abc"));
+    await expect(readFileRange(client, "/f", 3, 10)).resolves.toEqual({ text: "", offset: 3, bytesRead: 0, size: 3 });
+    expect(probe.opened).toBe(0);
+    expect(probe.ended).toBe(1);
+  });
+
+  it("rejects a length above the per-read cap before touching the remote", async () => {
+    const { client, probe } = rangeClient(Buffer.from("abc"));
+    await expect(readFileRange(client, "/f", 0, 2 * MB, MB)).rejects.toThrow(/exceeds the 1 MB limit/);
+    expect(probe.opened).toBe(0);
+  });
+
+  it.each([
+    [-1, 10],
+    [0, 0],
+    [1.5, 10],
+  ])("rejects offset=%s length=%s", async (offset, length) => {
+    const { client } = rangeClient(Buffer.from("abc"));
+    await expect(readFileRange(client, "/f", offset, length)).rejects.toThrow(/must be/);
   });
 });
 

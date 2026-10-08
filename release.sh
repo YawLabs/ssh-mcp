@@ -292,7 +292,7 @@ fi
 if [ "$IS_CI" != "true" ] && [ "$CURRENT_VERSION" != "$VERSION" ]; then
   echo ""
   echo -e "${YELLOW}About to release v${VERSION}. This will:${NC}"
-  echo "  1. Run lint, typecheck, build, tests"
+  echo "  1. Run lint, typecheck, build, tests, the MCP compliance gate and the oam floor check"
   echo "  2. Bump version in package.json"
   echo "  3. Commit, tag, and push"
   echo "  4. Publish to npm"
@@ -311,12 +311,28 @@ if [ "$IS_CI" != "true" ] && [ "$CURRENT_VERSION" != "$VERSION" ]; then
 fi
 
 # Step 1: Lint, typecheck, build, test
-step 1 "Lint, typecheck, build, test"
+step 1 "Lint, typecheck, build, test, compliance"
 
 npm run lint || fail "Lint failed (run 'npm run lint:fix')"
 npm run typecheck || fail "Type check failed"
 npm run build || fail "Build failed"
 npm test || fail "Tests failed"
+
+# MCP compliance gate, before anything is tagged. Yaw MCP grades every server it
+# fronts with @yawlabs/mcp-compliance and blocks one below its minimum, so a
+# regression that drops the grade must stop the release here, not surface for
+# users. The grader is a pinned devDependency (same version line Yaw MCP grades
+# with) and runs against dist/ over stdio, so it needs no network. Skipped tests
+# and grader warnings are printed as warnings; a missing grader is a failure, not
+# a skip.
+node scripts/check-compliance.mjs || fail "MCP compliance gate failed -- the server must grade A (see above)"
+
+# Is the oam floor current? The drift half already ran inside `npm test`
+# (src/tests/oam-floor.test.ts); this adds the network half: is OAM_MIN behind
+# the latest oam release? Exits non-zero when it is; SSH_MCP_ALLOW_STALE_OAM=1 is
+# the deliberate way past it. No network is not a failure -- the check says so
+# and continues.
+node scripts/check-oam-floor.mjs || fail "oam floor check failed -- see above. Set SSH_MCP_ALLOW_STALE_OAM=1 to release on the old floor deliberately."
 info "All checks passed"
 
 # Step 2: Bump version

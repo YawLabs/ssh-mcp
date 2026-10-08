@@ -103,6 +103,8 @@ interface RunOpts {
   mode?: string;
   pathDirs?: string[];
   oamBin?: string;
+  /** OAM_INSTALL_DIR, the oam installer's install target. */
+  oamInstallDir?: string;
   args?: string[];
   /**
    * Pose as an oam host by preloading a `process.versions.oam` key before the
@@ -122,7 +124,7 @@ function run(layout: string, opts: RunOpts = {}) {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (typeof v !== "string") continue;
-    if (/^(path|oam_bin|ssh_mcp_runtime|userprofile|home|localappdata)$/i.test(k)) continue;
+    if (/^(path|oam_bin|oam_install_dir|ssh_mcp_runtime|userprofile|home|localappdata)$/i.test(k)) continue;
     env[k] = v;
   }
   env.PATH = (opts.pathDirs ?? []).join(delimiter);
@@ -133,6 +135,7 @@ function run(layout: string, opts: RunOpts = {}) {
   env.HOME = join(layout, "home");
   env.LOCALAPPDATA = join(layout, "home");
   if (opts.oamBin) env.OAM_BIN = opts.oamBin;
+  if (opts.oamInstallDir) env.OAM_INSTALL_DIR = opts.oamInstallDir;
 
   const posing =
     opts.hostOam === undefined
@@ -232,8 +235,8 @@ describe("launcher: version gate distinguishes unreadable from old", () => {
     const layout = makeLayout();
     const r = run(layout, { mode: "auto", oamBin: unexecutable(layout) });
     expect(r.stderr).toMatch(/could not be run, or did not report a version/);
-    // The regression this pins: every one of these causes used to be reported as
-    // "older than oam 0.9.0", sending the user to `oam self-update`.
+    // The regression this pins: every one of these causes was reported as
+    // "older than oam 0.9.0" (what it used to say), sending the user to `oam self-update`.
     expect(r.stderr).not.toMatch(/older than/);
     expect(r.stderr).not.toMatch(/self-update/);
     // Not fatal in auto mode.
@@ -639,6 +642,88 @@ describe("launcher: SSH_MCP_RUNTIME=node always means Node", () => {
     },
     TIMEOUT_MS,
   );
+});
+
+describe("launcher: OAM_INSTALL_DIR discovery", () => {
+  // OAM_INSTALL_DIR is the oam installer's install target. The launcher's comment
+  // claimed it "can pick either" default location while the code never read it, so
+  // an oam installed to a custom directory and left off PATH was never found.
+  const exeName = isWin ? "oam.exe" : "oam";
+
+  it("probes the oam in OAM_INSTALL_DIR even when it is not on PATH", () => {
+    const layout = makeLayout();
+    const installDir = dirWith(layout, exeName, "");
+    const r = run(layout, { mode: "oam", oamInstallDir: installDir });
+    expect(r.status).toBe(1);
+    // The file is empty so it cannot run; being named as a probed candidate is the
+    // proof that discovery looked there.
+    expect(r.stderr).toContain(`${join(installDir, exeName)} could not be run`);
+  });
+
+  it("probes OAM_INSTALL_DIR before PATH", () => {
+    const layout = makeLayout();
+    const installDir = dirWith(layout, exeName, "");
+    const pathDir = dirWith(layout, exeName, "");
+    const r = run(layout, { mode: "oam", oamInstallDir: installDir, pathDirs: [pathDir] });
+    const installAt = r.stderr.indexOf(join(installDir, exeName));
+    const pathAt = r.stderr.indexOf(join(pathDir, exeName));
+    expect(installAt, r.stderr).toBeGreaterThanOrEqual(0);
+    expect(pathAt, r.stderr).toBeGreaterThan(installAt);
+  });
+});
+
+describe("launcher: stripPermissionFlags()", () => {
+  // oam 0.18.0 appends its --permission / --allow-* flags to every child's NODE_OPTIONS,
+  // and Node exits 9 on some of them there ("--allow-net is not allowed in
+  // NODE_OPTIONS"). This launcher has no sandbox, so a child gets an env without them.
+  const strip = new Function(
+    `${extract([/const PERMISSION_FLAG = .*;/, /function stripPermissionFlags\(env\) \{[\s\S]*?\n\}/])}\nreturn stripPermissionFlags;`,
+  )() as (env: Record<string, string | undefined>) => Record<string, string | undefined>;
+
+  it("drops --permission and every --allow-* grant, keeping other flags in order", () => {
+    const env = {
+      NODE_OPTIONS:
+        "--max-old-space-size=4096 --permission --allow-fs-read=* --allow-net --no-warnings --allow-child-process",
+      OTHER: "x",
+    };
+    expect(strip(env)).toEqual({ NODE_OPTIONS: "--max-old-space-size=4096 --no-warnings", OTHER: "x" });
+  });
+
+  it("removes NODE_OPTIONS entirely when only permission flags were in it", () => {
+    const out = strip({ NODE_OPTIONS: "--permission --allow-net=example.com:443", KEEP: "1" });
+    expect(out).toEqual({ KEEP: "1" });
+    expect("NODE_OPTIONS" in out).toBe(false);
+  });
+
+  it("handles a quoted grant value containing spaces", () => {
+    expect(strip({ NODE_OPTIONS: '--allow-fs-read="C:\\Program Files\\x" --trace-warnings' })).toEqual({
+      NODE_OPTIONS: "--trace-warnings",
+    });
+  });
+
+  it("drops the older --experimental-permission spelling too", () => {
+    expect(strip({ NODE_OPTIONS: "--experimental-permission --enable-source-maps" })).toEqual({
+      NODE_OPTIONS: "--enable-source-maps",
+    });
+  });
+
+  it("returns the same env object when there is nothing to strip", () => {
+    const env = { NODE_OPTIONS: "--enable-source-maps" };
+    expect(strip(env)).toBe(env);
+    const bare = { PATH: "/bin" };
+    expect(strip(bare)).toBe(bare);
+  });
+
+  it("does not mutate the env it was given", () => {
+    const env = { NODE_OPTIONS: "--permission --no-warnings" };
+    strip(env);
+    expect(env.NODE_OPTIONS).toBe("--permission --no-warnings");
+  });
+
+  it("is applied only on an oam host", () => {
+    const src = readFileSync(LAUNCHER_SRC, "utf8");
+    expect(src).toContain("env: process.versions.oam !== undefined ? stripPermissionFlags(process.env) : process.env,");
+  });
 });
 
 describe("launcher: Windows PATH discovery", () => {

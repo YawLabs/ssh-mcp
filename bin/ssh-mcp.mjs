@@ -79,13 +79,29 @@
  * MINIMUM OAM VERSION
  * The latest oam release, 0.18.0 -- bump OAM_MIN when oam ships a newer one.
  * Only the current oam is used and verified; an older one is passed over.
- * The floor is not cosmetic: before 0.9.0 `child_process.execFile` ran its
- * arguments through a SHELL, `exec` accepted `timeout` and ignored it,
- * `spawnSync` truncated at `maxBuffer` while reporting success, and
- * `stdio: 'inherit'`/`'ignore'` both behaved as `'pipe'`. This server shells
- * out to a CLI on its main paths, so those were reachable bugs rather than
- * theoretical ones: an argument containing shell metacharacters was re-split
- * and executed.
+ *
+ * The floor is not cosmetic. Two things this server does need 0.18.0 itself,
+ * so anyone lowering it has to answer for both:
+ *
+ *   1. An explicit child `env` that DELETES a variable. probeAgent
+ *      (src/env.ts:85-90) runs `ssh-add -l` with SSH_AUTH_SOCK removed, so
+ *      Windows ssh-add falls back to the OpenSSH named pipe instead of a stale
+ *      Unix-style socket. Up to 0.17.x oam laid an explicit `env` OVER its
+ *      startup environment, so the deleted SSH_AUTH_SOCK came back and ssh-add
+ *      probed the wrong agent. 0.18.0 makes an explicit `env` replace it, as
+ *      Node does (oam CHANGELOG 0.18.0, B4).
+ *   2. `net.connect` to a Windows named pipe or a Unix socket path.
+ *      resolveConfig (src/ssh.ts:581-584) hands ssh2 SSH_AUTH_SOCK, or on Windows
+ *      `\\.\pipe\openssh-ssh-agent`, and ssh2 dials it with
+ *      `new Socket().connect(path)` for every agent-backed connection. Up to
+ *      0.17.x oam could not dial either (oam CHANGELOG 0.18.0, F1).
+ *
+ * Background, long before the current floor: before 0.9.0
+ * `child_process.execFile` ran its arguments through a SHELL, `exec` accepted
+ * `timeout` and ignored it, `spawnSync` truncated at `maxBuffer` while
+ * reporting success, and `stdio: 'inherit'`/`'ignore'` both behaved as
+ * `'pipe'`. This server shells out to ssh, ssh-add and ssh-keygen on its main
+ * paths, so those were reachable bugs rather than theoretical ones.
  *
  * SELECTION
  *   SSH_MCP_RUNTIME=auto   newest usable oam, else Node (default)
@@ -103,7 +119,12 @@ import { constants, homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-/** Oldest oam whose `child_process` matches Node. See MINIMUM OAM VERSION above. */
+/**
+ * Oldest oam this server runs on: the one whose explicit child `env` replaces
+ * the environment (needed by probeAgent, src/env.ts) and whose `net` dials named
+ * pipes and Unix sockets (needed by ssh2's agent client, src/ssh.ts). See MINIMUM
+ * OAM VERSION above.
+ */
 const OAM_MIN = [0, 18, 0];
 
 /**
@@ -141,8 +162,12 @@ function pathKey(p) {
  * usually has oam/target/release on PATH, and cargo replaces that binary
  * underneath running processes; the installed copy is the release the user
  * actually installed. Both forms are checked on Windows: the installer defaults
- * to %LOCALAPPDATA%\oam\bin there, but oam's docs name ~/.oam/bin first and
- * OAM_INSTALL_DIR can pick either.
+ * to %LOCALAPPDATA%\oam\bin there, but oam's docs name ~/.oam/bin first.
+ *
+ * OAM_INSTALL_DIR, when set, is searched before both. It is the installer's
+ * install target (oam docs/cli-reference.md), so an oam put somewhere custom and
+ * left off PATH is still found -- this comment used to say it "can pick either"
+ * default while the code never read it.
  *
  * Windows: `.exe` ONLY -- deliberately narrower than PATHEXT. Node refuses to
  * run a .cmd/.bat through execFile/spawn without `shell: true` (EINVAL, and for
@@ -156,6 +181,7 @@ function discoverOamPaths() {
   if (isWin) {
     installed.unshift(join(process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local"), "oam", "bin", exe));
   }
+  if (process.env.OAM_INSTALL_DIR) installed.unshift(join(process.env.OAM_INSTALL_DIR, exe));
   const onPath = (process.env.PATH ?? "")
     .split(delimiter)
     .filter(Boolean)
@@ -406,6 +432,48 @@ const fallbackFailed = (e) => {
 };
 
 /**
+ * A permission flag oam may have put in NODE_OPTIONS: `--permission` (and the
+ * older `--experimental-permission`) or any `--allow-*` grant, with or without
+ * an `=value`.
+ */
+const PERMISSION_FLAG = /^--(?:experimental-)?permission$|^--allow-[a-z0-9-]+(?:=.*)?$/;
+
+/**
+ * `env` with oam's permission flags removed from NODE_OPTIONS, or `env` itself
+ * when there is nothing to remove.
+ *
+ * oam 0.18.0 appends its own `--permission` / `--allow-*` flags to every child's
+ * NODE_OPTIONS "for any program" (oam CHANGELOG 0.18.0, Permissions), so a
+ * process started under a sandboxed oam carries them in its environment. Node
+ * refuses some of them there -- measured on Node 22:
+ * `NODE_OPTIONS="--permission --allow-net" node` exits 9 with "--allow-net is
+ * not allowed in NODE_OPTIONS" -- and this launcher has no sandbox to pass on
+ * (see NO SANDBOX HERE), so the tokens are dropped before a child is started.
+ *
+ * Only the INHERITED copy can be removed here. When THIS process was itself
+ * started as `oam --permission ...`, oam re-appends those flags from its own
+ * execArgv inside spawn(), after this env is built -- measured on oam 0.18.0:
+ * the Node child still exits 9 with this env. That host is outside what this
+ * launcher supports, since the server needs unrestricted net and child-process
+ * grants anyway.
+ *
+ * Tokens are split on whitespace with double-quoted spans kept whole, which is
+ * how Node itself reads NODE_OPTIONS. Pure, so src/tests/launcher.test.ts can
+ * extract and test it without booting a runtime.
+ */
+function stripPermissionFlags(env) {
+  const raw = env.NODE_OPTIONS;
+  if (!raw) return env;
+  const tokens = raw.match(/(?:[^\s"]+|"[^"]*")+/g) ?? [];
+  const kept = tokens.filter((t) => !PERMISSION_FLAG.test(t.replaceAll('"', "")));
+  if (kept.length === tokens.length) return env;
+  const next = { ...env };
+  if (kept.length === 0) delete next.NODE_OPTIONS;
+  else next.NODE_OPTIONS = kept.join(" ");
+  return next;
+}
+
+/**
  * Spawn the server in a child runtime and mirror its lifetime.
  *
  * `onLaunchFailed(err)` runs when the child could not be started at all; it is
@@ -428,7 +496,9 @@ async function launchChild(cmd, args, onLaunchFailed) {
       // server's shutdown path. Piping preserves both as well: bytes are copied
       // unchanged, and stdin's end propagates to the child.
       stdio: piped ? ["pipe", "pipe", "pipe"] : "inherit",
-      env: process.env,
+      // On an oam host, drop the permission flags oam put in NODE_OPTIONS; see
+      // stripPermissionFlags. A Node host's env passes through untouched.
+      env: process.versions.oam !== undefined ? stripPermissionFlags(process.env) : process.env,
       windowsHide: true,
     });
   } catch (err) {

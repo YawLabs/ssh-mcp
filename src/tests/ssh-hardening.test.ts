@@ -188,6 +188,7 @@ beforeEach(() => {
   clearKnownHostTypeCache();
   vi.unstubAllEnvs();
   vi.stubEnv("SSH_MCP_STRICT_HOST_KEY", "");
+  vi.stubEnv("SSH_MCP_STRICT_HOSTKEYS", "");
 });
 
 /** `ssh-keygen -F <host>` answers with these entries; everything else misses. */
