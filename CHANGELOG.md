@@ -15,6 +15,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`ssh_exec` now returns its status first: `[exit code: N]` (with the signal and any truncation flags) as the first content block, then `[stderr]`, then `[stdout]`.** It used to return one block with stdout first and the exit code last. Each stream can be up to 10 MB, but a proxy in front of the server can keep far less -- Yaw MCP caps a result at 100 KB by default and cuts the last block -- so any command that printed more than about 100 KB lost its stderr and exit code. Now only the stdout tail is lost. stdout carries a `[stdout]` label of its own. **Callers that parse the text:** the order and the block count changed.
+- **`ssh_read_file` takes optional `offset` and `length` (bytes) to read a file one page at a time.** A paged read returns a status block first (`[bytes A-B of SIZE; next offset: N]`, or `end of file`) and then the text. The whole-file read without them is unchanged, and the "exceeds 10 MB" error now points at these arguments instead of at `ssh_exec` with head/tail. New library export: `readFileRange`.
+- **Strict host-key mode has a new name, `SSH_MCP_STRICT_HOSTKEYS`, and both names accept `1` or `true` (trimmed, case-insensitive).** The old `SSH_MCP_STRICT_HOST_KEY` keeps working, but its `_KEY` segment makes credential scanners -- Yaw MCP's doctor among them -- list `SSH_MCP_STRICT_HOST_KEY=1` as a plaintext secret. Only the exact string `1` used to count, so `=true` silently left strict mode **off**.
+- **Tools carry MCP annotations.** `readOnlyHint` on `ssh_key_list`, `ssh_config_lookup`, `ssh_ls`, `ssh_stat`, `ssh_read_file`, `ssh_diagnose`, `ssh_find`, `ssh_tail` and `ssh_service_status` (with `openWorldHint: false` on the two that never touch the network), and `destructiveHint` on `ssh_write_file` and `ssh_delete`. Yaw MCP picks its no-argument example tool as the first read-only one; with no annotations that was `ssh_agent_ensure`, which can start an ssh-agent. It is now `ssh_key_list`.
+
+### Added
+- **Initialize `instructions`**: a short plain-ASCII routing note (under 2000 bytes, pinned by a test) that Yaw MCP shows when the server is activated -- run `ssh_diagnose` after a failure, prefer the purpose-built tools over `ssh_exec`, the `ssh_exec` output order and result cap, the host-key policy, and the Windows agent.
+- **Release gates before the tag.** `release.sh` now runs `@yawlabs/mcp-compliance` (a pinned devDependency, `^0.20.4`, the line Yaw MCP grades with) against the built server and refuses anything below grade A; skipped tests and grader warnings are printed, and a missing grader fails the release rather than skipping it. It also runs `scripts/check-oam-floor.mjs` (ported from aws-mcp): every `npm test` checks that the oam floor quoted in the README, the launcher and its tests agrees with `OAM_MIN`, and the release adds a check that `OAM_MIN` is not behind the latest oam release (`SSH_MCP_ALLOW_STALE_OAM=1` releases on the old floor deliberately).
+
+### Fixed
+- **The launcher finds an oam installed to `OAM_INSTALL_DIR`.** That is the oam installer's install target, and the launcher's comments said it was honoured, but discovery never read it, so an oam installed there and left off `PATH` was never found. It is now searched first.
+- **On an oam host, the launcher strips `--permission` / `--allow-*` from the `NODE_OPTIONS` it passes to a child.** oam 0.18.0 appends its permission flags to every child's `NODE_OPTIONS`, and Node exits 9 on some of them there (`--allow-net is not allowed in NODE_OPTIONS`). This server has no sandbox to pass on. An oam started with `--permission` itself re-adds the flags inside `spawn()`, which the launcher cannot undo.
+
+### Documentation
+- The launcher's MINIMUM OAM VERSION note now names what actually needs oam 0.18.0 here: an explicit child `env` that deletes `SSH_AUTH_SOCK` (`probeAgent`, src/env.ts), which older oam leaked back in, and `net` dialing a named pipe or Unix socket (ssh2's agent client, from `resolveConfig` in src/ssh.ts), which older oam could not do. The pre-0.9.0 `child_process` bugs stay as background.
+- README, Windows: agent auth on oam needs 0.18.0 or newer; agent-backed remote operations are so far verified end to end on Node only.
+
 ## [0.17.3] — 2026-10-07
 
 ### Security

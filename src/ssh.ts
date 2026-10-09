@@ -52,7 +52,7 @@ interface SshConfigResult {
 
 /** Why the hostVerifier turned a server's host key down. */
 export type HostKeyRejectionReason =
-  /** No known_hosts entry at all, and SSH_MCP_STRICT_HOST_KEY=1. */
+  /** No known_hosts entry at all, and strict mode is on (SSH_MCP_STRICT_HOSTKEYS, see isStrictHostKeyMode). */
   | "unknown-host-strict"
   /** known_hosts has entries for this host, but none of the algorithm the server offered. */
   | "algorithm-not-in-known-hosts"
@@ -350,7 +350,7 @@ function cachedKnownHostTypes(hosts: ReadonlyArray<string>, port: number | undef
 // Build a hostVerifier that compares the server's key against ~/.ssh/known_hosts.
 // - Known host, key matches: accept.
 // - Known host, key mismatch: reject (MITM protection).
-// - Unknown host: ACCEPT unless SSH_MCP_STRICT_HOST_KEY=1, then reject.
+// - Unknown host: ACCEPT unless strict mode is on (isStrictHostKeyMode), then reject.
 //
 // That last branch is trust-ALWAYS, not trust-on-first-use, and the distinction is
 // worth stating plainly: real TOFU pins the key it saw the first time and rejects a
@@ -358,16 +358,38 @@ function cachedKnownHostTypes(hosts: ReadonlyArray<string>, port: number | undef
 // connecting -- every connection to a host absent from known_hosts is a "first" use
 // and is accepted, including one where an attacker swapped the key since the last
 // call. Only hosts a user (or ssh-keyscan) put into known_hosts out of band get MITM
-// protection. Set SSH_MCP_STRICT_HOST_KEY=1 to require an entry.
+// protection. Set SSH_MCP_STRICT_HOSTKEYS=1 to require an entry.
 //
 // Checks known_hosts under both the user-supplied host (e.g. a ssh_config alias) and
 // the resolved hostname, matching OpenSSH's CheckHostIP behavior.
+/**
+ * Strict host-key mode: reject a host with no known_hosts entry instead of trusting it.
+ *
+ * Two names, one switch. SSH_MCP_STRICT_HOSTKEYS is the documented one.
+ * SSH_MCP_STRICT_HOST_KEY is the original name and keeps working, but it is
+ * credential-shaped -- `KEY` is a whole underscore segment -- so Yaw MCP's doctor
+ * listed `SSH_MCP_STRICT_HOST_KEY=1` as a plaintext secret and suggested moving it
+ * into the vault. `HOSTKEYS` is not a credential segment, so the new name is not
+ * flagged. Either one turns strict mode on.
+ *
+ * Both are read the way Yaw MCP reads an opt-in: trimmed, case-insensitive `1` or
+ * `true`. Only the exact string "1" used to count, so `=true` silently left strict
+ * mode OFF -- the unsafe direction for a security switch.
+ */
+export function isStrictHostKeyMode(env: NodeJS.ProcessEnv = process.env): boolean {
+  const on = (v: string | undefined) => {
+    const t = (v ?? "").trim().toLowerCase();
+    return t === "1" || t === "true";
+  };
+  return on(env.SSH_MCP_STRICT_HOSTKEYS) || on(env.SSH_MCP_STRICT_HOST_KEY);
+}
+
 function buildHostVerifier(
   hosts: ReadonlyArray<string>,
   port: number | undefined,
   rejection: { current: HostKeyRejection | null },
 ): (key: Buffer) => boolean {
-  const strict = process.env.SSH_MCP_STRICT_HOST_KEY === "1";
+  const strict = isStrictHostKeyMode();
   const label = hosts.join(" / ");
   // The host to paste into the ssh-keyscan / ssh-keygen -R remediation below. Both
   // tools have the same bracket sensitivity documented for `-F` on knownHostsTargets:
@@ -383,7 +405,7 @@ function buildHostVerifier(
       if (strict) {
         rejection.current = {
           reason: "unknown-host-strict",
-          message: `no known_hosts entry for ${label}, and SSH_MCP_STRICT_HOST_KEY=1 requires one. Add it: ssh-keyscan -H "${remediationHost}" >> ~/.ssh/known_hosts`,
+          message: `no known_hosts entry for ${label}, and strict mode (SSH_MCP_STRICT_HOSTKEYS=1) requires one. Add it: ssh-keyscan -H "${remediationHost}" >> ~/.ssh/known_hosts`,
         };
       }
       return !strict;
@@ -728,7 +750,7 @@ function parsePort(text: string): number | undefined {
  *
  * It is also a host-key issue, not only a connectivity one: `knownHostsTargets`
  * rejects those mangled spellings and returns [], and a verifier with zero known
- * entries accepts ANY key unless SSH_MCP_STRICT_HOST_KEY=1. Parsing correctly is
+ * entries accepts ANY key unless SSH_MCP_STRICT_HOSTKEYS=1. Parsing correctly is
  * what puts the bastion hop back under real known_hosts checking.
  *
  * Grammar (OpenSSH ssh_config(5)): `[user@]host[:port]`, or the equivalent
@@ -1090,7 +1112,7 @@ function getSftp(client: Client): Promise<SFTPWrapper> {
   });
 }
 
-const DEFAULT_MAX_READ_BYTES = 10 * 1024 * 1024; // 10 MB
+export const DEFAULT_MAX_READ_BYTES = 10 * 1024 * 1024; // 10 MB
 
 export async function readFile(client: Client, remotePath: string, maxBytes = DEFAULT_MAX_READ_BYTES): Promise<string> {
   const sftp = await getSftp(client);
@@ -1103,7 +1125,7 @@ export async function readFile(client: Client, remotePath: string, maxBytes = DE
     });
     if (stats.size > maxBytes) {
       throw new Error(
-        `File is ${(stats.size / 1024 / 1024).toFixed(1)} MB, exceeds ${(maxBytes / 1024 / 1024).toFixed(0)} MB limit. Use ssh_exec with head/tail to read a portion.`,
+        `File is ${(stats.size / 1024 / 1024).toFixed(1)} MB, exceeds ${(maxBytes / 1024 / 1024).toFixed(0)} MB limit. Read it a page at a time with ssh_read_file's offset and length arguments (byte offsets; the file is ${stats.size} bytes).`,
       );
     }
     return await new Promise((resolve, reject) => {
@@ -1112,6 +1134,82 @@ export async function readFile(client: Client, remotePath: string, maxBytes = DE
         resolve(data.toString("utf8"));
       });
     });
+  } finally {
+    sftp.end();
+  }
+}
+
+/** One page of a remote file, plus where it sits in the whole. */
+export interface FileRange {
+  /** The bytes read, decoded as UTF-8. A page boundary can split a multi-byte character. */
+  text: string;
+  /** Byte offset the page starts at (as requested). */
+  offset: number;
+  /** Number of bytes actually read: less than requested at end of file. */
+  bytesRead: number;
+  /** Size of the whole file, from the same stat. */
+  size: number;
+}
+
+/**
+ * Read `length` bytes of a remote file starting at byte `offset`.
+ *
+ * The paging half of ssh_read_file. A whole-file read is capped at 10 MB here, but a
+ * proxy in front of this server can cap far lower -- Yaw MCP keeps 100 KB of a result
+ * by default and cuts the rest -- so a large file has to be readable in pages without
+ * turning a cap off. `length` is bounded by the same `maxBytes` as a whole read.
+ */
+export async function readFileRange(
+  client: Client,
+  remotePath: string,
+  offset: number,
+  length: number,
+  maxBytes = DEFAULT_MAX_READ_BYTES,
+): Promise<FileRange> {
+  if (!Number.isSafeInteger(offset) || offset < 0)
+    throw new Error(`offset must be a non-negative integer, got ${offset}`);
+  if (!Number.isSafeInteger(length) || length <= 0) throw new Error(`length must be a positive integer, got ${length}`);
+  if (length > maxBytes) {
+    throw new Error(
+      `length ${length} exceeds the ${(maxBytes / 1024 / 1024).toFixed(0)} MB limit for one read. Use a smaller length and page with offset.`,
+    );
+  }
+  const sftp = await getSftp(client);
+  try {
+    const stats = await new Promise<{ size: number }>((resolve, reject) => {
+      sftp.stat(remotePath, (err, st) => {
+        if (err) return reject(err);
+        resolve(st);
+      });
+    });
+    const want = Math.max(0, Math.min(length, stats.size - offset));
+    if (want === 0) return { text: "", offset, bytesRead: 0, size: stats.size };
+    const handle = await new Promise<Buffer>((resolve, reject) => {
+      sftp.open(remotePath, "r", (err, h) => {
+        if (err) return reject(err);
+        resolve(h);
+      });
+    });
+    try {
+      const buf = Buffer.alloc(want);
+      let got = 0;
+      // A single SFTP READ may return fewer bytes than asked (servers cap a packet,
+      // commonly at 32-256 KB), so loop until the page is full or the file ends.
+      while (got < want) {
+        const n = await new Promise<number>((resolve, reject) => {
+          sftp.read(handle, buf, got, want - got, offset + got, (err, bytesRead) => {
+            if (err) return reject(err);
+            // ssh2 swallows an SFTP EOF status on read and calls back with no count.
+            resolve(bytesRead ?? 0);
+          });
+        });
+        if (n === 0) break;
+        got += n;
+      }
+      return { text: buf.subarray(0, got).toString("utf8"), offset, bytesRead: got, size: stats.size };
+    } finally {
+      sftp.close(handle, () => {});
+    }
   } finally {
     sftp.end();
   }

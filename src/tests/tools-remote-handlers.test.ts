@@ -40,6 +40,8 @@ const {
   statFileSpy,
   listDirSpy,
   readFileSpy,
+  readFileRangeSpy,
+  execSpy,
   downloadFileSpy,
   uploadFileSpy,
   writeFileSpy,
@@ -50,6 +52,8 @@ const {
   statFileSpy: vi.fn(),
   listDirSpy: vi.fn(),
   readFileSpy: vi.fn(),
+  readFileRangeSpy: vi.fn(),
+  execSpy: vi.fn(),
   downloadFileSpy: vi.fn(),
   uploadFileSpy: vi.fn(),
   writeFileSpy: vi.fn(),
@@ -72,6 +76,8 @@ vi.mock("../ssh.js", async (importOriginal) => {
     statFile: statFileSpy as unknown as typeof actual.statFile,
     listDir: listDirSpy as unknown as typeof actual.listDir,
     readFile: readFileSpy as unknown as typeof actual.readFile,
+    readFileRange: readFileRangeSpy as unknown as typeof actual.readFileRange,
+    exec: execSpy as unknown as typeof actual.exec,
     downloadFile: downloadFileSpy as unknown as typeof actual.downloadFile,
     uploadFile: uploadFileSpy as unknown as typeof actual.uploadFile,
     writeFile: writeFileSpy as unknown as typeof actual.writeFile,
@@ -185,6 +191,8 @@ beforeEach(() => {
     statFileSpy,
     listDirSpy,
     readFileSpy,
+    readFileRangeSpy,
+    execSpy,
     downloadFileSpy,
     uploadFileSpy,
     writeFileSpy,
@@ -652,6 +660,88 @@ describe("ssh_read_file passes content through untouched", () => {
   });
 });
 
+describe("ssh_read_file paging (offset / length)", () => {
+  it("a paged read puts the position first and the text second", async () => {
+    readFileRangeSpy.mockResolvedValue({ text: "abcde", offset: 10, bytesRead: 5, size: 100 });
+    const result = await call("ssh_read_file", { ...HOST, path: "/f", offset: 10, length: 5 });
+    expect(result.content.map((c) => c.text)).toEqual(["[bytes 10-15 of 100; next offset: 15]", "abcde"]);
+    expect(lastCall(readFileRangeSpy).slice(1)).toEqual(["/f", 10, 5]);
+    expect(readFileSpy).not.toHaveBeenCalled();
+  });
+
+  it("says end of file on the last page", async () => {
+    readFileRangeSpy.mockResolvedValue({ text: "tail", offset: 96, bytesRead: 4, size: 100 });
+    const result = await call("ssh_read_file", { ...HOST, path: "/f", offset: 96 });
+    expect(result.content[0].text).toBe("[bytes 96-100 of 100; end of file]");
+  });
+
+  it("an offset at or past the end reports the size and returns no text block", async () => {
+    readFileRangeSpy.mockResolvedValue({ text: "", offset: 500, bytesRead: 0, size: 100 });
+    const result = await call("ssh_read_file", { ...HOST, path: "/f", offset: 500 });
+    expect(result.content.map((c) => c.text)).toEqual(["[no bytes at offset 500: the file is 100 bytes]"]);
+  });
+
+  it("length alone starts at offset 0", async () => {
+    readFileRangeSpy.mockResolvedValue({ text: "ab", offset: 0, bytesRead: 2, size: 2 });
+    await call("ssh_read_file", { ...HOST, path: "/f", length: 2 });
+    expect(lastCall(readFileRangeSpy).slice(1)).toEqual(["/f", 0, 2]);
+  });
+
+  it("offset alone reads to the end, bounded by the 10 MB whole-read cap", async () => {
+    readFileRangeSpy.mockResolvedValue({ text: "x", offset: 3, bytesRead: 1, size: 4 });
+    await call("ssh_read_file", { ...HOST, path: "/f", offset: 3 });
+    expect(lastCall(readFileRangeSpy).slice(1)).toEqual(["/f", 3, 10 * 1024 * 1024]);
+  });
+
+  it("the description tells the caller paging exists", () => {
+    expect(getTool("ssh_read_file").description).toMatch(/offset/);
+    expect(getTool("ssh_read_file").description).toMatch(/length/);
+  });
+});
+
+describe("ssh_exec output order: status, then stderr, then stdout", () => {
+  // A proxy in front of this server (Yaw MCP: 100 KB by default) keeps content blocks in
+  // order and cuts the LAST one. stdout used to come first, so a command printing more
+  // than the cap lost its exit code and stderr; status now leads and stdout trails.
+  it("emits the exit code as the first block, stderr second, stdout last", async () => {
+    execSpy.mockResolvedValue({ stdout: "out", stderr: "err", code: 2 });
+    const result = await call("ssh_exec", { ...HOST, command: "x" });
+    expect(result.content.map((c) => c.text)).toEqual(["[exit code: 2]", "[stderr]\nerr", "[stdout]\nout"]);
+  });
+
+  it("puts the signal and truncation flags in the status block", async () => {
+    execSpy.mockResolvedValue({
+      stdout: "big",
+      stderr: "",
+      code: -1,
+      signal: "TERM",
+      stdoutTruncated: true,
+      stderrTruncated: false,
+    });
+    const result = await call("ssh_exec", { ...HOST, command: "x" });
+    expect(result.content[0].text).toBe("[exit code: -1]\n[signal: TERM]\n[stdout truncated at the byte cap]");
+    expect(result.content.map((c) => c.text)).toEqual([result.content[0].text, "[stdout]\nbig"]);
+  });
+
+  it("omits empty streams, leaving only the status", async () => {
+    execSpy.mockResolvedValue({ stdout: "", stderr: "", code: 0 });
+    const result = await call("ssh_exec", { ...HOST, command: "true" });
+    expect(result.content.map((c) => c.text)).toEqual(["[exit code: 0]"]);
+  });
+
+  it("keeps the exit code inside a 100 KB cap even when stdout is far larger", async () => {
+    execSpy.mockResolvedValue({ stdout: "x".repeat(500_000), stderr: "warn", code: 3 });
+    const result = await call("ssh_exec", { ...HOST, command: "x" });
+    // Emulate a proxy cap: concatenate the blocks in order and keep the first 100000 bytes.
+    const kept = result.content
+      .map((c) => c.text)
+      .join("\n")
+      .slice(0, 100_000);
+    expect(kept).toContain("[exit code: 3]");
+    expect(kept).toContain("[stderr]\nwarn");
+  });
+});
+
 describe("SFTP confirmation strings", () => {
   it("ssh_write_file confirms with the UTF-8 byte count and the path", async () => {
     expect(textOf(await call("ssh_write_file", { ...HOST, path: "/tmp/a.txt", content: "hello" }))).toBe(
@@ -757,8 +847,9 @@ describe("every single-host tool hands withConnection a capacity wait budget", (
 
   /** Calls the tool and returns the options its handler passed to withConnection. */
   async function poolOptionsFor(name: string, args: Record<string, unknown>): Promise<unknown> {
-    // Four callees (exec, tail, makeDir, deleteFile) are not mocked in this file, so the
-    // handler's fn fails on the `{}` client -- AFTER the pool call this test looks at. A
+    // Three callees (tail, makeDir, deleteFile) are not mocked in this file, and the exec
+    // spy answers undefined unless a test scripts it, so the handler's fn fails on the `{}`
+    // client -- AFTER the pool call this test looks at. A
     // handler that never reaches withConnection leaves nothing recorded and fails below.
     await call(name, args).catch(() => undefined);
     expect(seenPoolOptions).toHaveLength(1);

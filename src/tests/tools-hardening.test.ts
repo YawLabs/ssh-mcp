@@ -888,7 +888,12 @@ describe("ssh_exec renders a stderr block when the remote wrote to stderr", () =
     const { handler } = getTool("ssh_exec");
     const result = (await handler({ ...baseConn, command: "build" })) as { content: { text: string }[] };
 
-    expect(result.content[0].text).toBe("some output\n[stderr]\nwarning: deprecated flag\n[exit code: 0]");
+    // Status first, stdout last: a proxy that cuts long results cuts the last block.
+    expect(result.content.map((c) => c.text)).toEqual([
+      "[exit code: 0]",
+      "[stderr]\nwarning: deprecated flag",
+      "[stdout]\nsome output",
+    ]);
   });
 
   it("omits the stderr block entirely when stderr is empty", async () => {
@@ -896,7 +901,7 @@ describe("ssh_exec renders a stderr block when the remote wrote to stderr", () =
     const { handler } = getTool("ssh_exec");
     const result = (await handler({ ...baseConn, command: "build" })) as { content: { text: string }[] };
 
-    expect(result.content[0].text).not.toContain("[stderr]");
+    expect(result.content.map((c) => c.text).join("\n")).not.toContain("[stderr]");
   });
 });
 

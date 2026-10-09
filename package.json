@@ -28,6 +28,8 @@
     "test": "vitest run",
     "test:integration": "docker compose -f test/docker/docker-compose.yml up -d --build --wait && SSH_MCP_INTEGRATION=1 vitest run src/tests/integration.test.ts; docker compose -f test/docker/docker-compose.yml down",
     "test:ci": "npm run build && npm test",
+    "check:compliance": "node scripts/check-compliance.mjs",
+    "check:oam-floor": "node scripts/check-oam-floor.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -72,6 +74,7 @@
     "@types/node": "^26.1.1",
     "@types/ssh2": "^1.15.5",
     "@vitest/coverage-v8": "^4.1.11",
+    "@yawlabs/mcp-compliance": "^0.20.4",
     "esbuild": "^0.28.1",
     "postject": "^1.0.0-alpha.6",
     "tsup": "^8.5.1",

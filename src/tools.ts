@@ -13,7 +13,19 @@ import {
 import { find, multiExec, serviceStatus, shellQuote, tail } from "./ops.js";
 import { enforcePolicy } from "./policy.js";
 import { ConnectionPool } from "./pool.js";
-import { deleteFile, downloadFile, exec, listDir, makeDir, readFile, statFile, uploadFile, writeFile } from "./ssh.js";
+import {
+  DEFAULT_MAX_READ_BYTES,
+  deleteFile,
+  downloadFile,
+  exec,
+  listDir,
+  makeDir,
+  readFile,
+  readFileRange,
+  statFile,
+  uploadFile,
+  writeFile,
+} from "./ssh.js";
 
 const HostSchema = z.string().describe("SSH hostname or IP address");
 
@@ -79,6 +91,21 @@ const poolWait = (timeoutMs: number = DEFAULT_TIMEOUT_MS) => ({ waitForCapacityM
 // wait only from the error text once it had already been spent.
 const SFTP_POOL_WAIT_NOTE = ` If the connection pool is full (SSH_MCP_MAX_POOL_SIZE, default 100), waits up to ${DEFAULT_TIMEOUT_MS / 1000}s for a free slot before starting.`;
 
+// MCP tool annotations. Hints only -- a client must not treat them as a security
+// boundary -- but hosts route on them: Yaw MCP picks its no-argument example tool as
+// the first one that is readOnlyHint:true, and only falls back to the first
+// no-argument tool when none is. Without these that fallback was ssh_agent_ensure,
+// which can START an ssh-agent; ssh_key_list only reads ~/.ssh and is the right probe.
+//
+// READ_ONLY_LOCAL: reads local state only, never the network.
+// READ_ONLY_REMOTE: reads (or, for ssh_diagnose, probes) a remote host, changes nothing.
+// DESTRUCTIVE_REMOTE: can overwrite or remove remote data.
+// ssh_agent_ensure, ssh_key_load and ssh_known_hosts_fix change local state, and the
+// exec tools run arbitrary commands, so none of them is marked read-only.
+const READ_ONLY_LOCAL = { readOnlyHint: true, openWorldHint: false } as const;
+const READ_ONLY_REMOTE = { readOnlyHint: true, openWorldHint: true } as const;
+const DESTRUCTIVE_REMOTE = { readOnlyHint: false, destructiveHint: true, openWorldHint: true } as const;
+
 // Standard note appended to every tool description that command policy does NOT cover.
 // See the SCOPE LIMIT block in src/policy.ts -- a blacklist is not whole-server coverage,
 // and an admin who assumes otherwise leaves remote mutation wide open.
@@ -137,7 +164,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_exec",
-    "Execute a command on a remote host via SSH. The command is interpreted by the remote login shell — pipes, redirects, globs, and other shell metacharacters work as expected. Returns stdout, stderr, and exit code. Use `env` to set environment variables for this call without modifying the command string. Subject to SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST if configured (policy is checked against the env-prefixed command).",
+    "Execute a command on a remote host via SSH. The command is interpreted by the remote login shell — pipes, redirects, globs, and other shell metacharacters work as expected. Returns up to three content blocks in this order: the status (`[exit code: N]`, plus the signal and any truncation), then `[stderr]`, then `[stdout]`. Status comes first so a proxy that cuts long results (Yaw MCP keeps about 100 KB) never drops the exit code; for big output, filter or page on the remote (head, tail, grep). Use `env` to set environment variables for this call without modifying the command string. Subject to SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST if configured (policy is checked against the env-prefixed command).",
     {
       ...connectionParams,
       command: z
@@ -154,14 +181,21 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
         conn,
         async (client) => {
           const result = await exec(client, finalCommand, timeoutMs);
-          const parts: string[] = [];
-          if (result.stdout) parts.push(result.stdout);
-          if (result.stderr) parts.push(`[stderr]\n${result.stderr}`);
+          // Status FIRST, stdout LAST. Each stream may be up to 10 MB, while a proxy in
+          // front of this server can keep far less: Yaw MCP caps a result at 100 KB by
+          // default, keeping blocks in order and cutting the last one. With stdout first
+          // (as this used to be) any command printing more than ~100 KB lost its stderr
+          // and its exit code. Ordered this way only the stdout tail is lost.
+          const status: string[] = [`[exit code: ${result.code}]`];
           // Surface signal when the channel closed signal-only -- otherwise `code: -1`
           // looks like a generic failure with no hint that the remote was killed.
-          if (result.signal) parts.push(`[signal: ${result.signal}]`);
-          parts.push(`[exit code: ${result.code}]`);
-          return { content: [{ type: "text", text: parts.join("\n") }] };
+          if (result.signal) status.push(`[signal: ${result.signal}]`);
+          if (result.stdoutTruncated) status.push("[stdout truncated at the byte cap]");
+          if (result.stderrTruncated) status.push("[stderr truncated at the byte cap]");
+          const content: { type: "text"; text: string }[] = [{ type: "text", text: status.join("\n") }];
+          if (result.stderr) content.push({ type: "text", text: `[stderr]\n${result.stderr}` });
+          if (result.stdout) content.push({ type: "text", text: `[stdout]\n${result.stdout}` });
+          return { content };
         },
         poolWait(timeoutMs),
       );
@@ -170,7 +204,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_read_file",
-    `Read a file from a remote host via SFTP.${SFTP_POOL_WAIT_NOTE}`,
+    `Read a file from a remote host via SFTP. A whole-file read is limited to 10 MB. For a large file -- or behind a proxy that caps results, such as Yaw MCP at about 100 KB -- read it in pages with \`offset\` and \`length\` (bytes): a paged read returns a status block first (\`[bytes A-B of SIZE]\` and the next offset) and then the text.${SFTP_POOL_WAIT_NOTE}`,
     {
       ...connectionParams,
       path: z
@@ -180,13 +214,46 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
             "Path must be absolute (start with /). Relative paths resolve against the remote user's CWD, which is rarely what you want.",
         })
         .describe("Absolute path to the remote file. Must start with /."),
+      offset: z
+        .number()
+        .int()
+        .nonnegative()
+        .optional()
+        .describe("Byte offset to start reading at (default 0). Setting offset or length switches to a paged read."),
+      length: z
+        .number()
+        .int()
+        .positive()
+        .max(DEFAULT_MAX_READ_BYTES)
+        .optional()
+        .describe(
+          "Number of bytes to read (default: the rest of the file, up to 10 MB). Behind Yaw MCP keep it at or under about 90000 so the page is not cut. A page boundary can split a multi-byte UTF-8 character.",
+        ),
     },
-    async ({ path, ...conn }) => {
+    READ_ONLY_REMOTE,
+    async ({ path, offset, length, ...conn }) => {
       return connectionPool.withConnection(
         conn,
         async (client) => {
-          const content = await readFile(client, path);
-          return { content: [{ type: "text", text: content }] };
+          // No paging argument: the whole-file read, byte-for-byte as before.
+          if (offset === undefined && length === undefined) {
+            const content = await readFile(client, path);
+            return { content: [{ type: "text", text: content }] };
+          }
+          const page = await readFileRange(client, path, offset ?? 0, length ?? DEFAULT_MAX_READ_BYTES);
+          const end = page.offset + page.bytesRead;
+          // The position goes FIRST, for the same reason ssh_exec's status does: a proxy
+          // that cuts the result cuts the last block, and the caller still learns where
+          // to continue from.
+          const where =
+            page.bytesRead === 0
+              ? `[no bytes at offset ${page.offset}: the file is ${page.size} bytes]`
+              : end < page.size
+                ? `[bytes ${page.offset}-${end} of ${page.size}; next offset: ${end}]`
+                : `[bytes ${page.offset}-${end} of ${page.size}; end of file]`;
+          const content: { type: "text"; text: string }[] = [{ type: "text", text: where }];
+          if (page.bytesRead > 0) content.push({ type: "text", text: page.text });
+          return { content };
         },
         poolWait(),
       );
@@ -201,6 +268,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       path: AbsoluteRemotePathSchema.describe("Absolute path to the remote file. Must start with /."),
       content: z.string().describe("File content to write"),
     },
+    DESTRUCTIVE_REMOTE,
     async ({ path, content, ...conn }) => {
       return connectionPool.withConnection(
         conn,
@@ -265,6 +333,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       ...connectionParams,
       path: AbsoluteRemotePathSchema.describe("Absolute path to the remote directory. Must start with /."),
     },
+    READ_ONLY_REMOTE,
     async ({ path, ...conn }) => {
       return connectionPool.withConnection(
         conn,
@@ -291,6 +360,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       ...connectionParams,
       path: AbsoluteRemotePathSchema.describe("Absolute path to the remote file or directory. Must start with /."),
     },
+    READ_ONLY_REMOTE,
     async ({ path, ...conn }) => {
       return connectionPool.withConnection(
         conn,
@@ -353,6 +423,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
         "Absolute path of the file or empty directory to delete. Must start with /.",
       ),
     },
+    DESTRUCTIVE_REMOTE,
     async ({ path, ...conn }) => {
       return connectionPool.withConnection(
         conn,
@@ -372,6 +443,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       host: HostSchema,
       port: PortSchema,
     },
+    READ_ONLY_REMOTE,
     async ({ host, port }) => {
       const report = diagnose(host, port || 22);
 
@@ -426,6 +498,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
     "ssh_key_list",
     "List all SSH private keys in ~/.ssh/ with their type, fingerprint, and whether they are loaded in the agent. Use this to find which keys are available and which ones need to be loaded. Reports isError only when ~/.ssh exists but could not be read -- an absent or empty ~/.ssh is a successful answer with a ssh-keygen hint.",
     {},
+    READ_ONLY_LOCAL,
     async () => {
       // Three different situations all produce zero keys and only one of them is fixed by
       // running ssh-keygen, so each gets its own message and its own isError. Telling an
@@ -499,6 +572,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
     {
       host: HostSchema,
     },
+    READ_ONLY_LOCAL,
     async ({ host }) => {
       const result = configLookup(host);
       if ("error" in result) {
@@ -649,6 +723,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
         .describe("Reference file path -- find matches files modified more recently than this file"),
       timeout: TimeoutSchema,
     },
+    READ_ONLY_REMOTE,
     async ({ path, name, type, maxdepth, minsize, maxsize, newer, timeout, ...conn }) => {
       const timeoutMs = timeout || DEFAULT_TIMEOUT_MS;
       return connectionPool.withConnection(
@@ -680,6 +755,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       grep: z.string().optional().describe("Case-insensitive pattern to filter lines"),
       timeout: TimeoutSchema,
     },
+    READ_ONLY_REMOTE,
     async ({ path, lines, grep, timeout, ...conn }) => {
       const timeoutMs = timeout || DEFAULT_TIMEOUT_MS;
       return connectionPool.withConnection(
@@ -717,6 +793,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       service: z.string().describe("Systemd service name (e.g. nginx, sshd, docker)"),
       timeout: TimeoutSchema,
     },
+    READ_ONLY_REMOTE,
     async ({ service, timeout, ...conn }) => {
       const timeoutMs = timeout || DEFAULT_TIMEOUT_MS;
       return connectionPool.withConnection(

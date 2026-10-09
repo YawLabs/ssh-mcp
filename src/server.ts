@@ -21,11 +21,32 @@ export const version =
         }
       ).version;
 
+/**
+ * Routing guidance sent once, at initialize. Yaw MCP shows it when this server is
+ * activated, capped at 2000 UTF-8 bytes, so it stays plain ASCII, well under that, and
+ * about these tools only (src/tests/server.test.ts pins both). It must not carry
+ * Yaw MCP's own framing markers, which the proxy strips or rejects.
+ */
+export const SERVER_INSTRUCTIONS = [
+  "ssh-mcp runs commands and moves files on remote hosts over SSH, using ~/.ssh/config, the ssh-agent and known_hosts the way the OpenSSH client does.",
+  "",
+  "- After an auth, connect or host-key failure, run ssh_diagnose on that host before retrying. ssh_test is the quick check; ssh_key_list and ssh_key_load fix a key missing from the agent; ssh_known_hosts_fix replaces a stale host key.",
+  "- Prefer the purpose-built tools over ssh_exec: ssh_read_file, ssh_ls, ssh_stat, ssh_find, ssh_tail, ssh_service_status. Use ssh_multi_exec for the same command on several hosts.",
+  "- ssh_exec returns the exit code first, then stderr, then stdout. Proxies may cut long results (Yaw MCP keeps about 100 KB), so filter on the remote (grep, head, tail) instead of printing everything. Page a large file with ssh_read_file offset and length.",
+  "- The SFTP tools take absolute remote paths (ssh_mkdir also accepts a relative one); ~ is not expanded.",
+  "- Host keys: a host already in known_hosts must match. An unknown host is trusted on every connection unless strict mode (SSH_MCP_STRICT_HOSTKEYS=1) is on; add it with ssh_known_hosts_fix first.",
+  "- On Windows the agent is the OpenSSH Authentication Agent service pipe; if agent auth fails, ssh_agent_ensure checks that the agent is reachable.",
+  "- SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST gate only ssh_exec and ssh_multi_exec, not the SFTP write and delete tools.",
+].join("\n");
+
 export function createServer(pool?: ConnectionPool): McpServer {
-  const server = new McpServer({
-    name: "ssh-mcp",
-    version,
-  });
+  const server = new McpServer(
+    {
+      name: "ssh-mcp",
+      version,
+    },
+    { instructions: SERVER_INSTRUCTIONS },
+  );
 
   registerTools(server, pool);
 
@@ -61,6 +82,7 @@ export { ConnectionPool, isPoolFullError, POOL_FULL_ERROR_CODE, PoolFullError } 
 // so a consumer cannot fully type that value without them.
 export type {
   ExecResult,
+  FileRange,
   FileStats,
   HostKeyRejection,
   HostKeyRejectionReason,
@@ -78,6 +100,7 @@ export {
   listDir,
   makeDir,
   readFile,
+  readFileRange,
   readKnownHostsKeys,
   resolveConfig,
   statFile,
