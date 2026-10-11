@@ -327,6 +327,15 @@ describe("policy scope gap is documented on the tools it does not cover", () => 
   });
 });
 
+describe("ssh_upload's description notes the arbitrary-local-file read", () => {
+  // policy.ts's SCOPE LIMIT block documents ssh_download's direction (it writes an
+  // arbitrary LOCAL file no command policy sees); ssh_upload reads an arbitrary LOCAL file
+  // and had no note anywhere. Description text only -- no policy code or enforcement.
+  it("names the local-read direction, mirroring the download caveat's wording style", () => {
+    expect(getTool("ssh_upload").description).toContain("Reads an arbitrary local file at an agent-chosen `localPath`");
+  });
+});
+
 describe("ssh_mkdir description matches makeDir's actual relative-path support", () => {
   it("does not claim the path must be absolute", () => {
     const { description, schema } = getTool("ssh_mkdir");
@@ -363,6 +372,14 @@ describe("ssh_mkdir description matches makeDir's actual relative-path support",
       expect(pathSchema.safeParse("projects/new").success).toBe(false);
       expect(pathSchema.description ?? "").toMatch(/[Aa]bsolute/);
     }
+  });
+
+  it("ssh_read_file also rejects relative paths (it now shares AbsoluteRemotePathSchema)", () => {
+    const pathSchema = getTool("ssh_read_file").schema.path as unknown as {
+      safeParse: (v: unknown) => { success: boolean };
+    };
+    expect(pathSchema.safeParse("logs/app.log").success).toBe(false);
+    expect(pathSchema.safeParse("/abs/path").success).toBe(true);
   });
 });
 

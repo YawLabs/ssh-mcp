@@ -273,9 +273,8 @@ export async function find(client: Client, options: FindOptions, timeoutMs = 300
   // narrow -- a leading `-`, or an operand that is exactly one of the four operator tokens.
   // Every other path is passed through untouched, so ordinary absolute and relative paths
   // (and the printed results for them) are unchanged.
-  const pathOperand =
-    options.path.startsWith("-") || FIND_EXPRESSION_TOKENS.has(options.path) ? `./${options.path}` : options.path;
-  const args: string[] = [shellQuote(pathOperand)];
+  const defuseFindOperand = (p: string): string => (p.startsWith("-") || FIND_EXPRESSION_TOKENS.has(p) ? `./${p}` : p);
+  const args: string[] = [shellQuote(defuseFindOperand(options.path))];
 
   // Every operand is quoted, the validated ones included: validation is what gives a bad
   // value a clear error, quoting is what keeps the shell out of it even if a check is ever
@@ -285,7 +284,12 @@ export async function find(client: Client, options: FindOptions, timeoutMs = 300
   if (options.name) args.push("-name", shellQuote(options.name));
   if (options.minsize) args.push("-size", shellQuote(`+${options.minsize}`));
   if (options.maxsize) args.push("-size", shellQuote(`-${options.maxsize}`));
-  if (options.newer) args.push("-newer", shellQuote(options.newer));
+  // Same `./`-defusing as the path operand above (the reasoning lives there). Measured on
+  // GNU findutils 4.10.0: an -newer operand is consumed as a path either way, but a bare
+  // leading-dash token sits in the same position find parses predicates, so `./` removes
+  // the ambiguity for every find flavor without changing behavior -- with the file present
+  // both forms reference it identically, and both fail with "No such file or directory".
+  if (options.newer) args.push("-newer", shellQuote(defuseFindOperand(options.newer)));
 
   const command = `find ${args.join(" ")}`;
   const result = await exec(client, command, timeoutMs);
@@ -351,7 +355,11 @@ export interface ServiceStatus {
 
 export async function serviceStatus(client: Client, serviceName: string, timeoutMs = 30000): Promise<ServiceStatus> {
   // `--` so a service name starting with `-` isn't parsed as a systemctl flag.
-  const result = await exec(client, `systemctl status -- ${shellQuote(serviceName)} 2>&1`, timeoutMs);
+  // LC_ALL=C is a literal env assignment prefix, deliberately not shellQuoted: it pins
+  // systemctl's output language so the English-anchored parsing below holds on hosts
+  // whose default locale is not English (there, a RUNNING service parsed as
+  // active:false with the status falling back to "active" and no error anywhere).
+  const result = await exec(client, `LC_ALL=C systemctl status -- ${shellQuote(serviceName)} 2>&1`, timeoutMs);
   const raw = result.stdout;
 
   const activeMatch = raw.match(/Active:\s+(\S+)\s+\(([^)]+)\)/);

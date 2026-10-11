@@ -146,6 +146,43 @@ describe("ConnectionPool — concurrent acquire dedup", () => {
     }
   });
 
+  it("does NOT share a pooled connection across differing agent sockets", async () => {
+    // The password and privateKey cases are covered in this file and
+    // pool-ops-lifecycle.test.ts; the agent arm of the fingerprint was never executed.
+    // Two callers to the same host:user through different agent sockets must not
+    // collide, or the second silently rides the first's authenticated session (the
+    // keys loaded in the agent ARE the credential).
+    const pool = new ConnectionPool();
+    try {
+      const a = await pool.acquire({ host: "agent-diff.example.com", agent: "/tmp/agent-a.sock" });
+      const b = await pool.acquire({ host: "agent-diff.example.com", agent: "/tmp/agent-b.sock" });
+      expect(a).not.toBe(b);
+      expect(mockedConnect).toHaveBeenCalledTimes(2);
+      expect(pool.size).toBe(2);
+      pool.release(a);
+      pool.release(b);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("DOES reuse a pooled connection for an identical agent socket", async () => {
+    // The other half of the agent fingerprint: same socket -> same key -> reuse, so the
+    // differing-socket split above isn't just "agent always dials". Mirrors the password
+    // reuse test below.
+    const pool = new ConnectionPool();
+    try {
+      const a = await pool.acquire({ host: "agent-same.example.com", agent: "/tmp/agent-a.sock" });
+      pool.release(a); // goes idle, stays in the pool
+      const b = await pool.acquire({ host: "agent-same.example.com", agent: "/tmp/agent-a.sock" });
+      expect(b).toBe(a);
+      expect(mockedConnect).toHaveBeenCalledTimes(1);
+      pool.release(b);
+    } finally {
+      pool.drain();
+    }
+  });
+
   it("DOES reuse a pooled connection for identical credentials", async () => {
     const pool = new ConnectionPool();
     try {

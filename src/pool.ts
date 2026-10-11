@@ -369,6 +369,12 @@ export class ConnectionPool {
       if (entry.client === client) {
         entry.refCount = Math.max(0, entry.refCount - 1);
         if (entry.refCount === 0 && !entry.dead) {
+          // A second release of an already-idle entry lands here with the first timer
+          // still armed. Re-arming without this clear orphans it: the orphan fires on
+          // its own deadline and end()s + deletes whatever entry then holds entry.key
+          // -- a live one, if the key was re-registered by a new dial. release() is
+          // documented as always safe, so the double call must be a no-op for timers.
+          if (entry.idleTimer) clearTimeout(entry.idleTimer);
           entry.idleTimer = setTimeout(() => {
             try {
               entry.client.end();

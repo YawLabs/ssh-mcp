@@ -62,18 +62,19 @@ export {
   checkSshKeys,
   diagnose,
 } from "./diagnose.js";
-export type { AgentResult, ConfigLookupResult, KeyInfo } from "./env.js";
+export type { AgentResult, ConfigLookupResult, KeyInfo, SshKeyListing } from "./env.js";
 export {
   checkGitSsh,
   configLookup,
   ensureAgent,
   fixKnownHosts,
   listSshKeys,
+  listSshKeysDetailed,
   loadKey,
   testConnection,
 } from "./env.js";
 export type { FindOptions, MultiExecHost, MultiExecResult, ServiceStatus } from "./ops.js";
-export { find, multiExec, serviceStatus, tail } from "./ops.js";
+export { find, multiExec, serviceStatus, shellQuote, tail } from "./ops.js";
 export type { PolicyContext } from "./policy.js";
 export { enforcePolicy, isPolicyConfigured } from "./policy.js";
 export type { AcquireOptions, PoolOptions } from "./pool.js";

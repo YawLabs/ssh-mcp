@@ -201,6 +201,49 @@ describe("serviceStatus unknown vs inactive", () => {
     expect(status.description).toBe("A high performance web server");
   });
 
+  it("pins systemctl's output language with an LC_ALL=C prefix (locale-proof parsing)", async () => {
+    // Every regex in serviceStatus is English-anchored (Active:, Main PID:, since). On a
+    // remote whose default locale is not English, an unprefixed systemctl answered in its
+    // own language and a RUNNING service parsed as active:false, with the status silently
+    // falling back to "active" and unknown:false -- a confident wrong answer with no error.
+    // The prefix is a literal env assignment before the command, not a shellQuoted operand;
+    // the service name keeps its shellQuote discipline and the `--` flag guard.
+    const cap = capturingClient({
+      stdout: [
+        "* nginx.service - A high performance web server",
+        "     Active: active (running) since Mon 2025-01-01 12:00:00 UTC; 1h ago",
+        "   Main PID: 1234 (nginx)",
+      ].join("\n"),
+      code: 0,
+    });
+    const status = await serviceStatus(cap.client, "nginx");
+    expect(cap.lastCommand()).toBe("LC_ALL=C systemctl status -- 'nginx' 2>&1");
+    expect(status.active).toBe(true);
+  });
+
+  it("non-English systemctl output: the LC_ALL=C prefix is what prevents the misparse", async () => {
+    // Simulates the output a remote produces in its own locale -- exactly the situation
+    // the LC_ALL=C prefix exists to prevent. The English-anchored Active: regex still
+    // matches "actif (demarre)" structurally, but "actif" !== "active", so a RUNNING
+    // service pins to the wrong answer: active:false, unknown:false, status carrying the
+    // French tokens verbatim -- confidently wrong, with no error anywhere. That this
+    // happens proves the prefix on the command (asserted below) is load-bearing: with
+    // LC_ALL=C, systemctl can never answer in French.
+    const cap = capturingClient({
+      stdout: [
+        "* nginx.service - Serveur web",
+        "     Active: actif (demarre) since Mon 2025-01-01 12:00:00 UTC; 1h ago",
+      ].join("\n"),
+      code: 0,
+    });
+    const status = await serviceStatus(cap.client, "nginx");
+    expect(cap.lastCommand()).toMatch(/^LC_ALL=C /);
+    expect(status.active).toBe(false);
+    expect(status.unknown).toBe(false);
+    expect(status.status).toBe("actif (demarre)");
+    expect(status.description).toBe("Serveur web");
+  });
+
   it("marks unknown=false for an active service", async () => {
     const client = fakeClient({
       stdout: [
@@ -289,5 +332,29 @@ describe("argument flag-injection hardening", () => {
     await tail(cap.client, "/var/log/app.log", 100, "-v");
     const cmd = cap.lastCommand();
     expect(cmd).toContain("grep -i -e '-v'");
+  });
+
+  it("find `./`-prefixes a leading-dash -newer value to disambiguate it as a path", async () => {
+    const cap = capturingClient({ stdout: "", code: 0 });
+    await find(cap.client, { path: "/tmp", newer: "-ref" });
+    // Measured on GNU findutils 4.10.0: a bare `-ref` is consumed as the reference path,
+    // not parsed as an option -- but it sits in the position find parses predicates, so
+    // `./-ref` removes that ambiguity on every find flavor. Behavior is identical either
+    // way: with the file present both forms reference it, both error when it is absent.
+    expect(cap.lastCommand()).toBe("find '/tmp' -newer './-ref'");
+  });
+
+  it("find leaves an ordinary -newer path untouched", async () => {
+    const cap = capturingClient({ stdout: "", code: 0 });
+    await find(cap.client, { path: "/tmp", newer: "/var/log/syslog" });
+    expect(cap.lastCommand()).toBe("find '/tmp' -newer '/var/log/syslog'");
+  });
+
+  it("find defuses an exact operator token passed as the -newer operand", async () => {
+    // The token arm of defuseFindOperand was only exercised via the path operand;
+    // -newer goes through the same defusing, so `(` there must become `./(` too.
+    const cap = capturingClient({ stdout: "", code: 0 });
+    await find(cap.client, { path: "/tmp", newer: "(" });
+    expect(cap.lastCommand()).toBe("find '/tmp' -newer './('");
   });
 });

@@ -32,8 +32,8 @@ const HostSchema = z.string().describe("SSH hostname or IP address");
 // Shared refine for SFTP remote paths. SFTP does not expand ~ or resolve
 // relative paths through a shell — they land on the server verbatim, relative
 // to the SFTP CWD (usually the user's home dir). Absolute paths are unambiguous;
-// ~ paths cause ENOENT on most servers. Matches the enforcement already on
-// ssh_read_file. ssh_mkdir is intentionally excluded: makeDir (src/ssh.ts) walks
+// ~ paths cause ENOENT on most servers. ssh_mkdir is intentionally excluded:
+// makeDir (src/ssh.ts) walks
 // path segments itself and handles a CWD-relative path, so ssh_mkdir takes a
 // plain z.string() and its `path` description spells out that both forms work.
 const AbsoluteRemotePathSchema = z.string().refine((p) => p.startsWith("/"), {
@@ -207,13 +207,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
     `Read a file from a remote host via SFTP. A whole-file read is limited to 10 MB. For a large file -- or behind a proxy that caps results, such as Yaw MCP at about 100 KB -- read it in pages with \`offset\` and \`length\` (bytes): a paged read returns a status block first (\`[bytes A-B of SIZE]\` and the next offset) and then the text.${SFTP_POOL_WAIT_NOTE}`,
     {
       ...connectionParams,
-      path: z
-        .string()
-        .refine((p) => p.startsWith("/"), {
-          message:
-            "Path must be absolute (start with /). Relative paths resolve against the remote user's CWD, which is rarely what you want.",
-        })
-        .describe("Absolute path to the remote file. Must start with /."),
+      path: AbsoluteRemotePathSchema.describe("Absolute path to the remote file. Must start with /."),
       offset: z
         .number()
         .int()
@@ -288,7 +282,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_upload",
-    `Upload a local file to a remote host via SFTP.${SFTP_POOL_WAIT_NOTE}${POLICY_EXEMPT_NOTE}`,
+    `Upload a local file to a remote host via SFTP. Reads an arbitrary local file at an agent-chosen \`localPath\` -- any file readable by this process leaves the machine toward the remote host (the mirror direction of ssh_download's local write).${SFTP_POOL_WAIT_NOTE}${POLICY_EXEMPT_NOTE}`,
     {
       ...connectionParams,
       localPath: z.string().describe("Path to the local file to upload"),
@@ -660,7 +654,12 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
     "ssh_multi_exec",
     "Execute a command on multiple remote hosts in parallel. Runs at most SSH_MCP_MAX_POOL_SIZE hosts at once (default 100) and works through a longer list as slots free up. `timeout` is per host: it bounds each host's command, not the whole call. Each parallel slot works through its share of the list one host at a time, so with the pool to itself a call can take up to about ceil(hosts / SSH_MCP_MAX_POOL_SIZE) x (`timeout` + connect time). The connection pool is shared with every other tool; when it is full this call waits for slots instead of failing, and gives up only when none of its own hosts holds a slot and a full `timeout` has passed with none of them starting or finishing. The hosts waiting at that point (up to one per parallel slot) and every host still queued then report `Connection pool is full`; the queued ones are never attempted. Rerun those hosts once the other calls finish, or raise SSH_MCP_MAX_POOL_SIZE. Returns results per host. Use this instead of calling ssh_exec multiple times — it's faster and shows results side by side. Use `env` to set environment variables for this call without modifying the command string. Subject to SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST if configured (policy is checked once, against the env-prefixed command, before fan-out).",
     {
-      hosts: z.array(z.string()).describe("List of SSH hostnames or IPs"),
+      // .min(1): `hosts: []` used to return an empty success block indistinguishable from a
+      // no-op -- the same boundary rejection ssh_git_check applies to its empty host.
+      hosts: z
+        .array(z.string())
+        .min(1, "hosts must not be empty. Name at least one host -- an empty list runs the command on nothing.")
+        .describe("List of SSH hostnames or IPs"),
       command: z.string().describe("Shell command to execute on all hosts"),
       port: PortSchema,
       username: UsernameSchema,

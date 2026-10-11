@@ -1,7 +1,19 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { describe, expect, it } from "vitest";
-import { createServer, SERVER_INSTRUCTIONS } from "../server.js";
+import {
+  createServer,
+  enforcePolicy,
+  isPolicyConfigured,
+  listSshKeysDetailed,
+  SERVER_INSTRUCTIONS,
+  shellQuote,
+} from "../server.js";
+
+// Compile-time check: fails tsc if the SshKeyListing type re-export is dropped.
+type _SshKeyListingExport = import("../server.js").SshKeyListing;
+const _typeCheck: _SshKeyListingExport | null = null;
+void _typeCheck;
 
 describe("createServer", () => {
   it("creates an MCP server instance", () => {
@@ -95,5 +107,14 @@ describe("tool annotations", () => {
     } finally {
       await client.close();
     }
+  });
+});
+
+describe("server re-exports", () => {
+  it("exports helpers as functions", () => {
+    expect(typeof listSshKeysDetailed).toBe("function");
+    expect(typeof shellQuote).toBe("function");
+    expect(typeof enforcePolicy).toBe("function");
+    expect(typeof isPolicyConfigured).toBe("function");
   });
 });

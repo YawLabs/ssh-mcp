@@ -183,7 +183,7 @@ export function enforcePolicy(command: string, context: PolicyContext = {}): voi
   }
 }
 
-/** Returns true if any policy is currently configured. Used by tool descriptions to surface that. */
+/** Returns true if any policy is currently configured. Exported for library consumers and tests; tool descriptions use static "if configured" text instead. */
 export function isPolicyConfigured(): boolean {
   return Boolean(process.env.SSH_MCP_COMMAND_WHITELIST?.trim() || process.env.SSH_MCP_COMMAND_BLACKLIST?.trim());
 }

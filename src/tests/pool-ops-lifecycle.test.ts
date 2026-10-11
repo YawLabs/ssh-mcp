@@ -1086,29 +1086,41 @@ describe("ConnectionPool — idle timer release path", () => {
     }
   });
 
-  it("PINS A BUG: an unbalanced double release orphans a timer that later closes a live connection", async () => {
-    // release() re-arms unconditionally whenever refCount is 0, overwriting entry.idleTimer
-    // without clearing the previous one. The orphaned timer is unreachable by the
-    // clearTimeout on re-acquire, so it fires on its own deadline and end()s + evicts a
-    // connection the caller is actively holding. Pinned as ACTUAL behavior, not endorsed.
+  it("a double release never orphans a timer that later closes a live connection", async () => {
+    // Regression: release() used to re-arm unconditionally whenever refCount was 0,
+    // overwriting entry.idleTimer without clearing the previous timer. The orphan was
+    // unreachable by the clearTimeout on re-acquire, so it fired on its own deadline
+    // and end()ed + evicted a connection a new caller was actively holding. release()
+    // is documented as always safe, so the second release must REPLACE the armed
+    // timer (one timer total), not add a second one.
     const pool = new ConnectionPool({ idleTtlMs: TTL });
     try {
       const c1 = (await pool.acquire({ host: "double-release.example.com" })) as unknown as { endCalls: number };
       pool.release(c1 as never); // arms T1
       vi.advanceTimersByTime(1_000);
-      pool.release(c1 as never); // refCount already 0 -> arms T2, T1 is orphaned
-      expect(vi.getTimerCount()).toBe(2);
+      pool.release(c1 as never); // refCount already 0 -> T1 is replaced, not orphaned
+      expect(vi.getTimerCount()).toBe(1);
 
-      // A new caller takes the connection; only T2 is cancelled.
+      // A new caller takes the connection; the armed timer is cancelled outright.
       const c2 = await pool.acquire({ host: "double-release.example.com" });
       expect(c2).toBe(c1 as unknown as typeof c2);
-      expect(vi.getTimerCount()).toBe(1); // T1 survives
+      expect(vi.getTimerCount()).toBe(0);
 
-      // T1's original deadline arrives and closes the connection out from under c2.
-      vi.advanceTimersByTime(TTL - 1_000);
+      // Far past the ORIGINAL deadline the caller still holds a live connection --
+      // this is the assertion the orphaned-T1 behavior failed.
+      vi.advanceTimersByTime(TTL * 10);
+      expect(c1.endCalls).toBe(0);
+      expect(pool.size).toBe(1);
+      expect(pool.stats).toEqual({ active: 1, idle: 0 });
+      expect(mockedConnect).toHaveBeenCalledTimes(1);
+
+      // The fix must REPLACE the timer, not suppress arming: releasing again still
+      // arms a fresh one, and the entry closes normally on ITS deadline.
+      pool.release(c2);
+      expect(vi.getTimerCount()).toBe(1);
+      vi.advanceTimersByTime(TTL);
       expect(c1.endCalls).toBe(1);
       expect(pool.size).toBe(0);
-      expect(pool.stats).toEqual({ active: 0, idle: 0 });
     } finally {
       pool.drain();
     }
@@ -1450,7 +1462,7 @@ describe("serviceStatus — crashed and masked units", () => {
 
     const status = await serviceStatus(cap.client, "myapp");
 
-    expect(cap.lastCommand()).toBe("systemctl status -- 'myapp' 2>&1");
+    expect(cap.lastCommand()).toBe("LC_ALL=C systemctl status -- 'myapp' 2>&1");
     expect(status.unknown).toBe(false); // systemctl DID answer
     expect(status.active).toBe(false);
     expect(status.status).toBe("failed (Result: exit-code)");

@@ -970,12 +970,22 @@ describe("ssh_multi_exec sets isError for the WHOLE batch", () => {
     expect(textOf(result)).toContain("[exit code: -1]");
   });
 
-  it("an EMPTY host list is not an error -- some() over [] is false", async () => {
-    // Pinned as actual behavior: nothing ran, so nothing failed.
-    multiExecSpy.mockResolvedValue([]);
-    const result = await call("ssh_multi_exec", { hosts: [], command: "uptime" });
-    expect(result.isError).toBe(false);
-    expect(textOf(result)).toBe("");
+  it("an EMPTY host list is rejected at the schema boundary (.min(1))", async () => {
+    // `hosts: []` used to return an empty success block indistinguishable from a no-op.
+    // The schema now refuses it the same way ssh_git_check refuses an empty host. Pinned at
+    // the schema, not the handler: these tests call handlers directly, bypassing zod, so a
+    // handler-level call never exercised what an MCP client actually validates against.
+    // A discriminated union, not an optional field: a plain `error?:` cannot narrow on
+    // `!success`, so `result.error` would stay `... | undefined` for tsc inside the branch.
+    const schema = getTool("ssh_multi_exec").schema.hosts as unknown as {
+      safeParse: (v: unknown) => { success: false; error: { issues: { message: string }[] } } | { success: true };
+    };
+    const result = schema.safeParse([]);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0].message).toMatch(/hosts must not be empty/);
+    }
+    expect(schema.safeParse(["a.test"]).success).toBe(true);
   });
 
   it("renders one block per host, in the order multiExec returned them", async () => {
