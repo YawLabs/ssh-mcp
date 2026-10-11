@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] — 2026-10-11
+
 ### Changed
 - **`ssh_exec` now returns its status first: `[exit code: N]` (with the signal and any truncation flags) as the first content block, then `[stderr]`, then `[stdout]`.** It used to return one block with stdout first and the exit code last. Each stream can be up to 10 MB, but a proxy in front of the server can keep far less -- Yaw MCP caps a result at 100 KB by default and cuts the last block -- so any command that printed more than about 100 KB lost its stderr and exit code. Now only the stdout tail is lost. stdout carries a `[stdout]` label of its own. **Callers that parse the text:** the order and the block count changed.
 - **`ssh_read_file` takes optional `offset` and `length` (bytes) to read a file one page at a time.** A paged read returns a status block first (`[bytes A-B of SIZE; next offset: N]`, or `end of file`) and then the text. The whole-file read without them is unchanged, and the "exceeds 10 MB" error now points at these arguments instead of at `ssh_exec` with head/tail. New library export: `readFileRange`.
