@@ -8,9 +8,9 @@ import { registerTools } from "./tools.js";
 // Read version from package.json at runtime so we never lie to MCP clients about
 // what they're talking to. package.json is always present in published npm packages
 // (the files allow-list does not affect it) and at the repo root in dev.
-// Inlined by the single-binary build (build-binary.mjs --define); the runtime
-// package.json read crashes the SEA binary (no package.json beside the exe).
-// Falls back to reading package.json for the normal ESM/tsup build.
+// A single-file binary build inlines it (esbuild `define: { __VERSION__ }`);
+// the runtime package.json read would crash such a binary (no package.json
+// beside the exe). Falls back to reading package.json for the normal ESM/tsup build.
 declare const __VERSION__: string;
 export const version =
   typeof __VERSION__ !== "undefined"

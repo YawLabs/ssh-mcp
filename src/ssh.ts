@@ -241,16 +241,16 @@ const SSH2_CONSTANTS_MODULE = "ssh2/lib/protocol/constants.js";
  * route covers both:
  *
  *  1. A LITERAL `require(...)`. esbuild resolves that specifier at BUILD time, so
- *     `scripts/build-binary.mjs` (bundle:true, format:cjs) INLINES the constants
- *     module into the Node SEA single-file binary -- which has no node_modules to
- *     resolve against at runtime. Route 2 alone was therefore dead in every
- *     Homebrew/Scoop binary: `createRequire(import.meta.url)` is opaque to any
- *     bundler, so it threw there, returned null, and the whole reorder silently
- *     no-opped. In the tsup ESM build ssh2 stays EXTERNAL and esbuild rewrites this
- *     call into its `__require` shim, which throws "Dynamic require ... is not
- *     supported" under a real ESM loader -- hence the try, and hence route 2.
+ *     a single-file binary build (bundle:true, format:cjs) INLINES the constants
+ *     module into the binary -- which has no node_modules to resolve against at
+ *     runtime. Route 2 alone was therefore dead in every Homebrew/Scoop binary:
+ *     `createRequire(import.meta.url)` is opaque to any bundler, so it threw
+ *     there, returned null, and the whole reorder silently no-opped. In the tsup
+ *     ESM build ssh2 stays EXTERNAL and esbuild rewrites this call into its
+ *     `__require` shim, which throws "Dynamic require ... is not supported" under
+ *     a real ESM loader -- hence the try, and hence route 2.
  *  2. `createRequire(import.meta.url)`. The route that works in the published ESM
- *     dist (and under vitest / tsx), and the one the SEA cannot use.
+ *     dist (and under vitest / tsx), and the one a single-file binary cannot use.
  *
  * Verified by bundling this exact shape with both configurations: the CJS bundle
  * inlines the module and route 1 answers with no node_modules reachable at all,

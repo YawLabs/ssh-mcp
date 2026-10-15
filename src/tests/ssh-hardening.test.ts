@@ -1318,9 +1318,9 @@ describe("ssh2's default host-key list stays reachable from a BUNDLED build", ()
 
   it("keeps a LITERAL require() specifier a bundler can follow", () => {
     // esbuild resolves a literal require() at BUILD time and inlines the constants
-    // module into the SEA single-file binary; createRequire(import.meta.url) is opaque
-    // to it and throws there (a SEA has no node_modules), which silently no-opped the
-    // whole reorder in every Homebrew/Scoop binary. No runtime test can catch that
+    // module into a single-file binary; createRequire(import.meta.url) is opaque to
+    // it and throws there (such a binary has no node_modules), which silently no-opped
+    // the whole reorder in every Homebrew/Scoop binary. No runtime test can catch that
     // regression -- the ESM dist takes the createRequire route and works -- so pin the
     // literal itself. Verified by bundling this file's shape with esbuild in both
     // configurations: CJS/bundled inlines the module, ESM/external falls through.

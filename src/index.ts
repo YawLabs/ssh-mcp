@@ -23,23 +23,22 @@ import { createServer, version } from "./server.js";
 //    oam host hands off to Node (handOffToNode), forward the flag unchanged into
 //    a subprocess running this same module, so the answer has to come from here
 //    either way.
-// 3. scripts/build-binary.mjs:151 -- the SEA smoke test, `run(outExe,
-//    ['--version'])`, execFileSync with stdio:'inherit' (helper at :60-63). This
-//    does NOT go through bin/ssh-mcp.mjs: esbuild bundles src/index.ts straight
-//    into the binary (:46, :79), so the early exit below is inlined and is what
-//    makes the binary terminate at all. Because stdin is inherited, a --version
-//    that reached main() would attach the transport to the build shell's stdin
-//    and HANG the build. It is darwin-only (it guards the codesign dance), so
-//    win32/linux builds run no smoke test and would ship the break silently --
-//    caught later by :159-160's printed "Verify with:" hint, or by 4.
+// 3. A single-file binary. Such a build bundles src/index.ts straight into the
+//    executable and does NOT go through bin/ssh-mcp.mjs, so the early exit below
+//    is inlined and is what makes the binary terminate on --version at all. A
+//    --version that reached main() would attach the transport to whatever stdin
+//    the binary inherited and HANG. (This repo has no binary build script wired
+//    up right now; the Homebrew/Scoop manifests scripts/update-manifests.mjs
+//    generates still point at per-arch binaries, so the invariant stands.)
 // 4. scripts/update-manifests.mjs:144 -- the generated Homebrew formula's
 //    `test do assert_match version.to_s, shell_output("#{bin}/ssh-mcp --version")`.
 //    `brew test` runs that against the RELEASED binary, so it fails if this stops
 //    printing a bare version to stdout or stops exiting.
 //
 // So: keep this synchronous, keep it above main(), keep the exit, and keep the
-// output a bare version on stdout. (Verified against the built binary: `ssh-mcp
-// --version` prints and exits 0 -- in a SEA, argv[2] is still the first user arg.)
+// output a bare version on stdout. (Verified against a built single-file binary:
+// `ssh-mcp --version` prints and exits 0 -- argv[2] is still the first user arg
+// there.)
 if (process.argv[2] === "--version" || process.argv[2] === "version") {
   console.log(version);
   process.exit(0);

@@ -21,8 +21,8 @@ import { afterAll, describe, expect, it } from "vitest";
 // what no unit test can reach by importing a module:
 //
 //   * the server's --version short-circuit, which must answer BEFORE main()
-//     attaches a stdio transport (Homebrew's `brew test` and the SEA smoke test
-//     both depend on it, and neither runs on a win32/linux build)
+//     attaches a stdio transport (Homebrew's `brew test` depends on it, and
+//     that never runs on a win32/linux build)
 //   * the process.on("exit") backstop, the ONLY thing that reaps a self-spawned
 //     ssh-agent when the host closes the pipe -- which fires neither SIGINT nor
 //     SIGTERM
@@ -165,10 +165,10 @@ function runServer(layout: ServerLayout, args: string[] = []) {
 
 describe("server: --version answers before main() attaches a transport", () => {
   // The contract these pin, from src/index.ts's own header: a BARE version on
-  // stdout, exit 0, and no transport. `brew test` greps that stdout, and the
-  // SEA smoke test inherits the build shell's stdin -- reaching main() there
-  // hangs the build rather than failing it. The smoke test is darwin-only and
-  // this repo has no CI, so on win32/linux nothing else catches a break.
+  // stdout, exit 0, and no transport. `brew test` greps that stdout, but it is
+  // darwin-only and this repo has no CI, so on win32/linux nothing else catches
+  // a break. (Reaching main() in a single-file binary would attach the transport
+  // to an inherited stdin and hang rather than fail.)
   for (const flag of ["--version", "version"]) {
     it(`prints only the version and exits 0 for \`${flag}\``, () => {
       const layout = makeServerLayout();
@@ -185,7 +185,7 @@ describe("server: --version answers before main() attaches a transport", () => {
 
   it("only examines the FIRST user argument", () => {
     // Observed behaviour, and deliberate per the source note: argv[2] is the
-    // first user arg in a SEA binary too. A --version anywhere later is just an
+    // first user arg in a single-file binary too. A --version anywhere later is just an
     // argument, so the server starts normally.
     const layout = makeServerLayout();
     const r = runServer(layout, ["serve", "--version"]);
