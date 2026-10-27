@@ -14,7 +14,7 @@ MCP server that makes SSH work for AI tools. 21 tools across 4 categories: SSH e
 - `src/env.ts` — SSH environment management (ensureAgent, listSshKeys, loadKey, configLookup, fixKnownHosts, checkGitSsh, testConnection). Handles Windows OpenSSH agent service.
 - `src/policy.ts` — Optional command allow/deny policy for the exec tools, configured via `SSH_MCP_COMMAND_WHITELIST` / `SSH_MCP_COMMAND_BLACKLIST`.
 - `src/ssh-config.ts` — Pure parser for `ssh -G` output, shared by `resolveConfig` (ssh.ts) and `configLookup` (env.ts).
-- `bin/ssh-mcp.mjs` — Runtime launcher. Prefers the newest `oam` binary it finds at or above `OAM_MIN` (the latest oam release, 0.18.0), falls back to running the server in-process on Node. An oam host below the floor never serves: it hands off, with piped stdio, to a newer oam or Node. Owns signal forwarding and escalation.
+- `bin/ssh-mcp.mjs` — Runtime launcher. Prefers the newest `oam` binary it finds at or above `OAM_MIN` (the latest oam release, 0.18.0), falls back to running the server in-process on Node. An oam host below the floor never serves: it hands off, with piped stdio, to a newer oam or Node. A candidate (`OAM_BIN` or discovered) counts only if its `--version` output carries oam's own banner (`oam x.y.z` at the start of a line, `oamBanner`): a bare x.y.z is not enough, or an `OAM_BIN` pointing at node (`v22.x.y`) would clear the floor and be spawned as `node run dist/index.js` with no fallback. `process.versions.oam` keeps the loose parse (only oam sets it). Owns signal forwarding and escalation.
 
 ## Build
 

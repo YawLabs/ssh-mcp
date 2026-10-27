@@ -115,7 +115,34 @@ interface RunOpts {
   hostOam?: string;
   /** More ESM source to preload, after the `hostOam` pose. */
   preload?: string;
+  /**
+   * Make the Node running this suite answer the launcher's `oam --version`
+   * probe with this text, so OAM_BIN=process.execPath passes for an oam. The
+   * real `node --version` prints "v22.x.y", which carries no oam banner and is
+   * passed over (see "launcher: a non-oam OAM_BIN"). Only that one probe is
+   * patched, in the launcher process only: every other execFileSync is real,
+   * and the spawned `<node> run ...` child gets no preload.
+   */
+  oamBinAnswers?: string;
 }
+
+/** The launcher's `--version` probe of the Node running this suite answers `text`. */
+function poseNodeAsOam(text: string): string {
+  return [
+    'import poseCp from "node:child_process";',
+    'import { syncBuiltinESMExports as poseSync } from "node:module";',
+    "const poseReal = poseCp.execFileSync;",
+    "poseCp.execFileSync = function (cmd, args, opts) {",
+    `  if (cmd === ${JSON.stringify(process.execPath)} && args?.[0] === "--version") return ${JSON.stringify(text)};`,
+    "  return poseReal.call(this, cmd, args, opts);",
+    "};",
+    "poseSync();",
+    "",
+  ].join("\n");
+}
+
+/** What oam itself prints for `--version`, at the floor. */
+const OAM_AT_FLOOR = "oam 0.18.0\n";
 
 function run(layout: string, opts: RunOpts = {}) {
   // Build the child env from scratch. A spread of process.env would carry the
@@ -140,8 +167,9 @@ function run(layout: string, opts: RunOpts = {}) {
   const posing =
     opts.hostOam === undefined
       ? ""
-      : `Object.defineProperty(process.versions, "oam", { value: ${JSON.stringify(opts.hostOam)}, enumerable: true });`;
-  const source = `${posing}${opts.preload ?? ""}`;
+      : `Object.defineProperty(process.versions, "oam", { value: ${JSON.stringify(opts.hostOam)}, enumerable: true });\n`;
+  const probe = opts.oamBinAnswers === undefined ? "" : poseNodeAsOam(opts.oamBinAnswers);
+  const source = `${posing}${probe}${opts.preload ?? ""}`;
   const preload = source ? ["--import", `data:text/javascript,${encodeURIComponent(source)}`] : [];
 
   const r = spawnSync(process.execPath, [...preload, join(layout, "bin", "ssh-mcp.mjs"), ...(opts.args ?? [])], {
@@ -196,10 +224,22 @@ describe("launcher: in-process fallback", () => {
     expect(r.stderr).toBe("");
   });
 
+  it("reports a broken install with its own diagnostic, not a raw stack trace", () => {
+    // dist/index.js missing: the bare import() in runInProcess rejects. The
+    // in-process plan used to await it unguarded, so an ESM top-level rejection
+    // replaced the launcher's message with Node's stack trace.
+    const layout = makeLayout();
+    rmSync(join(layout, "dist", "index.js"));
+    const r = run(layout, { mode: "node" });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/^ssh-mcp: fallback to Node failed \(.*\)$/m);
+    expect(r.stderr).not.toMatch(/^\s+at /m);
+  });
+
   it("reads SSH_MCP_RUNTIME case-insensitively", () => {
     // OAM_BIN is usable, so an `auto` reading would spawn it and the stub would
     // never run. Only a `node` reading of "NODE" serves in-process.
-    const r = run(makeLayout(), { mode: "NODE", oamBin: process.execPath });
+    const r = run(makeLayout(), { mode: "NODE", oamBin: process.execPath, oamBinAnswers: OAM_AT_FLOOR });
     expect(r.status, JSON.stringify(r)).toBe(0);
     expect(stubPayload(r.stdout).pid).toBe(r.pid);
   });
@@ -253,10 +293,10 @@ describe("launcher: version gate distinguishes unreadable from old", () => {
   });
 
   it("reports a genuinely old oam as old, with the version it detected", () => {
-    // node --version prints a semver, so with the floor raised above it the real
-    // "too old" branch runs against a real executable.
+    // A real executable that answers as oam at the floor, with the floor raised
+    // above it, so the real "too old" branch runs.
     const layout = makeLayout({ oamMin: "[99, 0, 0]" });
-    const r = run(layout, { mode: "auto", oamBin: process.execPath });
+    const r = run(layout, { mode: "auto", oamBin: process.execPath, oamBinAnswers: OAM_AT_FLOOR });
     expect(r.stderr).toMatch(/is oam \d+\.\d+\.\d+, older than 99\.0\.0/);
     expect(r.status).toBe(0);
     expect(r.stdout).toContain(MARKER);
@@ -264,7 +304,7 @@ describe("launcher: version gate distinguishes unreadable from old", () => {
 
   it("tells the old case to self-update, and exits 1 in oam mode", () => {
     const layout = makeLayout({ oamMin: "[99, 0, 0]" });
-    const r = run(layout, { mode: "oam", oamBin: process.execPath });
+    const r = run(layout, { mode: "oam", oamBin: process.execPath, oamBinAnswers: OAM_AT_FLOOR });
     expect(r.status).toBe(1);
     expect(r.stderr).toMatch(/self-update/);
     expect(r.stderr).not.toMatch(/could not be run/);
@@ -302,12 +342,42 @@ describe("launcher: a bad OAM_BIN is named, and discovery carries on", () => {
   });
 });
 
+/**
+ * An OAM_BIN that runs and prints a version but is not oam: the real Node,
+ * unposed, which prints "v22.x.y". The probe needs oam's own banner, so it is
+ * passed over like an unreadable binary instead of clearing the floor and being
+ * spawned as `<node> run dist/index.js`, which dies with no Node fallback
+ * because the spawn itself succeeded. Both cases fail against the old probe,
+ * which read any x.y.z.
+ */
+describe("launcher: a non-oam OAM_BIN", () => {
+  it("auto passes it over, says so, and serves on Node in-process", () => {
+    const r = run(makeLayout(), { mode: "auto", oamBin: process.execPath });
+    expect(r.status, JSON.stringify(r)).toBe(0);
+    expect(stubPayload(r.stdout).pid, "served in-process, not by a spawned child").toBe(r.pid);
+    expect(r.stderr).toMatch(
+      /^ssh-mcp: OAM_BIN=.* could not be run, or did not report a version this launcher understands; using Node instead\.$/m,
+    );
+    expect(r.stderr).not.toMatch(/older than/);
+  });
+
+  it("SSH_MCP_RUNTIME=oam refuses it rather than spawning it", () => {
+    const r = run(makeLayout(), { mode: "oam", oamBin: process.execPath });
+    expect(r.status).toBe(1);
+    expect(r.stdout).not.toContain(MARKER);
+    expect(r.stderr).toMatch(/SSH_MCP_RUNTIME=oam but no usable oam/);
+    expect(r.stderr).toMatch(/Check that it is an executable oam binary/);
+    expect(r.stderr).not.toMatch(/self-update/);
+  });
+});
+
 describe("launcher: spawning oam", () => {
   it("spawns a usable oam instead of running the server in-process", () => {
-    // process.execPath passes the version gate, so the launcher spawns it as
-    // `<node> run <server> --`. Node has no script named "run" and exits non-zero;
-    // what matters is that the stub never ran, i.e. the spawn path was taken.
-    const r = run(makeLayout(), { mode: "auto", oamBin: process.execPath });
+    // process.execPath, posing as oam, passes the version gate, so the launcher
+    // spawns it as `<node> run <server> --`. Node has no script named "run" and
+    // exits non-zero; what matters is that the stub never ran, i.e. the spawn
+    // path was taken.
+    const r = run(makeLayout(), { mode: "auto", oamBin: process.execPath, oamBinAnswers: OAM_AT_FLOOR });
     expect(r.stdout).not.toContain(MARKER);
     expect(r.status).not.toBe(0);
   });
@@ -435,6 +505,28 @@ describe("launcher: pickNewest()", () => {
   });
 });
 
+describe("launcher: oamBanner()", () => {
+  // Extracted per call, not at collection time, so a missing function fails
+  // these two cases instead of the whole file.
+  const oamBanner = (text: string): number[] | null =>
+    new Function(
+      `${extract([/function parseVersion\(text\) \{[\s\S]*?\n\}/, /function oamBanner\(text\) \{[\s\S]*?\n\}/])}\nreturn oamBanner;`,
+    )()(text);
+
+  it("reads oam's own banner, including a pre-release and a later line", () => {
+    expect(oamBanner("oam 0.18.0\n")).toEqual([0, 18, 0]);
+    expect(oamBanner("oam 0.19.0-rc.1\r\n")).toEqual([0, 19, 0]);
+    expect(oamBanner("warning: something\noam 1.2.3\n")).toEqual([1, 2, 3]);
+  });
+
+  it("rejects a version that is not oam's banner", () => {
+    expect(oamBanner("v22.22.2\n")).toBeNull(); // node
+    expect(oamBanner("Terraform v1.9.0\n")).toBeNull();
+    expect(oamBanner("not oam 0.18.0\n")).toBeNull();
+    expect(oamBanner("")).toBeNull();
+  });
+});
+
 describe("launcher: already hosted on oam", () => {
   // The unit tests above prove the decision; these prove the launcher WIRES it
   // -- that the call site actually reads `process.versions.oam` -- which no
@@ -455,7 +547,13 @@ describe("launcher: already hosted on oam", () => {
       `serves in-process instead of spawning a nested oam (SSH_MCP_RUNTIME=${mode})`,
       () => {
         const layout = makeLayout();
-        const r = run(layout, { mode, hostOam: "0.18.0", oamBin: process.execPath, args: ["--version", "extra"] });
+        const r = run(layout, {
+          mode,
+          hostOam: "0.18.0",
+          oamBin: process.execPath,
+          oamBinAnswers: OAM_AT_FLOOR,
+          args: ["--version", "extra"],
+        });
         expect(r.status, JSON.stringify(r)).toBe(0);
         const payload = stubPayload(r.stdout);
         // Same entry-point repoint and argv passthrough as the Node fallback:
@@ -488,7 +586,12 @@ describe("launcher: already hosted on oam", () => {
   it(
     "still discovers and spawns when the host oam is below the floor",
     () => {
-      const r = run(makeLayout(), { mode: "auto", hostOam: "0.17.0", oamBin: process.execPath });
+      const r = run(makeLayout(), {
+        mode: "auto",
+        hostOam: "0.17.0",
+        oamBin: process.execPath,
+        oamBinAnswers: OAM_AT_FLOOR,
+      });
       expect(r.stdout, `a below-floor host must not shortcut, got ${JSON.stringify(r)}`).not.toContain(MARKER);
       expect(r.status).not.toBe(0);
       // The spawned child failed, not the launcher: every launcher diagnostic
@@ -524,13 +627,14 @@ describe("launcher: an oam host below the floor never serves", () => {
   it(
     "hands off to Node when the only oam found is also too old",
     () => {
-      // The floor raised above the Node running the suite makes OAM_BIN a real,
+      // The floor raised above the oam that OAM_BIN poses as makes it a real,
       // runnable, too-old oam -- and makes the posed host too old as well.
       const layout = makeLayout({ oamMin: "[99, 0, 0]" });
       const r = run(layout, {
         mode: "auto",
         hostOam: "1.0.0",
         oamBin: process.execPath,
+        oamBinAnswers: OAM_AT_FLOOR,
         pathDirs: [nodeDir(layout)],
       });
       expect(r.status, JSON.stringify(r)).toBe(0);
@@ -592,6 +696,7 @@ describe("launcher: an oam host below the floor never serves", () => {
         mode: "auto",
         hostOam: "0.9.0",
         oamBin: process.execPath,
+        oamBinAnswers: OAM_AT_FLOOR,
         pathDirs: [nodeDir(layout)],
         preload: failFirstSpawn,
       });

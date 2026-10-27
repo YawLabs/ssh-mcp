@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The launcher accepts an oam binary only when its `--version` prints oam's own banner (`oam x.y.z`).** The probe of `OAM_BIN` and of every discovered binary read any `x.y.z` in the output, so an `OAM_BIN` (or an `oam.exe` on disk) that was really another program -- Node prints `v22.x.y` -- cleared the 0.18.0 floor and was spawned as `<it> run dist/index.js`, which died with no Node fallback because the spawn itself succeeded. Such a binary is now passed over and named on stderr like an unrunnable one; under `SSH_MCP_RUNTIME=oam` it exits 1 instead of spawning it. `process.versions.oam` keeps the loose parse (only oam sets it). Same fix as terraform-cwd-mcp and ansible-mcp.
+- **A broken install (missing `dist/index.js`) on the in-process path prints the launcher's diagnostic** (`ssh-mcp: fallback to Node failed (...)`, exit 1) instead of a raw Node stack trace from an unguarded top-level `import()`.
+
 ## [0.18.0] — 2026-10-11
 
 ### Changed

@@ -261,11 +261,18 @@ const STUB_DIST = `console.log(${JSON.stringify(MARKER)});\n`;
 // Patching the builtin from a --require preload is enough: Node builds the ESM
 // facade for node:child_process on first import, which happens after preloads
 // run, so the launcher's `import { spawn }` sees the replacement. execFileSync
-// is left alone, so the version gate stays the real one -- except for the exact
-// paths a test lists in FAKE_OAM_VERSIONS, whose `--version` it answers. That is
-// the one way to get two binaries reporting DIFFERENT versions on every
-// platform: a Windows oam must be a real .exe, and every runnable .exe this
-// suite can plant is a link to the same node.exe, which always ties.
+// still RUNS every version probe for real, so an unrunnable fake still fails it
+// -- except for the exact paths a test lists in FAKE_OAM_VERSIONS, whose
+// `--version` it answers without running anything. That is the one way to get
+// two binaries reporting DIFFERENT versions on every platform: a Windows oam
+// must be a real .exe, and every runnable .exe this suite can plant is a link to
+// the same node.exe, which always ties.
+//
+// The launcher accepts only oam's own banner ("oam x.y.z"), and a runnable fake
+// is really Node, which prints "v22.x.y". So when FAKE_NODE_AS_OAM is set, a
+// probe that ran and answered with Node's version is rewritten to
+// "oam <FAKE_NODE_AS_OAM>". runLauncher sets it whenever the spy is loaded,
+// unless a test opts out to see the real banner check refuse Node.
 //
 // A piped spawn (the launcher's handoff from an oam host) gets real streams to
 // pipe into and out of, and the stand-in emits 'close' after 'exit', because a
@@ -299,11 +306,17 @@ const SPAWN_SPY = [
   'const fakeVersions = JSON.parse(process.env.FAKE_OAM_VERSIONS || "{}");',
   "const realExecFileSync = cp.execFileSync;",
   "cp.execFileSync = function (file, args, opts) {",
-  '  if (Array.isArray(args) && args[0] === "--version" && Object.hasOwn(fakeVersions, file)) {',
+  '  const probe = Array.isArray(args) && args[0] === "--version";',
+  "  if (probe && Object.hasOwn(fakeVersions, file)) {",
   // biome-ignore lint/suspicious/noTemplateCurlyInString: SOURCE TEXT for a preload stub, not a string this file evaluates -- the placeholder must reach that file verbatim.
   "    return `oam ${fakeVersions[file]}\\n`;",
   "  }",
-  "  return realExecFileSync.call(this, file, args, opts);",
+  "  const out = realExecFileSync.call(this, file, args, opts);",
+  "  if (probe && process.env.FAKE_NODE_AS_OAM && /^v\\d+\\.\\d+\\.\\d+/.test(String(out).trim())) {",
+  // biome-ignore lint/suspicious/noTemplateCurlyInString: SOURCE TEXT for a preload stub, not a string this file evaluates -- the placeholder must reach that file verbatim.
+  "    return `oam ${process.env.FAKE_NODE_AS_OAM}\\n`;",
+  "  }",
+  "  return out;",
   "};",
   "",
 ].join("\n");
@@ -353,7 +366,8 @@ function plantOam(dir: string): string {
 
 /**
  * Plant a RUNNABLE oam install and return its path: a hard link to the Node
- * running this suite, whose `--version` (v18 or newer) clears the floor. Copied
+ * running this suite. Its `--version` really runs; the spy then rewrites Node's
+ * "v22.x.y" to "oam 0.18.0" (FAKE_NODE_AS_OAM), which clears the floor. Copied
  * when a link cannot be made (another volume, or a hardlink-protected file).
  * Two of these are the same version, which is exactly a tie. The spy stands in
  * for the spawn, so the link is only ever asked for its version.
@@ -382,6 +396,12 @@ interface LauncherOpts {
   hostOam?: string;
   /** path -> the version the spy answers for that exact path's `--version`. */
   fakeVersions?: Record<string, string>;
+  /**
+   * The oam version the spy reports for a probe that ran and printed Node's
+   * version (see SPAWN_SPY). Defaults to the floor whenever the spy is loaded;
+   * null leaves Node's real "v22.x.y" for the launcher to refuse.
+   */
+  nodeAsOam?: string | null;
 }
 
 function runLauncher(layout: LauncherLayout, opts: LauncherOpts = {}) {
@@ -392,7 +412,7 @@ function runLauncher(layout: LauncherLayout, opts: LauncherOpts = {}) {
   for (const [k, v] of Object.entries(process.env)) {
     if (typeof v !== "string") continue;
     if (
-      /^(path|oam_bin|ssh_mcp_runtime|userprofile|home|localappdata|spawn_log|fake_code|fake_signal|fake_oam_versions)$/i.test(
+      /^(path|oam_bin|ssh_mcp_runtime|userprofile|home|localappdata|spawn_log|fake_code|fake_signal|fake_oam_versions|fake_node_as_oam)$/i.test(
         k,
       )
     ) {
@@ -412,6 +432,8 @@ function runLauncher(layout: LauncherLayout, opts: LauncherOpts = {}) {
   if (opts.fakeCode !== undefined) env.FAKE_CODE = opts.fakeCode;
   if (opts.fakeSignal) env.FAKE_SIGNAL = opts.fakeSignal;
   if (opts.fakeVersions) env.FAKE_OAM_VERSIONS = JSON.stringify(opts.fakeVersions);
+  const nodeAsOam = opts.nodeAsOam === undefined ? (opts.spy ? "0.18.0" : null) : opts.nodeAsOam;
+  if (nodeAsOam) env.FAKE_NODE_AS_OAM = nodeAsOam;
 
   const nodeArgs = opts.spy ? ["--require", layout.spy] : [];
   if (opts.hostOam !== undefined) {
@@ -530,6 +552,24 @@ describe("launcher: every oam found is asked, and the newest wins", () => {
     expect(spawnedWith(layout).cmd).toBe(appData);
   });
 
+  it("passes over a runnable binary that answers with Node's version, not oam's banner", () => {
+    // The same runnable fake the tie cases above spawn, with the spy's rewrite
+    // switched off: it runs and prints "v22.x.y", which the old probe read as a
+    // version well above the floor and spawned as `<node> run ...`.
+    const layout = makeLauncherLayout();
+    const onPath = plantRunnableOam(join(layout.dir, "pathdir"));
+
+    const r = runLauncher(layout, {
+      mode: "oam",
+      pathDirs: [join(layout.dir, "pathdir")],
+      spy: true,
+      nodeAsOam: null,
+    });
+    expect(r.status, JSON.stringify(r)).toBe(1);
+    expect(spawnLog(layout), "not oam, so nothing may be spawned").toEqual([]);
+    expect(r.stderr).toContain(`${onPath} could not be run, or did not report a version this launcher understands`);
+  });
+
   it("names every unusable oam it found, each one once", () => {
     // Two distinct binaries, and one of them reachable twice through PATH --
     // on Windows the second time in a different case, which is the same file.
@@ -548,8 +588,8 @@ describe("launcher: every oam found is asked, and the newest wins", () => {
 });
 
 describe("launcher: the argv handed to oam", () => {
-  // process.execPath passes the REAL version gate (`node --version` reports a
-  // semver well above the 0.18.0 floor); the spy only replaces the spawn.
+  // process.execPath passes the version gate: its probe really runs, and the
+  // spy reports it as oam at the floor (FAKE_NODE_AS_OAM) and replaces the spawn.
   it("passes `run <server> --` and forwards host args after the separator", () => {
     const layout = makeLauncherLayout();
     const r = runLauncher(layout, { mode: "oam", oamBin: process.execPath, spy: true, args: ["--version", "extra"] });
