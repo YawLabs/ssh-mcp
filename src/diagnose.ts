@@ -91,7 +91,14 @@ export function isValidHostname(host: string): boolean {
 
 export function runArgs(cmd: string, args: string[]): { stdout: string; ok: boolean } {
   try {
-    const stdout = execFileSync(cmd, args, { encoding: "utf8", timeout: 10000, stdio: ["pipe", "pipe", "pipe"] });
+    // windowsHide: oam 0.19.1 stopped giving every child CREATE_NO_WINDOW, and Node
+    // never did, so without it each ssh / ssh-add / ssh-keygen probe can flash a console.
+    const stdout = execFileSync(cmd, args, {
+      encoding: "utf8",
+      timeout: 10000,
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
     return { stdout: stdout.trim(), ok: true };
   } catch (e: unknown) {
     // Capture both stdout and stderr — many SSH commands (ssh -T, ssh-add) output to stderr

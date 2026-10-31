@@ -648,8 +648,12 @@ describe("ConnectionPool — maxPoolSize eviction", () => {
   // defaultMaxPoolSize() reads process.env on every ConnectionPool construction, so a
   // stubbed env plus the file-level (already mocked) ConnectionPool is enough -- no
   // module reset or re-import needed.
-  it("uses SSH_MCP_MAX_POOL_SIZE as the default cap when no maxPoolSize option is passed", async () => {
-    vi.stubEnv("SSH_MCP_MAX_POOL_SIZE", "2");
+  // " 2 " pins the trim: surrounding whitespace is not a typo, so it still reads as 2.
+  it.each([
+    "2",
+    " 2 ",
+  ])("uses SSH_MCP_MAX_POOL_SIZE=%j as the default cap when no maxPoolSize option is passed", async (value) => {
+    vi.stubEnv("SSH_MCP_MAX_POOL_SIZE", value);
     const pool = new ConnectionPool(); // no explicit maxPoolSize -- should pick up env
     try {
       const c1 = await pool.acquire({ host: "env-cap-1.example.com" });
@@ -666,7 +670,7 @@ describe("ConnectionPool — maxPoolSize eviction", () => {
   // refused. "" takes the early `!raw` return that an unset var shares, and is the only
   // row that pins that return's constant (the other rows reach the final fallback). "-1"
   // catches a sign flip (Math.abs would yield cap 1); the 400-digit value makes
-  // Number.parseInt return Infinity, which only the Number.isFinite guard rejects.
+  // Number() return Infinity, which only the Number.isFinite guard rejects.
   // Distinct ports on one host give 100 distinct pool keys while paying for a single
   // memoized `ssh -G` spawn instead of 101. The regexes pin the number but not the
   // words after it, so a rewording of the pool-full message does not break them.
@@ -675,7 +679,11 @@ describe("ConnectionPool — maxPoolSize eviction", () => {
     { label: "0", value: "0" },
     { label: "-1", value: "-1" },
     { label: "not-a-number", value: "not-a-number" },
-    { label: '"9" x 400 (parseInt -> Infinity)', value: "9".repeat(400) },
+    { label: '"9" x 400 (Number -> Infinity)', value: "9".repeat(400) },
+    // A prefix parse read these as 10, 1 and 2: digits only, or the default.
+    { label: "10abc", value: "10abc" },
+    { label: "1e2", value: "1e2" },
+    { label: "2.5", value: "2.5" },
   ])("falls back to the default pool cap of exactly 100 when SSH_MCP_MAX_POOL_SIZE=$label", async ({ value }) => {
     vi.stubEnv("SSH_MCP_MAX_POOL_SIZE", value);
     const pool = new ConnectionPool();

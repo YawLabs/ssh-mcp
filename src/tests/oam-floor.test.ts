@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -120,5 +120,26 @@ describe("check-oam-floor catches drift", () => {
     const r = runChecker(root);
     expect(r.code, r.out).not.toBe(0);
     expect(r.out).toMatch(/OAM_MIN/);
+  });
+});
+
+describe("check-oam-floor runs from a linked checkout", () => {
+  // Node realpaths the main module's URL but not argv[1]. With a plain resolve()
+  // compare, running the script through a junction or symlink skipped main() and
+  // exited 0 having checked nothing -- a drifted tree passed.
+  it("still reports drift when invoked through a junction / symlink to scripts/", () => {
+    const root = fixture({ launcherTest: "    expect(floor).toEqual([0, 17, 1]);\n" });
+    const linkParent = mkdtempSync(join(tmpdir(), "ssh-mcp-floor-link-"));
+    dirs.push(linkParent);
+    const linked = join(linkParent, "scripts");
+    // "junction" needs no privilege on Windows; the type is ignored elsewhere.
+    symlinkSync(join(repoRoot, "scripts"), linked, "junction");
+    const r = spawnSync(process.execPath, [join(linked, "check-oam-floor.mjs"), "--offline", "--root", root], {
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+    const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+    expect(r.status, out).toBe(1);
+    expect(out).toMatch(/pins the floor at 0\.17\.1/);
   });
 });

@@ -83,9 +83,12 @@ export function isPoolFullError(err: unknown): err is PoolFullError {
 const MAX_TIMER_MS = 2_147_483_647;
 
 function defaultMaxPoolSize(): number {
-  const raw = process.env.SSH_MCP_MAX_POOL_SIZE;
-  if (!raw) return 100;
-  const parsed = Number.parseInt(raw, 10);
+  // Digits only, after a trim. Number.parseInt reads a prefix, so "10abc" was 10 and
+  // "1e2" was 1 -- a typo silently capped the pool (and ssh_multi_exec) instead of
+  // falling back to the default.
+  const raw = process.env.SSH_MCP_MAX_POOL_SIZE?.trim();
+  if (!raw || !/^\d+$/.test(raw)) return 100;
+  const parsed = Number(raw);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 100;
 }
 

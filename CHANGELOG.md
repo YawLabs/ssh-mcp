@@ -15,7 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The oam floor is now 0.19.1, the latest oam release.** The launcher no longer serves on oam 0.19.0, 0.19.0-dev builds or 0.18.x; it hands off to a newer oam or to Node, as for any below-floor oam. Verified on oam 0.19.1 through the launcher: MCP initialize, tools/list, and tools/call on `ssh_key_list`, `ssh_config_lookup` and `ssh_agent_ensure`, plus ssh2's agent client dialing a Windows named pipe. An agent-only `ssh_exec` end to end is still verified on Node only (README, Windows support).
+- **`SSH_MCP_MAX_POOL_SIZE` must be a whole number of digits (surrounding whitespace is trimmed); anything else falls back to the default of 100.** It was read with `Number.parseInt`, which takes a prefix, so `10abc` meant 10 and `1e2` meant 1 -- a typo silently capped the pool and `ssh_multi_exec`'s parallelism.
+
 ### Fixed
+- **ssh, ssh-add and ssh-keygen run with `windowsHide: true`.** oam 0.19.1 stopped starting every child with `CREATE_NO_WINDOW` and now honours `windowsHide` as Node does, so without it each diagnostic and agent probe could flash a console window on Windows.
+- **`scripts/check-oam-floor.mjs` runs from a junctioned or symlinked checkout.** It decided whether it was the main module by comparing `resolve(process.argv[1])` with its own path, but Node realpaths the main module and not `argv[1]`, so through a link the check never ran and exited 0 in silence. Both sides are now realpath'd. Same fix as yaw-mcp 1.1.2.
 - **The launcher accepts an oam binary only when its `--version` prints oam's own banner (`oam x.y.z`).** The probe of `OAM_BIN` and of every discovered binary read any `x.y.z` in the output, so an `OAM_BIN` (or an `oam.exe` on disk) that was really another program -- Node prints `v22.x.y` -- cleared the 0.18.0 floor and was spawned as `<it> run dist/index.js`, which died with no Node fallback because the spawn itself succeeded. Such a binary is now passed over and named on stderr like an unrunnable one; under `SSH_MCP_RUNTIME=oam` it exits 1 instead of spawning it. `process.versions.oam` keeps the loose parse (only oam sets it). Same fix as terraform-cwd-mcp and ansible-mcp.
 - **A broken install (missing `dist/index.js`) on the in-process path prints the launcher's diagnostic** (`ssh-mcp: fallback to Node failed (...)`, exit 1) instead of a raw Node stack trace from an unguarded top-level `import()`.
 

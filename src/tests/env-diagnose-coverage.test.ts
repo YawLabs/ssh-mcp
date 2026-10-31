@@ -25,6 +25,8 @@ interface ExecCall {
   args: string[];
   /** The child env, present ONLY when the caller passed one (runArgsWithEnv does; runArgs does not). */
   env?: Record<string, string>;
+  /** The windowsHide option as passed, so the no-console-flash setting is pinned. */
+  windowsHide?: boolean;
 }
 
 type ExecHandler = (cmd: string, args: string[], env?: Record<string, string>) => FakeRun;
@@ -36,8 +38,8 @@ vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
   return {
     ...actual,
-    execFileSync: (cmd: string, args: string[], opts?: { env?: Record<string, string> }) => {
-      calls.push({ cmd, args, env: opts?.env });
+    execFileSync: (cmd: string, args: string[], opts?: { env?: Record<string, string>; windowsHide?: boolean }) => {
+      calls.push({ cmd, args, env: opts?.env, windowsHide: opts?.windowsHide });
       if (!execHandler) {
         throw new Error(`unexpected subprocess in test: ${cmd} ${args.join(" ")}`);
       }
@@ -1455,6 +1457,26 @@ describe("G5 -- checkSshConfig reports an absent config file", () => {
 
     expect(result.status).toBe("ok");
     expect(result.message).toBe("No ~/.ssh/config file (using defaults)");
+  });
+});
+
+describe("both exec wrappers hide the child's console window", () => {
+  // oam 0.19.1 stopped applying CREATE_NO_WINDOW to every child and Node never did,
+  // so an ssh / ssh-add probe without windowsHide flashes a console on Windows.
+  it("runArgs (diagnose.ts) passes windowsHide: true", () => {
+    execHandler = () => ({ stdout: "OpenSSH_9.9" });
+    runArgs("ssh", ["-V"]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].windowsHide).toBe(true);
+  });
+
+  it("runArgsWithEnv (env.ts, via ensureAgent's probe) passes windowsHide: true", () => {
+    setPlatform("linux");
+    setEnv("SSH_AUTH_SOCK", "/tmp/real-agent.sock");
+    execHandler = () => ({ stdout: "256 SHA256:AAA jeff@box (ED25519)" });
+    ensureAgent();
+    const probe = calls.find((c) => c.cmd === "ssh-add" && c.env !== undefined);
+    expect(probe?.windowsHide).toBe(true);
   });
 });
 

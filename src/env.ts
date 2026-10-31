@@ -58,6 +58,8 @@ function runArgsWithEnv(
       encoding: "utf8",
       timeout: 10000,
       stdio: ["pipe", "pipe", "pipe"],
+      // No console window for ssh-add on Windows; see runArgs in diagnose.ts.
+      windowsHide: true,
     });
     return { stdout: stdout.trim(), ok: true };
   } catch (e: unknown) {

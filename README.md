@@ -207,7 +207,7 @@ If you don't trust the agent's `env` values at all, the simplest mitigation is t
 
 On Windows, ssh-mcp uses the OpenSSH Authentication Agent's `\\.\pipe\openssh-ssh-agent` named pipe automatically when `SSH_AUTH_SOCK` is not set. No `SSH_AUTH_SOCK` needed — just make sure the OpenSSH agent service is running.
 
-On the [oam](https://oamjs.org) runtime, agent auth needs oam 0.18.0 or newer: that is the first oam whose `net` can dial a named pipe or a Unix socket, which is how ssh2 reaches the agent (and the launcher never serves on an older one). Agent-backed remote operations have so far been verified end to end on Node only; on oam, the handshake and `ssh_config_lookup` were verified, not an agent-only `ssh_exec`. If agent auth fails on oam, set `SSH_MCP_RUNTIME=node` to rule the runtime out.
+On the [oam](https://oamjs.org) runtime, the launcher serves only on oam 0.19.1 or newer. Agent auth needs a `net` that can dial a named pipe or a Unix socket (that is how ssh2 reaches the agent), which older oam releases could not do. On oam 0.19.1 (Windows) the MCP handshake, `ssh_config_lookup`, `ssh_key_list` and `ssh_agent_ensure` were verified through the launcher, and ssh2's own agent client was verified dialing a named pipe and listing identities. An agent-only `ssh_exec` end to end has so far been verified on Node only. If agent auth fails on oam, set `SSH_MCP_RUNTIME=node` to rule the runtime out.
 
 `ssh_agent_ensure` and `ssh_diagnose` probe that pipe and tell you if the service is down. Remote operations do *not*: they assume the pipe and let the connection fail on its own if the agent isn't there. That is why a stopped agent service shows up as an auth failure rather than an "agent not running" error until you run the diagnostic tools.
 
@@ -328,27 +328,27 @@ for (const check of report.checks) {
 
 ## Runtime selection
 
-The `ssh-mcp` command — what `npx @yawlabs/ssh-mcp` runs — is a small launcher. It prefers the [oam](https://oamjs.org) runtime and otherwise runs the server on Node, so oam is optional. Its minimum is the **latest oam release, currently 0.18.0**, and it never serves on an older oam.
+The `ssh-mcp` command — what `npx @yawlabs/ssh-mcp` runs — is a small launcher. It prefers the [oam](https://oamjs.org) runtime and otherwise runs the server on Node, so oam is optional. Its minimum is the **latest oam release, currently 0.19.1**, and it never serves on an older oam.
 
 Two environment variables control the choice; set them in your MCP client's `env` block:
 
 - `SSH_MCP_RUNTIME` — which runtime to use. Case-insensitive; any value other than `oam` or `node` behaves as `auto`.
-  - `auto` (default) — use the newest oam it can find at 0.18.0 or newer, otherwise run on Node.
+  - `auto` (default) — use the newest oam it can find at 0.19.1 or newer, otherwise run on Node.
   - `oam` — require oam. Fails loudly: if no usable oam is found, the launcher prints what it found and why each one was passed over to stderr, and exits with status 1 instead of starting the server.
   - `node` — always Node. The launcher does not look for oam, and `OAM_BIN` is ignored.
-- `OAM_BIN` — path to an oam binary to use in preference to discovery, when it is 0.18.0 or newer. If it does not exist, is older, will not run, or does not answer `--version` with oam's own `oam x.y.z` banner (another program's version, such as Node's `v22.x.y`, does not count), the launcher says so on stderr and carries on with discovery.
+- `OAM_BIN` — path to an oam binary to use in preference to discovery, when it is 0.19.1 or newer. If it does not exist, is older, will not run, or does not answer `--version` with oam's own `oam x.y.z` banner (another program's version, such as Node's `v22.x.y`, does not count), the launcher says so on stderr and carries on with discovery.
 
-Discovery looks in `$OAM_INSTALL_DIR` (when set — the oam installer's install target), then `%LOCALAPPDATA%\oam\bin` (Windows only), then `~/.oam/bin`, then every directory on `PATH`; asks every oam binary it finds for its version, counting only an answer that carries oam's own `oam x.y.z` banner; and uses the newest one at 0.18.0 or newer. On a tie the one found first wins, so an installed copy beats one on `PATH`. On Windows only `oam.exe` counts: an `oam.cmd`/`oam.bat` shim on `PATH` is never run, and is named on stderr when no usable oam is found.
+Discovery looks in `$OAM_INSTALL_DIR` (when set — the oam installer's install target), then `%LOCALAPPDATA%\oam\bin` (Windows only), then `~/.oam/bin`, then every directory on `PATH`; asks every oam binary it finds for its version, counting only an answer that carries oam's own `oam x.y.z` banner; and uses the newest one at 0.19.1 or newer. On a tie the one found first wins, so an installed copy beats one on `PATH`. On Windows only `oam.exe` counts: an `oam.cmd`/`oam.bat` shim on `PATH` is never run, and is named on stderr when no usable oam is found.
 
-By default an unusable oam is not an error. When Node starts the launcher (`npx` or a global install, run directly by your MCP client), `auto` mode falls back to Node — silently when there was nothing to find, or with a note on stderr naming each oam (and `OAM_BIN`) it passed over and why: older than 0.18.0, not runnable, or a shim. A chosen oam that then fails to start is named on stderr too. When an older oam starts the launcher, the handoff to Node is always noted on stderr (see below). With `SSH_MCP_RUNTIME=oam`, each of these cases exits with status 1 instead.
+By default an unusable oam is not an error. When Node starts the launcher (`npx` or a global install, run directly by your MCP client), `auto` mode falls back to Node — silently when there was nothing to find, or with a note on stderr naming each oam (and `OAM_BIN`) it passed over and why: older than 0.19.1, not runnable, or a shim. A chosen oam that then fails to start is named on stderr too. When an older oam starts the launcher, the handoff to Node is always noted on stderr (see below). With `SSH_MCP_RUNTIME=oam`, each of these cases exits with status 1 instead.
 
 When the launcher is itself started by oam (`oam run <path>/bin/ssh-mcp.mjs`, which is how Yaw MCP starts an `npx @yawlabs/ssh-mcp` entry when a recent oam is installed):
 
-- On oam 0.18.0 or newer it runs the server on that oam, in the same process. Nothing is discovered or spawned, `OAM_BIN` is not read, and `SSH_MCP_RUNTIME=oam` counts it as the oam it requires.
+- On oam 0.19.1 or newer it runs the server on that oam, in the same process. Nothing is discovered or spawned, `OAM_BIN` is not read, and `SSH_MCP_RUNTIME=oam` counts it as the oam it requires.
 - On an older oam it never runs the server there. It hands the server off to the newest usable oam it can find, or to Node on `PATH`, or exits with status 1 when there is neither (`SSH_MCP_RUNTIME=oam` exits with status 1 rather than handing off to Node).
 - With `SSH_MCP_RUNTIME=node` it hands the server off to Node on `PATH`, whatever the oam version.
 
-Whenever an oam host starts a child (the handoffs above), the launcher removes `--permission` and `--allow-*` flags from the child's inherited `NODE_OPTIONS`. oam 0.18.0 adds its own permission flags to every child's `NODE_OPTIONS`, and Node refuses some of them there (`--allow-net is not allowed in NODE_OPTIONS`, exit 9); this server is not sandboxed, so there is nothing to pass on. An oam that was itself started with `--permission` re-adds the flags inside `spawn()`, which the launcher cannot undo, so do not start it that way.
+Whenever an oam host starts a child (the handoffs above), the launcher removes `--permission` and `--allow-*` flags from the child's inherited `NODE_OPTIONS`. oam (since 0.18.0) adds its own permission flags to every child's `NODE_OPTIONS`, and Node refuses some of them there (`--allow-net is not allowed in NODE_OPTIONS`, exit 9); this server is not sandboxed, so there is nothing to pass on. An oam that was itself started with `--permission` re-adds the flags inside `spawn()`, which the launcher cannot undo, so do not start it that way.
 
 For example, to always run on Node:
 
@@ -370,7 +370,7 @@ On Windows, add the same `env` block to the `cmd /c` form from [Quick start](#qu
 
 - Node.js 18+
 - SSH client installed (for diagnostics and environment management)
-- Optional: [oam](https://oamjs.org) 0.18.0+ — see [Runtime selection](#runtime-selection)
+- Optional: [oam](https://oamjs.org) 0.19.1+ — see [Runtime selection](#runtime-selection)
 
 ## License
 
