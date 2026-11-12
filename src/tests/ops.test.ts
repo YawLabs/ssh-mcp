@@ -87,17 +87,12 @@ describe("runtime validation of arguments spliced into the command unquoted", ()
     await expect(find(noExec, { path: "/tmp", type: type as any })).rejects.toThrow("Invalid type");
   });
 
-  it.each([
-    [-1],
-    [1.5],
-    [Number.NaN],
-    [Number.POSITIVE_INFINITY],
-    ["1; id"],
-    ["2"],
-    [null],
-  ])("find rejects maxdepth %j", async (maxdepth) => {
-    await expect(find(noExec, { path: "/tmp", maxdepth: maxdepth as any })).rejects.toThrow("Invalid maxdepth");
-  });
+  it.each([[-1], [1.5], [Number.NaN], [Number.POSITIVE_INFINITY], ["1; id"], ["2"], [null]])(
+    "find rejects maxdepth %j",
+    async (maxdepth) => {
+      await expect(find(noExec, { path: "/tmp", maxdepth: maxdepth as any })).rejects.toThrow("Invalid maxdepth");
+    },
+  );
 
   it.each([["minsize"], ["maxsize"]])("find rejects a non-string %s", async (field) => {
     const evil = { toString: () => "1M; id", [Symbol.toPrimitive]: () => "1M; id" };

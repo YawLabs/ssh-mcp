@@ -871,16 +871,17 @@ describe("every single-host tool hands withConnection a capacity wait budget", (
     ["ssh_service_status", { service: "nginx" }],
   ];
 
-  it.each(
-    EVERY_SINGLE_HOST_TOOL,
-  )("%s waits up to 30000ms for a slot when the caller sets no timeout", async (name, args) => {
-    statFileSpy.mockResolvedValue(stats());
-    listDirSpy.mockResolvedValue([]);
-    readFileSpy.mockResolvedValue("");
-    findSpy.mockResolvedValue([]);
-    serviceStatusSpy.mockResolvedValue(service());
-    expect(await poolOptionsFor(name, { ...HOST, ...args })).toEqual({ waitForCapacityMs: 30000 });
-  });
+  it.each(EVERY_SINGLE_HOST_TOOL)(
+    "%s waits up to 30000ms for a slot when the caller sets no timeout",
+    async (name, args) => {
+      statFileSpy.mockResolvedValue(stats());
+      listDirSpy.mockResolvedValue([]);
+      readFileSpy.mockResolvedValue("");
+      findSpy.mockResolvedValue([]);
+      serviceStatusSpy.mockResolvedValue(service());
+      expect(await poolOptionsFor(name, { ...HOST, ...args })).toEqual({ waitForCapacityMs: 30000 });
+    },
+  );
 
   it.each([
     ["ssh_exec", { command: "uptime" }],
