@@ -40,7 +40,7 @@
  * named on stderr, and discovery carries on. It used to stop everything: a typo
  * in OAM_BIN meant Node, with no hint why. The discovered binaries that were
  * passed over, and any .cmd/.bat shim on PATH, are named only when NO usable
- * oam is found -- with 0.9.0 installed and 0.19.1 on PATH, stderr stays empty.
+ * oam is found -- with 0.9.0 installed and 0.19.5 on PATH, stderr stays empty.
  *
  * ALREADY RUNNING ON OAM
  * A host can resolve this package's `bin` and launch `oam run <this file>`
@@ -77,9 +77,9 @@
  * wired up here.
  *
  * MINIMUM OAM VERSION
- * The latest oam release, 0.19.1 -- bump OAM_MIN when oam ships a newer one.
+ * The latest oam release, 0.19.5 -- bump OAM_MIN when oam ships a newer one.
  * Only the current oam is used and verified; an older one is passed over.
- * Verified on 0.19.1 through this launcher (`oam run bin/ssh-mcp.mjs`): MCP
+ * Verified on 0.19.5 through this launcher (`oam run bin/ssh-mcp.mjs`): MCP
  * initialize, tools/list and tools/call on ssh_key_list, ssh_config_lookup and
  * ssh_agent_ensure, plus ssh2's agent client dialing a Windows named pipe.
  *
@@ -105,6 +105,10 @@
  * runArgs (src/diagnose.ts) and runArgsWithEnv (src/env.ts) therefore pass
  * `windowsHide: true` themselves, or every ssh / ssh-add / ssh-keygen probe could
  * flash a console window on Windows.
+ *
+ * Moving from 0.19.1 to 0.19.5 changed nothing this server depends on: 0.19.2-0.19.5
+ * are dns, os, error-shape and argv-parsing fixes plus POSIX extra-fd pipe and
+ * EINTR fixes (oam CHANGELOG 0.19.2-0.19.5).
  *
  * Background, long before the current floor: before 0.9.0
  * `child_process.execFile` ran its arguments through a SHELL, `exec` accepted
@@ -136,7 +140,7 @@ import { fileURLToPath } from "node:url";
  * sockets (needed by ssh2's agent client, src/ssh.ts). See MINIMUM OAM VERSION
  * above.
  */
-const OAM_MIN = [0, 19, 1];
+const OAM_MIN = [0, 19, 5];
 
 /**
  * Bound on each `oam --version` probe. A healthy oam answers in milliseconds;
@@ -249,7 +253,7 @@ function parseVersion(text) {
 
 /**
  * `oam --version` output -> [major, minor, patch], or null unless it carries
- * oam's own banner ("oam 0.19.1" at the start of a line). Any x.y.z is NOT
+ * oam's own banner ("oam 0.19.5" at the start of a line). Any x.y.z is NOT
  * enough: an OAM_BIN (or an oam.exe on disk) that is really another program --
  * node prints "v22.22.2" -- would clear the floor, and the launcher would then
  * spawn `<it> run dist/index.js`, which dies with no Node fallback because the

@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The oam floor is now 0.19.5, the latest oam release.** The launcher no longer serves on oam 0.19.1 through 0.19.4; it hands off to a newer oam or to Node, as for any below-floor oam. Verified on oam 0.19.5 through the launcher: MCP initialize, tools/list, and tools/call on `ssh_key_list`, `ssh_config_lookup` and `ssh_agent_ensure`, plus ssh2's agent client dialing a Windows named pipe and listing identities. An agent-only `ssh_exec` end to end is still verified on Node only (README, Windows support).
+
+### Security
+- **Dependencies bumped to clear all 21 open Dependabot alerts.** zod 4.6.7 (direct), plus transitive undici 8.12.4, fast-uri 3.1.9, ip-address 10.7.6, body-parser 2.4.0, hono 4.13.18, @hono/node-server 2.1.7, and dev-only vite 8.3.8 and vitest / @vitest/mocker 4.1.12. `npm audit` reports 0 vulnerabilities.
+
 ## [0.18.1] — 2026-10-30
 
 ### Changed

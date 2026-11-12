@@ -367,7 +367,7 @@ function plantOam(dir: string): string {
 /**
  * Plant a RUNNABLE oam install and return its path: a hard link to the Node
  * running this suite. Its `--version` really runs; the spy then rewrites Node's
- * "v22.x.y" to "oam 0.19.1" (FAKE_NODE_AS_OAM), which clears the floor. Copied
+ * "v22.x.y" to "oam 0.19.5" (FAKE_NODE_AS_OAM), which clears the floor. Copied
  * when a link cannot be made (another volume, or a hardlink-protected file).
  * Two of these are the same version, which is exactly a tie. The spy stands in
  * for the spawn, so the link is only ever asked for its version.
@@ -432,7 +432,7 @@ function runLauncher(layout: LauncherLayout, opts: LauncherOpts = {}) {
   if (opts.fakeCode !== undefined) env.FAKE_CODE = opts.fakeCode;
   if (opts.fakeSignal) env.FAKE_SIGNAL = opts.fakeSignal;
   if (opts.fakeVersions) env.FAKE_OAM_VERSIONS = JSON.stringify(opts.fakeVersions);
-  const nodeAsOam = opts.nodeAsOam === undefined ? (opts.spy ? "0.19.1" : null) : opts.nodeAsOam;
+  const nodeAsOam = opts.nodeAsOam === undefined ? (opts.spy ? "0.19.5" : null) : opts.nodeAsOam;
   if (nodeAsOam) env.FAKE_NODE_AS_OAM = nodeAsOam;
 
   const nodeArgs = opts.spy ? ["--require", layout.spy] : [];
@@ -509,7 +509,7 @@ describe("launcher: every oam found is asked, and the newest wins", () => {
       mode: "auto",
       pathDirs,
       spy: true,
-      fakeVersions: { [installed]: "0.19.1", [newest]: "0.20.0", [middle]: "0.19.9" },
+      fakeVersions: { [installed]: "0.19.5", [newest]: "0.20.0", [middle]: "0.19.9" },
     });
     expect(r.status, JSON.stringify(r)).toBe(0);
     expect(spawnedWith(layout).cmd).toBe(newest);
@@ -634,7 +634,7 @@ describe("launcher: the argv handed to oam", () => {
     const node = join(nodeDir, isWin ? "node.exe" : "node");
     // Only has to EXIST: Node on PATH is found by stat, and the spy runs nothing.
     writeFileSync(node, "");
-    const r = runLauncher(layout, { mode: "node", pathDirs: [nodeDir], spy: true, hostOam: "0.19.1", args: ["x"] });
+    const r = runLauncher(layout, { mode: "node", pathDirs: [nodeDir], spy: true, hostOam: "0.19.5", args: ["x"] });
     const call = spawnedWith(layout);
     expect(call.cmd).toBe(node);
     // Node takes the entry directly: no `run`, no separator.
