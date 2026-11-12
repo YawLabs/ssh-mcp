@@ -98,6 +98,7 @@ export async function multiExec(
   let parked = 0;
   const canWait = typeof (pool as Partial<Pick<ConnectionPool, "waitForCapacity">>).waitForCapacity === "function";
   // Written as `>= 1` so a NaN or sub-millisecond timeout still parks for a real 1ms.
+  // biome-ignore lint/complexity/useMathMinMax: Math.max(NaN, 1) is NaN; the ternary maps NaN to 1.
   const freshBudgetMs = timeoutMs >= 1 ? timeoutMs : 1;
 
   const errorResult = (host: string, error: string): MultiExecResult => ({

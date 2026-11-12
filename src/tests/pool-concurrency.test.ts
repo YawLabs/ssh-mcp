@@ -649,22 +649,22 @@ describe("ConnectionPool — maxPoolSize eviction", () => {
   // stubbed env plus the file-level (already mocked) ConnectionPool is enough -- no
   // module reset or re-import needed.
   // " 2 " pins the trim: surrounding whitespace is not a typo, so it still reads as 2.
-  it.each([
-    "2",
-    " 2 ",
-  ])("uses SSH_MCP_MAX_POOL_SIZE=%j as the default cap when no maxPoolSize option is passed", async (value) => {
-    vi.stubEnv("SSH_MCP_MAX_POOL_SIZE", value);
-    const pool = new ConnectionPool(); // no explicit maxPoolSize -- should pick up env
-    try {
-      const c1 = await pool.acquire({ host: "env-cap-1.example.com" });
-      const c2 = await pool.acquire({ host: "env-cap-2.example.com" });
-      await expect(pool.acquire({ host: "env-cap-3.example.com" })).rejects.toThrow(/Connection pool is full \(2 /);
-      pool.release(c1);
-      pool.release(c2);
-    } finally {
-      pool.drain();
-    }
-  });
+  it.each(["2", " 2 "])(
+    "uses SSH_MCP_MAX_POOL_SIZE=%j as the default cap when no maxPoolSize option is passed",
+    async (value) => {
+      vi.stubEnv("SSH_MCP_MAX_POOL_SIZE", value);
+      const pool = new ConnectionPool(); // no explicit maxPoolSize -- should pick up env
+      try {
+        const c1 = await pool.acquire({ host: "env-cap-1.example.com" });
+        const c2 = await pool.acquire({ host: "env-cap-2.example.com" });
+        await expect(pool.acquire({ host: "env-cap-3.example.com" })).rejects.toThrow(/Connection pool is full \(2 /);
+        pool.release(c1);
+        pool.release(c2);
+      } finally {
+        pool.drain();
+      }
+    },
+  );
 
   // Pins the fallback to EXACTLY 100: 100 held connections succeed and the 101st is
   // refused. "" takes the early `!raw` return that an unset var shares, and is the only
