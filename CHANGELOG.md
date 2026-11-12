@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.2] — 2026-11-11
+
 ### Changed
 - **The oam floor is now 0.19.5, the latest oam release.** The launcher no longer serves on oam 0.19.1 through 0.19.4; it hands off to a newer oam or to Node, as for any below-floor oam. Verified on oam 0.19.5 through the launcher: MCP initialize, tools/list, and tools/call on `ssh_key_list`, `ssh_config_lookup` and `ssh_agent_ensure`, plus ssh2's agent client dialing a Windows named pipe and listing identities. An agent-only `ssh_exec` end to end is still verified on Node only (README, Windows support).
 
