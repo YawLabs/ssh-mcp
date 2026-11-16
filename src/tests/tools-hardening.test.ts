@@ -301,7 +301,21 @@ describe("policy scope gap is documented on the tools it does not cover", () => 
   it.each(MUTATING_SFTP_TOOLS)("%s says it is NOT gated by command policy", (name) => {
     const { description } = getTool(name);
     expect(description).toContain("NOT gated by SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST");
-    expect(description).toContain("ssh_exec and ssh_multi_exec");
+    expect(description).toContain("applies only to the remote command-execution tools");
+  });
+
+  it("no tool description names another tool (mcp-compliance security-tool-cross-reference)", () => {
+    const tools = getTools();
+    const names = [...tools.keys()];
+    expect(names.length).toBeGreaterThan(1);
+    for (const [name, { description }] of tools) {
+      for (const other of names) {
+        if (other === name) continue;
+        expect(description, `${name} names ${other}`).not.toMatch(
+          new RegExp(`(?<![A-Za-z0-9_])${other}(?![A-Za-z0-9_])`, "i"),
+        );
+      }
+    }
   });
 
   it("the exec tools do NOT carry the exemption note (they are the gated ones)", () => {

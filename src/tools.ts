@@ -110,7 +110,7 @@ const DESTRUCTIVE_REMOTE = { readOnlyHint: false, destructiveHint: true, openWor
 // See the SCOPE LIMIT block in src/policy.ts -- a blacklist is not whole-server coverage,
 // and an admin who assumes otherwise leaves remote mutation wide open.
 const POLICY_EXEMPT_NOTE =
-  " NOT gated by SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST: command policy applies only to ssh_exec and ssh_multi_exec, so a blacklist such as `^rm` does NOT block this tool.";
+  " NOT gated by SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST: command policy applies only to the remote command-execution tools (single-host and multi-host), so a blacklist such as `^rm` does NOT block this tool.";
 
 // POSIX portable environment-variable name grammar (IEEE Std 1003.1, "Name"): an initial
 // letter or underscore followed by letters, digits, or underscores. Keys are interpolated
@@ -282,7 +282,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_upload",
-    `Upload a local file to a remote host via SFTP. Reads an arbitrary local file at an agent-chosen \`localPath\` -- any file readable by this process leaves the machine toward the remote host (the mirror direction of ssh_download's local write).${SFTP_POOL_WAIT_NOTE}${POLICY_EXEMPT_NOTE}`,
+    `Upload a local file to a remote host via SFTP. Reads an arbitrary local file at an agent-chosen \`localPath\` -- any file readable by this process leaves the machine toward the remote host (the mirror direction of a download, which writes an arbitrary local file).${SFTP_POOL_WAIT_NOTE}${POLICY_EXEMPT_NOTE}`,
     {
       ...connectionParams,
       localPath: z.string().describe("Path to the local file to upload"),
@@ -410,7 +410,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_delete",
-    `Delete a file or empty directory on a remote host via SFTP. Auto-detects the path type and calls the right SFTP op (unlink for files/symlinks, rmdir for empty dirs). Recursive directory delete is intentionally NOT supported -- for that, use ssh_exec with \`rm -rf\` explicitly so the destructive intent is visible in the tool trace.${SFTP_POOL_WAIT_NOTE}${POLICY_EXEMPT_NOTE}`,
+    `Delete a file or empty directory on a remote host via SFTP. Auto-detects the path type and calls the right SFTP op (unlink for files/symlinks, rmdir for empty dirs). Recursive directory delete is intentionally NOT supported -- for that, run \`rm -rf\` explicitly as a remote shell command so the destructive intent is visible in the tool trace.${SFTP_POOL_WAIT_NOTE}${POLICY_EXEMPT_NOTE}`,
     {
       ...connectionParams,
       path: AbsoluteRemotePathSchema.describe(
@@ -550,7 +550,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_key_load",
-    "Load an SSH private key into the running agent. Ensures the agent is running first. Use this after ssh_key_list shows a key that is not loaded.",
+    "Load an SSH private key into the running agent. Ensures the agent is running first. Use this after listing local keys shows one that is not loaded.",
     {
       keyPath: z.string().describe("Path to the SSH private key to load (e.g. ~/.ssh/id_ed25519)"),
     },
@@ -607,7 +607,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_test",
-    "Quick connectivity test to an SSH host. Reports success/failure with timing and actionable error details. Lighter and faster than ssh_diagnose — use this for a quick check before running operations.",
+    "Quick connectivity test to an SSH host. Reports success/failure with timing and actionable error details. Lighter and faster than a full SSH environment diagnosis — use this for a quick check before running operations.",
     {
       host: HostSchema,
       port: PortSchema,
@@ -652,7 +652,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_multi_exec",
-    "Execute a command on multiple remote hosts in parallel. Runs at most SSH_MCP_MAX_POOL_SIZE hosts at once (default 100) and works through a longer list as slots free up. `timeout` is per host: it bounds each host's command, not the whole call. Each parallel slot works through its share of the list one host at a time, so with the pool to itself a call can take up to about ceil(hosts / SSH_MCP_MAX_POOL_SIZE) x (`timeout` + connect time). The connection pool is shared with every other tool; when it is full this call waits for slots instead of failing, and gives up only when none of its own hosts holds a slot and a full `timeout` has passed with none of them starting or finishing. The hosts waiting at that point (up to one per parallel slot) and every host still queued then report `Connection pool is full`; the queued ones are never attempted. Rerun those hosts once the other calls finish, or raise SSH_MCP_MAX_POOL_SIZE. Returns results per host. Use this instead of calling ssh_exec multiple times — it's faster and shows results side by side. Use `env` to set environment variables for this call without modifying the command string. Subject to SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST if configured (policy is checked once, against the env-prefixed command, before fan-out).",
+    "Execute a command on multiple remote hosts in parallel. Runs at most SSH_MCP_MAX_POOL_SIZE hosts at once (default 100) and works through a longer list as slots free up. `timeout` is per host: it bounds each host's command, not the whole call. Each parallel slot works through its share of the list one host at a time, so with the pool to itself a call can take up to about ceil(hosts / SSH_MCP_MAX_POOL_SIZE) x (`timeout` + connect time). The connection pool is shared with every other tool; when it is full this call waits for slots instead of failing, and gives up only when none of its own hosts holds a slot and a full `timeout` has passed with none of them starting or finishing. The hosts waiting at that point (up to one per parallel slot) and every host still queued then report `Connection pool is full`; the queued ones are never attempted. Rerun those hosts once the other calls finish, or raise SSH_MCP_MAX_POOL_SIZE. Returns results per host. Use this instead of running the same command against each host one call at a time — it's faster and shows results side by side. Use `env` to set environment variables for this call without modifying the command string. Subject to SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST if configured (policy is checked once, against the env-prefixed command, before fan-out).",
     {
       // .min(1): `hosts: []` used to return an empty success block indistinguishable from a
       // no-op -- the same boundary rejection ssh_git_check applies to its empty host.
@@ -741,7 +741,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_tail",
-    "Read the last N lines of a file on a remote host, optionally filtering by a grep pattern. Use this for reading log files instead of ssh_exec with manual tail/grep commands.",
+    "Read the last N lines of a file on a remote host, optionally filtering by a grep pattern. Use this for reading log files instead of running tail/grep by hand as a remote shell command.",
     {
       ...connectionParams,
       path: z.string().describe("Absolute path to the file to tail"),
@@ -786,7 +786,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_service_status",
-    "Check the status of a systemd service on a remote host. Returns whether it's active, its PID, uptime, and description. Use this instead of ssh_exec with systemctl.",
+    "Check the status of a systemd service on a remote host. Returns whether it's active, its PID, uptime, and description. Use this instead of running systemctl as a remote shell command.",
     {
       ...connectionParams,
       service: z.string().describe("Systemd service name (e.g. nginx, sshd, docker)"),
