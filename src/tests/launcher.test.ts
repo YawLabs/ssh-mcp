@@ -280,6 +280,15 @@ describe("launcher: oam mode is a hard requirement", () => {
     expect(r.status).toBe(1);
     expect(r.stderr).toMatch(/SSH_MCP_RUNTIME=oam but no usable oam/);
   });
+
+  it("ignores surrounding whitespace", () => {
+    // Untrimmed, " oam " read as `auto`, which is Node: it served in-process
+    // and told the user to set the SSH_MCP_RUNTIME=oam they had already set.
+    const r = run(makeLayout(), { mode: " oam " });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/SSH_MCP_RUNTIME=oam but no usable oam/);
+    expect(r.stdout).not.toContain(MARKER);
+  });
 });
 
 describe("launcher: version gate distinguishes unreadable from old", () => {

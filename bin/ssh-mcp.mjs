@@ -182,7 +182,7 @@
  *                          on PATH when THIS process is oam
  *   OAM_BIN=/path/to/oam   use this oam when it is usable, before discovery;
  *                          read only when oam is being looked for
- * The value is case-insensitive; anything else behaves like `auto`.
+ * The value is trimmed and case-insensitive; anything else behaves like `auto`.
  */
 
 import { execFileSync, spawn } from "node:child_process";
@@ -774,7 +774,10 @@ async function fallBackToNode(hostOam, why) {
   await handOffToNode(`this process is oam ${hostOam}, older than ${OAM_MIN.join(".")}, and ${why}`);
 }
 
-const mode = (process.env.SSH_MCP_RUNTIME ?? "auto").toLowerCase();
+// Trimmed as well as lowercased: with `auto` meaning Node, a padded "oam " read
+// untrimmed would fall to `auto` and silently run on Node (it used to land on oam
+// only because `auto` preferred it). Same parse as SSH_MCP_STRICT_HOSTKEYS.
+const mode = (process.env.SSH_MCP_RUNTIME ?? "auto").trim().toLowerCase();
 const hostOam = process.versions.oam;
 const plan = runtimePlan({ mode, hostOam });
 /** `auto`, or any value that is neither `oam` nor `node`, while auto means Node. */

@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`SSH_MCP_RUNTIME` is now trimmed as well as case-insensitive.** A padded value such as `"oam "` used to fall through to `auto`; since 0.18.4 made `auto` mean Node, that ran the server on Node and the stderr note told you to set the `SSH_MCP_RUNTIME=oam` you had already set. It now reads as `oam`.
+- The README no longer says `auto` never looks for oam without qualification: that holds when Node starts the launcher. Started by oam with no Node on `PATH`, `auto` still serves on oam, as the Runtime selection section lists.
+
 ## [0.18.5] — 2026-11-16
 
 ### Fixed
