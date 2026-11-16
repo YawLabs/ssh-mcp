@@ -30,6 +30,7 @@
     "test:ci": "npm run build && npm test",
     "check:compliance": "node scripts/check-compliance.mjs",
     "check:oam-floor": "node scripts/check-oam-floor.mjs",
+    "check:yaw-mcp-floor": "node scripts/check-yaw-mcp-floor.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

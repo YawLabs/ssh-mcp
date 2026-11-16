@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- The release pre-flight checks the Yaw MCP floor: `scripts/check-yaw-mcp-floor.mjs` (`npm run check:yaw-mcp-floor`) fails on drift between `YAW_MCP_MIN` 1.1.13, the README's "Yaw MCP 1.1.13 or newer" and the `@yawlabs/mcp-compliance` devDependency (`^0.20.4`, the range Yaw MCP 1.1.13 pins), and warns without failing when a newer @yawlabs/mcp is published. Release tooling and docs only.
+
 ### Fixed
 - **No tool description names another tool any more,** so `@yawlabs/mcp-compliance` passes `security-tool-cross-reference` (the server grades 100 instead of 99). Eight descriptions (the shared command-policy exemption note on the four mutating SFTP tools, plus upload, delete, key load, test, multi-host exec, tail and service status) now describe the other capability instead of naming it; tool names, schemas and behaviour are unchanged.
 - **`SSH_MCP_RUNTIME` is now trimmed as well as case-insensitive.** A padded value such as `"oam "` used to fall through to `auto`; since 0.18.4 made `auto` mean Node, that ran the server on Node and the stderr note told you to set the `SSH_MCP_RUNTIME=oam` you had already set. It now reads as `oam`.

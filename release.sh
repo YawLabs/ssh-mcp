@@ -292,7 +292,7 @@ fi
 if [ "$IS_CI" != "true" ] && [ "$CURRENT_VERSION" != "$VERSION" ]; then
   echo ""
   echo -e "${YELLOW}About to release v${VERSION}. This will:${NC}"
-  echo "  1. Run lint, typecheck, build, tests, the MCP compliance gate and the oam floor check"
+  echo "  1. Run lint, typecheck, build, tests, the MCP compliance gate and the oam and Yaw MCP floor checks"
   echo "  2. Bump version in package.json"
   echo "  3. Commit, tag, and push"
   echo "  4. Publish to npm"
@@ -333,6 +333,19 @@ node scripts/check-compliance.mjs || fail "MCP compliance gate failed -- the ser
 # the deliberate way past it. No network is not a failure -- the check says so
 # and continues.
 node scripts/check-oam-floor.mjs || fail "oam floor check failed -- see above. Set SSH_MCP_ALLOW_STALE_OAM=1 to release on the old floor deliberately."
+
+# The Yaw MCP floor: drift (YAW_MCP_MIN vs the README claim and the
+# @yawlabs/mcp-compliance devDependency) fails the release, and `npm test`
+# already runs that half (src/tests/yaw-mcp-floor.test.ts). A newer
+# @yawlabs/mcp on npm is only a WARNING -- nothing at runtime reads this floor
+# -- so it prints and the release continues. Offline it says so and passes.
+YAW_FLOOR_OUT=$(node scripts/check-yaw-mcp-floor.mjs 2>&1) || { echo "$YAW_FLOOR_OUT"; fail "Yaw MCP floor drift -- see above."; }
+echo "$YAW_FLOOR_OUT"
+if echo "$YAW_FLOOR_OUT" | grep -q "WARNING"; then
+  warn "Yaw MCP floor is behind the latest @yawlabs/mcp -- continuing"
+else
+  info "Yaw MCP floor has no drift"
+fi
 info "All checks passed"
 
 # Step 2: Bump version
