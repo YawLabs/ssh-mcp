@@ -16,8 +16,9 @@ import { createServer, version } from "./server.js";
 //    below is the only thing that ends that invocation, and the launcher is
 //    written around it: it flushes its own stderr synchronously first (errSync,
 //    bin/ssh-mcp.mjs:639-643) because this exit truncates a pending async write
-//    on Windows TTYs and pipes. Taken on Node, and on a host that is already oam
-//    at or above the launcher's floor (ALREADY RUNNING ON OAM in its header).
+//    on Windows TTYs and pipes. Taken on Node -- the default -- and, under
+//    SSH_MCP_RUNTIME=oam, on a host that is already oam at or above the
+//    launcher's floor (ALREADY RUNNING ON OAM in its header).
 // 2. bin/ssh-mcp.mjs, spawned paths. `oam run <entry> -- ...process.argv.slice(2)`
 //    (bin/ssh-mcp.mjs:607), and `node <entry> ...process.argv.slice(2)` when an
 //    oam host hands off to Node (handOffToNode), forward the flag unchanged into

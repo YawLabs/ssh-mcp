@@ -505,14 +505,30 @@ describe("launcher: every oam found is asked, and the newest wins", () => {
     // so neither the shim nor the older binaries passed over are named.
     if (isWin) writeFileSync(join(layout.dir, "path-middle", "oam.cmd"), "@echo off\r\n");
 
+    // `oam`, not `auto`: auto runs on Node and discovers nothing while the
+    // launcher's AUTO_PREFERS_OAM is false. Discovery is the same code either way.
     const r = runLauncher(layout, {
-      mode: "auto",
+      mode: "oam",
       pathDirs,
       spy: true,
       fakeVersions: { [installed]: "0.20.2", [newest]: "0.21.0", [middle]: "0.20.9" },
     });
     expect(r.status, JSON.stringify(r)).toBe(0);
     expect(spawnedWith(layout).cmd).toBe(newest);
+    expect(r.stderr).toBe("");
+  });
+
+  it("auto spawns none of them: the default runtime is Node", () => {
+    // Usable oams installed and on PATH, and no OAM_BIN. The shipped `auto`
+    // does not probe or spawn any of them, and has nothing to say about it.
+    const layout = makeLauncherLayout();
+    plantRunnableOam(join(layout.home, ".oam", "bin"));
+    plantRunnableOam(join(layout.dir, "pathdir"));
+
+    const r = runLauncher(layout, { mode: "auto", pathDirs: [join(layout.dir, "pathdir")], spy: true });
+    expect(r.status, JSON.stringify(r)).toBe(0);
+    expect(spawnLog(layout), "auto must not spawn an oam").toEqual([]);
+    expect(r.stdout).toContain(MARKER);
     expect(r.stderr).toBe("");
   });
 
@@ -618,7 +634,7 @@ describe("launcher: the argv handed to oam", () => {
     // connects the child to pipes nobody reads and the MCP handshake never
     // answers. From an oam host the launcher must pipe the streams itself.
     const layout = makeLauncherLayout();
-    const r = runLauncher(layout, { mode: "auto", oamBin: process.execPath, spy: true, hostOam: "0.9.0" });
+    const r = runLauncher(layout, { mode: "oam", oamBin: process.execPath, spy: true, hostOam: "0.9.0" });
     const call = spawnedWith(layout);
     expect(call.cmd).toBe(process.execPath);
     expect(call.args).toEqual(["run", layout.serverEntry, "--"]);
@@ -668,7 +684,13 @@ describe("launcher: the child's exit status is mirrored", () => {
   it("returns the child's code from a piped handoff too", () => {
     // Piped, the launcher mirrors on 'close' rather than 'exit'.
     const layout = makeLauncherLayout();
-    const r = runLauncher(layout, { oamBin: process.execPath, spy: true, hostOam: "0.9.0", fakeCode: "3" });
+    const r = runLauncher(layout, {
+      mode: "oam",
+      oamBin: process.execPath,
+      spy: true,
+      hostOam: "0.9.0",
+      fakeCode: "3",
+    });
     expect(r.status).toBe(3);
   });
 });

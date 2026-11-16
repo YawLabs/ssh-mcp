@@ -2,9 +2,21 @@
 /**
  * Runtime launcher for @yawlabs/ssh-mcp.
  *
- * Prefers the newest usable oam runtime (https://oamjs.org) and falls back to
- * Node. It never serves on an oam older than the floor below.
+ * Runs the server on Node by default. The oam runtime (https://oamjs.org) is
+ * opt-in with SSH_MCP_RUNTIME=oam, and the launcher never serves on an oam older
+ * than the floor below.
  *
+ * AUTO MEANS NODE, FOR NOW
+ * `auto` used to prefer the newest usable oam and fall back to Node. It is
+ * switched to Node by AUTO_PREFERS_OAM (below) because oam 0.20.2's node:crypto
+ * cannot do what ordinary SSH setups need -- see KNOWN LIMITS ON 0.20.2 -- and a
+ * default that breaks ed25519 keys is not a default. Everything below that
+ * describes `auto` discovering or preferring oam describes AUTO_PREFERS_OAM =
+ * true; with it false, `auto` behaves as SSH_MCP_RUNTIME=node does, plus two
+ * things node mode does not do: on an oam host with no Node on PATH it serves on
+ * that oam (at the floor) or looks for a newer one (below it) rather than
+ * exiting, and it says on stderr when it moved off an oam host or ignored an
+ * OAM_BIN. SSH_MCP_RUNTIME=oam is untouched by the switch.
  *
  * WHY THE FALLBACK COSTS NOTHING
  * npm has already started Node to run this launcher, so falling back is a
@@ -137,8 +149,8 @@
  *     host key format" (ssh-ed25519 is absent from ssh2's host key list there).
  * ssh2 cannot parse an ed25519 PUBLIC key on oam either, so an ed25519 key in
  * the agent is not expected to work (not measured end to end). Whether 0.19.5
- * behaved the same was not measured. `auto` still prefers oam regardless; the
- * README (Known limits on oam 0.20.2) tells users to set SSH_MCP_RUNTIME=node.
+ * behaved the same was not measured. This is why `auto` runs on Node: see
+ * AUTO_PREFERS_OAM. Under SSH_MCP_RUNTIME=oam the limits apply as listed.
  *
  * Background, long before the current floor: before 0.9.0
  * `child_process.execFile` ran its arguments through a SHELL, `exec` accepted
@@ -148,12 +160,18 @@
  * paths, so those were reachable bugs rather than theoretical ones.
  *
  * SELECTION
- *   SSH_MCP_RUNTIME=auto   newest usable oam, else Node (default)
+ *   SSH_MCP_RUNTIME=auto   Node (default): in THIS process on Node, handed off
+ *                          to Node on PATH when THIS process is oam. Only with
+ *                          no Node on PATH does an oam host serve: itself at
+ *                          the floor, a newer discovered oam below it.
+ *                          (With AUTO_PREFERS_OAM = true: newest usable oam,
+ *                          else Node.)
  *   SSH_MCP_RUNTIME=oam    newest usable oam, else exit with an error
  *                          (already running on oam at the floor satisfies it)
  *   SSH_MCP_RUNTIME=node   Node: in THIS process on Node, handed off to Node
  *                          on PATH when THIS process is oam
- *   OAM_BIN=/path/to/oam   use this oam when it is usable, before discovery
+ *   OAM_BIN=/path/to/oam   use this oam when it is usable, before discovery;
+ *                          read only when oam is being looked for
  * The value is case-insensitive; anything else behaves like `auto`.
  */
 
@@ -171,6 +189,23 @@ import { fileURLToPath } from "node:url";
  * above.
  */
 const OAM_MIN = [0, 20, 2];
+
+/**
+ * Whether `auto` (the default mode) prefers a usable oam over Node.
+ *
+ * FALSE because oam 0.20.2's node:crypto has no crypto.diffieHellman, no x25519
+ * key generation and no SEC1 EC private-key signing, so on oam ssh_exec fails
+ * for ed25519 and ECDSA key files and for ed25519-only servers (KNOWN LIMITS ON
+ * 0.20.2 above). Until that is fixed `auto` runs on Node and oam is opt-in via
+ * SSH_MCP_RUNTIME=oam.
+ *
+ * Flip back to true -- this one line -- once an oam release ships ed25519,
+ * x25519 and SEC1 EC signing and those three cases are measured working on it
+ * (raise OAM_MIN to that release in the same change). Then restore the docs that
+ * describe the default: README (Runtime selection), CLAUDE.md, and the
+ * "auto runs on Node" tests in src/tests/launcher.test.ts.
+ */
+const AUTO_PREFERS_OAM = false;
 
 /**
  * Bound on each `oam --version` probe. A healthy oam answers in milliseconds;
@@ -341,7 +376,12 @@ function pickNewest(candidates) {
  *   "in-process"   import it into THIS process
  *   "discover"     choose an oam and spawn it, or fall back to Node
  *   "handoff-node" hand it off to Node on PATH: THIS process is an oam, and
- *                  Node was asked for
+ *                  Node was asked for -- by SSH_MCP_RUNTIME=node, or by `auto`
+ *                  while AUTO_PREFERS_OAM is false
+ *
+ * While AUTO_PREFERS_OAM is false, every mode other than `oam` plans exactly as
+ * `node` does. What `auto` does differently when an oam host has no Node on
+ * PATH is decided at the call site, which is where PATH is read.
  *
  * `hostOam` is `process.versions.oam`: oam's own key, absent on Node. An oam
  * host whose version cannot be read is treated as below the floor -- it never
@@ -357,7 +397,8 @@ function pickNewest(candidates) {
  */
 function runtimePlan({ mode, hostOam }) {
   const onOam = hostOam !== undefined;
-  if (mode === "node") return onOam ? "handoff-node" : "in-process";
+  const wantsNode = mode === "node" || (mode !== "oam" && !AUTO_PREFERS_OAM);
+  if (wantsNode) return onOam ? "handoff-node" : "in-process";
   return atLeast(parseVersion(hostOam ?? ""), OAM_MIN) ? "in-process" : "discover";
 }
 
@@ -679,8 +720,8 @@ async function launchChild(cmd, args, onLaunchFailed) {
 
 /**
  * Hand the server to Node on PATH. Only reachable when THIS process is oam --
- * one below the floor, or any oam under SSH_MCP_RUNTIME=node -- so there is no
- * in-process option left.
+ * one below the floor, or any oam under SSH_MCP_RUNTIME=node or under `auto`
+ * while AUTO_PREFERS_OAM is false. `reason`, when given, is noted on stderr.
  */
 async function handOffToNode(reason) {
   const node = findNodeOnPath();
@@ -718,16 +759,11 @@ async function fallBackToNode(hostOam, why) {
 const mode = (process.env.SSH_MCP_RUNTIME ?? "auto").toLowerCase();
 const hostOam = process.versions.oam;
 const plan = runtimePlan({ mode, hostOam });
+/** `auto`, or any value that is neither `oam` nor `node`, while auto means Node. */
+const autoOnNode = !AUTO_PREFERS_OAM && mode !== "oam" && mode !== "node";
 
-if (plan === "in-process") {
-  // Guarded like every other in-process fallback: a broken install (missing
-  // dist/index.js) must print this launcher's diagnostic, not a raw Node stack
-  // trace from the bare import().
-  await runInProcess().catch(fallbackFailed);
-} else if (plan === "handoff-node") {
-  const belowFloor = !atLeast(parseVersion(hostOam), OAM_MIN);
-  await handOffToNode(belowFloor ? `this process is oam ${hostOam}, older than ${OAM_MIN.join(".")}` : "");
-} else {
+/** Choose an oam and spawn it; without one, fall back to Node or exit (oam mode). */
+async function discoverAndServe() {
   const { chosen, overrideNote, skipped, passedOver, overrideMissing } = chooseOam();
 
   if (chosen) {
@@ -774,4 +810,45 @@ if (plan === "in-process") {
     if (notes.length > 0) await errSync(`ssh-mcp: ${notes.join("; ")}; using Node instead.\n`);
     await fallBackToNode(hostOam, "no newer oam was found").catch(fallbackFailed);
   }
+}
+
+if (plan === "in-process") {
+  // auto never looks for oam while AUTO_PREFERS_OAM is false, so an OAM_BIN
+  // someone set expecting oam would be dropped without a word. errSync because
+  // the server's `--version` exits right after the import; see discoverAndServe.
+  if (autoOnNode && hostOam === undefined && process.env.OAM_BIN) {
+    await errSync(
+      "ssh-mcp: OAM_BIN is set but not used: the default runtime is Node until oam supports ed25519, x25519 and SEC1 EC keys. Set SSH_MCP_RUNTIME=oam to run on it.\n",
+    );
+  }
+  // Guarded like every other in-process fallback: a broken install (missing
+  // dist/index.js) must print this launcher's diagnostic, not a raw Node stack
+  // trace from the bare import().
+  await runInProcess().catch(fallbackFailed);
+} else if (plan === "handoff-node") {
+  const belowFloor = !atLeast(parseVersion(hostOam), OAM_MIN);
+  const floorReason = `this process is oam ${hostOam}, older than ${OAM_MIN.join(".")}`;
+  if (!autoOnNode) {
+    // SSH_MCP_RUNTIME=node: Node or nothing.
+    await handOffToNode(belowFloor ? floorReason : "");
+  } else if (findNodeOnPath()) {
+    await handOffToNode(
+      belowFloor
+        ? floorReason
+        : `this process is oam ${hostOam}, and the default runtime is Node until oam supports ed25519, x25519 and SEC1 EC keys (SSH_MCP_RUNTIME=oam to stay on oam)`,
+    );
+  } else if (belowFloor) {
+    // No Node to move to, and this oam may not serve: a newer oam is the only
+    // thing left, exactly as before the switch. It errors out when there is none.
+    await discoverAndServe();
+  } else {
+    // No Node to move to. A supported oam that serves everything but the keys in
+    // KNOWN LIMITS beats not starting at all, as long as it is said out loud.
+    await errSync(
+      `ssh-mcp: the default runtime is Node, but no Node was found on PATH; serving on this oam ${hostOam}, where ed25519 and ECDSA key files and ed25519-only servers do not work.\n`,
+    );
+    await runInProcess().catch(fallbackFailed);
+  }
+} else {
+  await discoverAndServe();
 }
