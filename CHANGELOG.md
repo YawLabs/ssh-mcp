@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The oam floor is now 0.20.2, the latest oam release.** The launcher no longer serves on oam 0.19.5 through 0.20.1; it hands off to a newer oam or to Node, as for any below-floor oam. Verified on oam 0.20.2 (Windows) through the launcher, both started by Node with `SSH_MCP_RUNTIME=oam` and as `oam run bin/ssh-mcp.mjs`: MCP initialize, tools/list (the same 21 tools as on Node), and tools/call on `ssh_key_list`, `ssh_config_lookup` and `ssh_agent_ensure`, plus ssh2's agent client dialing a Windows named pipe and completing an identities request against a stand-in agent. An agent-only `ssh_exec` end to end is still verified on Node only (README, Windows support). Also measured on 0.20.2: an ssh2 client connecting and running an exec against a local ssh2 server with an RSA host key, over `ecdh-sha2-nistp256` (ssh2's default on oam) and `diffie-hellman-group14-sha256`. Nothing in the server changes: the 0.20 line's Windows fixes are for GUI children under `windowsHide` and `spawnSync` job order, and the `windowsHide: true` this server already passes to ssh, ssh-add and ssh-keygen stays.
+
 ## [0.18.2] — 2026-11-11
 
 ### Changed

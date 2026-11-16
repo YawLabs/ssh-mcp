@@ -40,7 +40,7 @@
  * named on stderr, and discovery carries on. It used to stop everything: a typo
  * in OAM_BIN meant Node, with no hint why. The discovered binaries that were
  * passed over, and any .cmd/.bat shim on PATH, are named only when NO usable
- * oam is found -- with 0.9.0 installed and 0.19.5 on PATH, stderr stays empty.
+ * oam is found -- with 0.9.0 installed and 0.20.2 on PATH, stderr stays empty.
  *
  * ALREADY RUNNING ON OAM
  * A host can resolve this package's `bin` and launch `oam run <this file>`
@@ -77,11 +77,12 @@
  * wired up here.
  *
  * MINIMUM OAM VERSION
- * The latest oam release, 0.19.5 -- bump OAM_MIN when oam ships a newer one.
+ * The latest oam release, 0.20.2 -- bump OAM_MIN when oam ships a newer one.
  * Only the current oam is used and verified; an older one is passed over.
- * Verified on 0.19.5 through this launcher (`oam run bin/ssh-mcp.mjs`): MCP
+ * Verified on 0.20.2 through this launcher (`oam run bin/ssh-mcp.mjs`): MCP
  * initialize, tools/list and tools/call on ssh_key_list, ssh_config_lookup and
- * ssh_agent_ensure, plus ssh2's agent client dialing a Windows named pipe.
+ * ssh_agent_ensure, plus ssh2's agent client dialing a Windows named pipe (a
+ * stand-in agent on a pipe; the OpenSSH agent service was stopped on that machine).
  *
  * The floor is not cosmetic. Two things this server does were first fixed in
  * oam 0.18.0, so anyone taking it below that has to answer for both:
@@ -106,9 +107,20 @@
  * `windowsHide: true` themselves, or every ssh / ssh-add / ssh-keygen probe could
  * flash a console window on Windows.
  *
- * Moving from 0.19.1 to 0.19.5 changed nothing this server depends on: 0.19.2-0.19.5
- * are dns, os, error-shape and argv-parsing fixes plus POSIX extra-fd pipe and
- * EINTR fixes (oam CHANGELOG 0.19.2-0.19.5).
+ * Moving from 0.19.1 to 0.19.5 changed nothing this server depends on: those
+ * releases are dns, os, error-shape and argv-parsing fixes plus POSIX extra-fd pipe
+ * and EINTR fixes (oam CHANGELOG).
+ *
+ * Moving on through the 0.20 line needed no change here. Its fixes are rsa /
+ * Diffie-Hellman in node:crypto, --max-old-space-size, napi, os.networkInterfaces,
+ * cluster, and on Windows a GUI child now opening hidden under `windowsHide` and a
+ * spawnSync child joining the kill-on-close job before it runs (oam CHANGELOG
+ * 0.20.0-0.20.2). The children here are console programs (ssh, ssh-add,
+ * ssh-keygen), which `windowsHide: true` already kept windowless, so the option
+ * stays exactly as it is. The crypto side is ssh2's key exchange: measured on
+ * 0.20.2, an ssh2 client completed a connection and an exec against a local ssh2
+ * server with an RSA host key (rsa-sha2-512) over both ecdh-sha2-nistp256, which
+ * is what ssh2 negotiates by default on oam, and diffie-hellman-group14-sha256.
  *
  * Background, long before the current floor: before 0.9.0
  * `child_process.execFile` ran its arguments through a SHELL, `exec` accepted
@@ -140,7 +152,7 @@ import { fileURLToPath } from "node:url";
  * sockets (needed by ssh2's agent client, src/ssh.ts). See MINIMUM OAM VERSION
  * above.
  */
-const OAM_MIN = [0, 19, 5];
+const OAM_MIN = [0, 20, 2];
 
 /**
  * Bound on each `oam --version` probe. A healthy oam answers in milliseconds;
@@ -253,7 +265,7 @@ function parseVersion(text) {
 
 /**
  * `oam --version` output -> [major, minor, patch], or null unless it carries
- * oam's own banner ("oam 0.19.5" at the start of a line). Any x.y.z is NOT
+ * oam's own banner ("oam 0.20.2" at the start of a line). Any x.y.z is NOT
  * enough: an OAM_BIN (or an oam.exe on disk) that is really another program --
  * node prints "v22.22.2" -- would clear the floor, and the launcher would then
  * spawn `<it> run dist/index.js`, which dies with no Node fallback because the
