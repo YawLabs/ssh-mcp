@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.4] — 2026-11-15
+
 ### Changed
 - **The default runtime is now Node; oam is opt-in with `SSH_MCP_RUNTIME=oam`.** `auto` (the default) used to run the server on the newest oam at or above the floor whenever one was installed, and on oam 0.20.2 that broke `ssh_exec` for ed25519 and ECDSA key files and for ed25519-only servers (0.18.3, Known issues). `auto` now runs on Node and no longer looks for oam: started by Node it serves in-process, and says on stderr when an `OAM_BIN` was set and not used; started by oam (`oam run bin/ssh-mcp.mjs`, as Yaw MCP does) it hands the server off to Node on `PATH` and says so on stderr. Only when an oam host has no Node on `PATH` does `auto` still serve on oam -- on that oam if it is 0.20.2 or newer, with a stderr note naming what does not work there, otherwise on a newer oam it can find, or exit 1. `SSH_MCP_RUNTIME=oam` and `SSH_MCP_RUNTIME=node` are unchanged, and the oam floor is still 0.20.2. If you relied on `auto` picking oam, set `SSH_MCP_RUNTIME=oam`. The preference is one constant in the launcher (`AUTO_PREFERS_OAM`) and goes back to oam once an oam release ships ed25519, x25519 and SEC1 EC private-key signing.
 
