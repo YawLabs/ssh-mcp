@@ -474,8 +474,9 @@ describe("launcher: runtimePlan() as shipped -- auto runs on Node", () => {
   const AT_OR_ABOVE = ["0.20.2", "0.21.0", "1.0.0"];
 
   it("ships with AUTO_PREFERS_OAM = false", () => {
-    // oam 0.20.2 cannot do ed25519, x25519 or SEC1 EC signing, so the default
-    // must not land on it. Flipping this back is deliberate: update this case,
+    // On oam 0.20.2 ssh2 loses ed25519 (crypto.verify throws on an Ed25519
+    // private key), curve25519 kex and ECDSA key files (YawLabs/oam#489), so the
+    // default must not land on it. Flipping this back is deliberate: update this case,
     // the README and CLAUDE.md with it.
     expect(extract([AUTO_PREFERS_OAM_DECL])).toBe("const AUTO_PREFERS_OAM = false;");
   });
@@ -818,11 +819,12 @@ describe("launcher: an oam host below the floor never serves", () => {
 });
 
 describe("launcher: auto runs on Node (AUTO_PREFERS_OAM = false, as shipped)", () => {
-  // oam 0.20.2's node:crypto has no ed25519, x25519 or SEC1 EC signing, so the
-  // default must not land on oam. Every case runs the UNPATCHED launcher.
+  // oam 0.20.2's node:crypto gaps (YawLabs/oam#489) cost ssh2 its ed25519,
+  // curve25519 and ECDSA key-file support, so the default must not land on oam.
+  // Every case runs the UNPATCHED launcher.
   const TIMEOUT_MS = 45_000;
   const NOT_USED =
-    /^ssh-mcp: OAM_BIN is set but not used: the default runtime is Node until oam supports .*Set SSH_MCP_RUNTIME=oam to run on it\.$/m;
+    /^ssh-mcp: OAM_BIN is set but not used: the default runtime is Node until oam can run ssh2's ed25519, curve25519 and ECDSA key support \(YawLabs\/oam#489\)\. Set SSH_MCP_RUNTIME=oam to run on it\.$/m;
 
   for (const mode of ["auto", "AUTO", "bogus"]) {
     it(`serves on Node in-process past a usable OAM_BIN, and says it was not used (SSH_MCP_RUNTIME=${mode})`, () => {
@@ -866,7 +868,7 @@ describe("launcher: auto runs on Node (AUTO_PREFERS_OAM = false, as shipped)", (
       expect(payload.oam).toBeNull();
       expect(payload.args).toEqual(["extra"]);
       expect(r.stderr).toMatch(
-        /^ssh-mcp: this process is oam 0\.20\.2, and the default runtime is Node until oam supports .*\(SSH_MCP_RUNTIME=oam to stay on oam\); running on .*node(\.exe)? instead\.$/m,
+        /^ssh-mcp: this process is oam 0\.20\.2, and the default runtime is Node until oam can run ssh2's ed25519, curve25519 and ECDSA key support \(YawLabs\/oam#489; SSH_MCP_RUNTIME=oam to stay on oam\); running on .*node(\.exe)? instead\.$/m,
       );
     },
     TIMEOUT_MS,

@@ -330,7 +330,7 @@ for (const check of report.checks) {
 
 The `ssh-mcp` command — what `npx @yawlabs/ssh-mcp` runs — is a small launcher. It runs the server on Node by default. The [oam](https://oamjs.org) runtime is opt-in, with `SSH_MCP_RUNTIME=oam`; its minimum is the **latest oam release, currently 0.20.2**, and the launcher never serves on an older oam.
 
-The default used to prefer oam whenever a usable one was installed. It is Node until oam can do ed25519, x25519 and SEC1 EC key signing: on oam 0.20.2 ed25519 and ECDSA key files and ed25519-only servers do not work (see [Known limits on oam 0.20.2](#known-limits-on-oam-0202)).
+The default used to prefer oam whenever a usable one was installed. It is Node until oam closes the `node:crypto` gaps tracked in [YawLabs/oam#489](https://github.com/YawLabs/oam/issues/489): on oam 0.20.2 ed25519 and ECDSA key files and ed25519-only servers do not work (see [Known limits on oam 0.20.2](#known-limits-on-oam-0202)).
 
 Two environment variables control the choice; set them in your MCP client's `env` block:
 
@@ -354,7 +354,14 @@ Whenever an oam host starts a child (the handoffs above), the launcher removes `
 
 ### Known limits on oam 0.20.2
 
-oam 0.20.2's `node:crypto` has no `crypto.diffieHellman` and no x25519 key generation, so ssh2 turns off both its ed25519 and its curve25519 support there. Measured with this package's ssh2 against a local ssh2 server, each case below works on Node 22 and fails on oam 0.20.2:
+Four `node:crypto` gaps in oam 0.20.2 are behind these, tracked in [YawLabs/oam#489](https://github.com/YawLabs/oam/issues/489):
+
+- `crypto.verify` throws when it is given an Ed25519 private key. ssh2 decides whether it supports ed25519 by signing and then verifying with a private key, so on oam it turns ed25519 off altogether. oam itself can generate ed25519 keys, sign with them and verify with the public key; this one call is what disables ed25519 in ssh2.
+- `crypto.diffieHellman` does not exist, so ssh2 does not offer curve25519 key exchange.
+- x25519 key pairs cannot be generated, which curve25519 key exchange would need as well.
+- Signing with a SEC1 (`EC PRIVATE KEY`) key throws, and that is the form ssh2 converts an ECDSA key file to before signing.
+
+Measured with this package's ssh2 against a local ssh2 server, each case below works on Node 22 and fails on oam 0.20.2:
 
 - **An ed25519 private key file** — the connection is refused before it starts: `Cannot parse privateKey: Unsupported OpenSSH private key type: ssh-ed25519`. This applies to the key file ssh-mcp picks up on its own (the first usable `IdentityFile`, or `~/.ssh/id_ed25519`) as well as to `privateKeyPath`, and it fails the connection even when an agent is also offered.
 - **An ECDSA private key file** — authentication fails: `Error signing data with key: SEC1 EC private key format not supported; use PKCS#8`.
