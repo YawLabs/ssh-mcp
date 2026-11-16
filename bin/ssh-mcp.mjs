@@ -111,7 +111,7 @@
  * releases are dns, os, error-shape and argv-parsing fixes plus POSIX extra-fd pipe
  * and EINTR fixes (oam CHANGELOG).
  *
- * Moving on through the 0.20 line needed no change here. Its fixes are rsa /
+ * Moving on through the 0.20 line changed no code here. Its fixes are rsa /
  * Diffie-Hellman in node:crypto, --max-old-space-size, napi, os.networkInterfaces,
  * cluster, and on Windows a GUI child now opening hidden under `windowsHide` and a
  * spawnSync child joining the kill-on-close job before it runs (oam CHANGELOG
@@ -121,6 +121,24 @@
  * 0.20.2, an ssh2 client completed a connection and an exec against a local ssh2
  * server with an RSA host key (rsa-sha2-512) over both ecdh-sha2-nistp256, which
  * is what ssh2 negotiates by default on oam, and diffie-hellman-group14-sha256.
+ * Password auth and an RSA private key file both worked, as did password auth
+ * against an ECDSA host key.
+ *
+ * KNOWN LIMITS ON 0.20.2 -- that measurement is NOT "ssh works on oam". oam
+ * 0.20.2 has no crypto.diffieHellman and no x25519 key generation, so ssh2's
+ * eddsaSupported and curve25519Supported probes (ssh2 lib/protocol/constants.js)
+ * are both false. Measured against the same local server, fine on Node 22 and
+ * failing on oam 0.20.2:
+ *   - an ed25519 private key file: connect() throws "Cannot parse privateKey:
+ *     Unsupported OpenSSH private key type: ssh-ed25519", agent or not;
+ *   - an ECDSA private key file: "Error signing data with key: SEC1 EC private
+ *     key format not supported; use PKCS#8";
+ *   - a server whose only host key is ed25519: "Handshake failed: no matching
+ *     host key format" (ssh-ed25519 is absent from ssh2's host key list there).
+ * ssh2 cannot parse an ed25519 PUBLIC key on oam either, so an ed25519 key in
+ * the agent is not expected to work (not measured end to end). Whether 0.19.5
+ * behaved the same was not measured. `auto` still prefers oam regardless; the
+ * README (Known limits on oam 0.20.2) tells users to set SSH_MCP_RUNTIME=node.
  *
  * Background, long before the current floor: before 0.9.0
  * `child_process.execFile` ran its arguments through a SHELL, `exec` accepted

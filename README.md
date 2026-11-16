@@ -207,7 +207,7 @@ If you don't trust the agent's `env` values at all, the simplest mitigation is t
 
 On Windows, ssh-mcp uses the OpenSSH Authentication Agent's `\\.\pipe\openssh-ssh-agent` named pipe automatically when `SSH_AUTH_SOCK` is not set. No `SSH_AUTH_SOCK` needed — just make sure the OpenSSH agent service is running.
 
-On the [oam](https://oamjs.org) runtime, the launcher serves only on oam 0.20.2 or newer. Agent auth needs a `net` that can dial a named pipe or a Unix socket (that is how ssh2 reaches the agent), which older oam releases could not do. On oam 0.20.2 (Windows) the MCP handshake, `ssh_config_lookup`, `ssh_key_list` and `ssh_agent_ensure` were verified through the launcher, and ssh2's own agent client was verified dialing a named pipe and completing an identities request (against a stand-in agent on a pipe). An agent-only `ssh_exec` end to end has so far been verified on Node only. If agent auth fails on oam, set `SSH_MCP_RUNTIME=node` to rule the runtime out.
+On the [oam](https://oamjs.org) runtime, the launcher serves only on oam 0.20.2 or newer. Agent auth needs a `net` that can dial a named pipe or a Unix socket (that is how ssh2 reaches the agent), which older oam releases could not do. On oam 0.20.2 (Windows) the MCP handshake, `ssh_config_lookup`, `ssh_key_list` and `ssh_agent_ensure` were verified through the launcher, and ssh2's own agent client was verified dialing a named pipe and completing an identities request (against a stand-in agent on a pipe). An agent-only `ssh_exec` end to end has so far been verified on Node only. If agent auth fails on oam, set `SSH_MCP_RUNTIME=node` to rule the runtime out. ed25519 and ECDSA keys and ed25519-only servers do not work on oam 0.20.2 at all — see [Known limits on oam 0.20.2](#known-limits-on-oam-0202).
 
 `ssh_agent_ensure` and `ssh_diagnose` probe that pipe and tell you if the service is down. Remote operations do *not*: they assume the pipe and let the connection fail on its own if the agent isn't there. That is why a stopped agent service shows up as an auth failure rather than an "agent not running" error until you run the diagnostic tools.
 
@@ -349,6 +349,19 @@ When the launcher is itself started by oam (`oam run <path>/bin/ssh-mcp.mjs`, wh
 - With `SSH_MCP_RUNTIME=node` it hands the server off to Node on `PATH`, whatever the oam version.
 
 Whenever an oam host starts a child (the handoffs above), the launcher removes `--permission` and `--allow-*` flags from the child's inherited `NODE_OPTIONS`. oam (since 0.18.0) adds its own permission flags to every child's `NODE_OPTIONS`, and Node refuses some of them there (`--allow-net is not allowed in NODE_OPTIONS`, exit 9); this server is not sandboxed, so there is nothing to pass on. An oam that was itself started with `--permission` re-adds the flags inside `spawn()`, which the launcher cannot undo, so do not start it that way.
+
+### Known limits on oam 0.20.2
+
+oam 0.20.2's `node:crypto` has no `crypto.diffieHellman` and no x25519 key generation, so ssh2 turns off both its ed25519 and its curve25519 support there. Measured with this package's ssh2 against a local ssh2 server, each case below works on Node 22 and fails on oam 0.20.2:
+
+- **An ed25519 private key file** — the connection is refused before it starts: `Cannot parse privateKey: Unsupported OpenSSH private key type: ssh-ed25519`. This applies to the key file ssh-mcp picks up on its own (the first usable `IdentityFile`, or `~/.ssh/id_ed25519`) as well as to `privateKeyPath`, and it fails the connection even when an agent is also offered.
+- **An ECDSA private key file** — authentication fails: `Error signing data with key: SEC1 EC private key format not supported; use PKCS#8`.
+- **A server whose only host key is ed25519** — `Handshake failed: no matching host key format`.
+- **An ed25519 key held in the agent** — ssh2 cannot parse an ed25519 public key on oam (`Unsupported key format`), so it is not expected to be usable; this one was not measured end to end.
+
+What was measured working on oam 0.20.2: password auth and an RSA private key file, against servers with an RSA or ECDSA host key, over `ecdh-sha2-nistp256` (curve25519 key exchange is not offered).
+
+The launcher does not check for any of this: in `auto` mode it still prefers an oam at or above the floor. If your keys or servers are in the list above, set `SSH_MCP_RUNTIME=node`.
 
 For example, to always run on Node:
 
