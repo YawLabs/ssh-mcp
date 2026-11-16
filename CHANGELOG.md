@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.5] — 2026-11-16
+
 ### Fixed
 - **The stated cause of the oam 0.20.2 key limits was partly wrong; corrected in the README, the launcher's comments and its two stderr notes.** The 0.18.3 and 0.18.4 notes below, and the docs shipped with them, say ssh2 loses ed25519 on oam because `node:crypto` there has no `crypto.diffieHellman` and no x25519 key generation. Measured since: what turns off ssh2's ed25519 support is that `crypto.verify` throws when given an Ed25519 private key, which is the probe ssh2 runs at load; oam itself generates ed25519 keys, signs with them and verifies with the public key. The missing `crypto.diffieHellman` and x25519 key pairs are real and cost curve25519 key exchange only, and the SEC1 EC signing gap is what breaks ECDSA key files. All four are tracked in [YawLabs/oam#489](https://github.com/YawLabs/oam/issues/489). What fails on oam 0.20.2 is as already listed and nothing in the launcher's behaviour changes: the default runtime is still Node, and the two stderr notes now name that issue instead of "until oam supports ed25519, x25519 and SEC1 EC keys".
 
