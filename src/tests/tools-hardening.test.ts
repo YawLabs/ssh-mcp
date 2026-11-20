@@ -238,34 +238,40 @@ describe("whitelist rejection explains the env-prefix footgun", () => {
     );
   });
 
-  it("the suggested tolerant pattern is TAIL-anchored (it must not admit ls-prefixed commands)", () => {
+  it("the suggested pattern names the variable and pins the whole command", () => {
     // This message is the one place an operator sees this advice -- at the moment their
-    // working whitelist starts failing -- so the pattern it hands them has to be safe to
-    // paste. Without the trailing `( |$)` it is a prefix match: `^(...)*ls` also admits
-    // `lsof -i` and `ls; <anything>`, silently converting a tight whitelist into one that
-    // permits any command merely PREFIXED by `ls`. README.md documents the anchored form.
-    const source = suggestedPattern();
-    expect(source.endsWith("( |$)")).toBe(true);
-
-    const suggested = new RegExp(source);
-    // Still allows what it is meant to allow.
-    expect(suggested.test("ls")).toBe(true);
-    expect(suggested.test("ls -la")).toBe(true);
+    // working whitelist starts failing -- and following it requires the opt-out that turns
+    // the shell-syntax check off, so the pattern alone has to be safe to paste.
+    const suggested = new RegExp(suggestedPattern());
+    // Still allows what it is meant to allow, including shellQuote's apostrophe form.
     expect(suggested.test("FOO='x' ls")).toBe(true);
-    expect(suggested.test("FOO='x' BAR='y' ls -la")).toBe(true);
-    // ...and rejects the two shapes an un-anchored version let through.
-    expect(suggested.test("ls; rm -rf /")).toBe(false);
-    expect(suggested.test("lsof -i")).toBe(false);
+    expect(suggested.test("FOO='x' ls -la /var/log")).toBe(true);
+    expect(suggested.test("FOO='O'\\''Brien' ls")).toBe(true);
+    // ...and refuses everything the previous `^(NAME=...)*ls( |$)` suggestion let through.
     expect(suggested.test("FOO='x' ls; rm -rf /")).toBe(false);
+    expect(suggested.test("FOO='x' ls $(reboot)")).toBe(false);
+    expect(suggested.test("FOO='x' lsof -i")).toBe(false);
+    expect(suggested.test("LD_PRELOAD='/tmp/x.so' ls")).toBe(false);
+    expect(suggested.test("PATH='/tmp' ls")).toBe(false);
   });
 
   it("the suggested pattern really does gate enforcePolicy when configured verbatim", () => {
-    // End-to-end: paste it into SSH_MCP_COMMAND_WHITELIST and the dangerous command is
-    // blocked while the intended one passes.
+    // End-to-end: paste it in with the opt-out it requires, and the intended call passes
+    // while the dangerous ones are blocked by the pattern alone.
     vi.stubEnv("SSH_MCP_COMMAND_WHITELIST", suggestedPattern());
+    vi.stubEnv("SSH_MCP_COMMAND_ALLOW_SHELL_SYNTAX", "1");
     expect(() => enforcePolicy("FOO='x' ls -la", { envPrefixApplied: true })).not.toThrow();
-    expect(() => enforcePolicy("ls; rm -rf /")).toThrow(/SSH_MCP_COMMAND_WHITELIST/);
-    expect(() => enforcePolicy("lsof -i")).toThrow(/SSH_MCP_COMMAND_WHITELIST/);
+    expect(() => enforcePolicy("FOO='x' ls; rm -rf /")).toThrow(/SSH_MCP_COMMAND_WHITELIST/);
+    expect(() => enforcePolicy("LD_PRELOAD='x' ls")).toThrow(/SSH_MCP_COMMAND_WHITELIST/);
+  });
+
+  it("ssh_multi_exec refuses env under a prefix-tolerant whitelist before any host", async () => {
+    vi.stubEnv("SSH_MCP_COMMAND_WHITELIST", "^([A-Za-z_][A-Za-z0-9_]*='[^']*' )*ls( |$)");
+    const { handler } = getTool("ssh_multi_exec");
+    await expect(handler({ hosts: ["a.test"], command: "ls", env: { LD_PRELOAD: "/tmp/x.so" } })).rejects.toThrow(
+      /variable assignment/,
+    );
+    expect(execSpy).not.toHaveBeenCalled();
   });
 
   it("a blacklist rejection is unaffected by the flag", () => {
@@ -616,17 +622,16 @@ describe("the suggested tolerant pattern matches shellQuote's escaped-apostrophe
 
   it("the suggested pattern matches an env prefix whose value contains an apostrophe", () => {
     const suggested = new RegExp(suggestedPattern());
-    expect(suggested.test(`NAME=${shellQuote(APOSTROPHE_VALUE)} ls`)).toBe(true);
-    expect(suggested.test(`NAME=${shellQuote(APOSTROPHE_VALUE)} ls -la`)).toBe(true);
-    // Several apostrophes, and a mix of escaped and plain values.
-    expect(suggested.test(`A=${shellQuote("a'b'c")} B=${shellQuote("plain")} ls -l`)).toBe(true);
+    expect(suggested.test(`FOO=${shellQuote(APOSTROPHE_VALUE)} ls`)).toBe(true);
+    expect(suggested.test(`FOO=${shellQuote(APOSTROPHE_VALUE)} ls -la`)).toBe(true);
+    expect(suggested.test(`FOO=${shellQuote("a'b'c")} ls -l`)).toBe(true);
   });
 
   it("widening the value group did NOT widen what commands are allowed", () => {
     const suggested = new RegExp(suggestedPattern());
     // The apostrophe form only ever tolerates the PREFIX; the command verb is still gated.
-    expect(suggested.test(`NAME=${shellQuote(APOSTROPHE_VALUE)} reboot`)).toBe(false);
-    expect(suggested.test(`NAME=${shellQuote(APOSTROPHE_VALUE)} ls; reboot`)).toBe(false);
+    expect(suggested.test(`FOO=${shellQuote(APOSTROPHE_VALUE)} reboot`)).toBe(false);
+    expect(suggested.test(`FOO=${shellQuote(APOSTROPHE_VALUE)} ls; reboot`)).toBe(false);
     expect(suggested.test("lsof -i")).toBe(false);
   });
 
@@ -646,43 +651,37 @@ describe("the suggested tolerant pattern matches shellQuote's escaped-apostrophe
 
   it("gates enforcePolicy end-to-end when the apostrophe-carrying call is made for real", async () => {
     vi.stubEnv("SSH_MCP_COMMAND_WHITELIST", suggestedPattern());
+    vi.stubEnv("SSH_MCP_COMMAND_ALLOW_SHELL_SYNTAX", "1");
     const { handler } = getTool("ssh_exec");
     // Previously this threw: the operator's whitelist rejected its own documented use case.
-    await handler({ ...baseConn, command: "ls -la", env: { NAME: APOSTROPHE_VALUE } });
-    expect(recorder.commands).toEqual([`NAME=${shellQuote(APOSTROPHE_VALUE)} ls -la`]);
+    await handler({ ...baseConn, command: "ls -la", env: { FOO: APOSTROPHE_VALUE } });
+    expect(recorder.commands).toEqual([`FOO=${shellQuote(APOSTROPHE_VALUE)} ls -la`]);
   });
 });
 
-describe("command policy fails CLOSED when no pattern in a configured list compiles", () => {
+describe("command policy fails CLOSED when any pattern in a configured list is malformed", () => {
   // The whole-list-malformed case used to fail OPEN: parsePatterns skipped every bad pattern,
   // the empty result read as "no policy configured", and an arbitrary command was allowed.
-  // One typo in a single-pattern whitelist silently disabled the whitelist.
-  let errSpy: ReturnType<typeof vi.spyOn>;
-
-  beforeEach(() => {
-    errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
-  });
-  afterEach(() => {
-    errSpy.mockRestore();
-  });
+  // A single bad entry among good ones was dropped too, so a deny rule could silently vanish.
 
   it("an all-malformed WHITELIST blocks instead of allowing", () => {
     vi.stubEnv("SSH_MCP_COMMAND_WHITELIST", "(unclosed");
     expect(() => enforcePolicy("cat /etc/shadow")).toThrow(/MISCONFIGURED/);
   });
 
-  it("the error names the variable, the offending pattern, and that it is not in effect", () => {
+  it("the error names the variable and the offending pattern", () => {
     vi.stubEnv("SSH_MCP_COMMAND_WHITELIST", "(unclosed");
-    expect(() => enforcePolicy("ls")).toThrow(/SSH_MCP_COMMAND_WHITELIST/);
-    expect(() => enforcePolicy("ls")).toThrow(/NOT IN EFFECT/);
+    expect(() => enforcePolicy("ls")).toThrow(/SSH_MCP_COMMAND_WHITELIST could not be fully compiled/);
     expect(() => enforcePolicy("ls")).toThrow(/Malformed pattern\(s\): "\(unclosed"/);
     // An operator must be able to act on one read: it says the calls are refused until fixed.
     expect(() => enforcePolicy("ls")).toThrow(/until it is fixed/);
   });
 
   it("names EVERY offending pattern when several are malformed", () => {
-    vi.stubEnv("SSH_MCP_COMMAND_WHITELIST", "(unclosed,[bad,*nope");
-    expect(() => enforcePolicy("ls")).toThrow(/"\(unclosed", "\[bad", "\*nope"/);
+    vi.stubEnv("SSH_MCP_COMMAND_WHITELIST", "(unclosed,+bad,*nope");
+    for (const entry of [/"\(unclosed"/, /"\+bad"/, /"\*nope"/]) {
+      expect(() => enforcePolicy("ls")).toThrow(entry);
+    }
   });
 
   it("an all-malformed BLACKLIST also fails closed (it silently protected nothing before)", () => {
@@ -718,26 +717,33 @@ describe("command policy fails CLOSED when no pattern in a configured list compi
     expect(() => enforcePolicy("ls")).toThrow(/only separators/);
   });
 
-  it("a whitespace-only value is still treated as unset, not as a misconfiguration", () => {
-    // Matches isPolicyConfigured()'s own trim test -- it reports false here, so enforcement
-    // must agree and allow through rather than block every call.
+  it("a whitespace-only value fails closed too, not silently unset", () => {
+    // The var IS set, so isPolicyConfigured() reports it as configured. Reading it as
+    // "unset" here let a stray keystroke turn policy off while the operator was told one
+    // was running -- the same fail-open the separator-only case closes.
     vi.stubEnv("SSH_MCP_COMMAND_WHITELIST", "   ");
-    expect(() => enforcePolicy("anything at all")).not.toThrow();
+    expect(() => enforcePolicy("anything at all")).toThrow(/MISCONFIGURED/);
+    expect(() => enforcePolicy("anything at all")).toThrow(/whitespace only/);
   });
 
-  it("ONE malformed pattern among valid ones is still skipped, not fatal", () => {
-    // The fix must not over-reach: a typo next to working patterns keeps the working ones.
+  it("a loose quantifier that new RegExp accepts is refused too", () => {
+    // `new RegExp("a{1,2")` compiles as the literal `a{1,2`, so no SyntaxError fires and
+    // the deny silently stops matching while policy reads as in effect.
+    vi.stubEnv("SSH_MCP_COMMAND_BLACKLIST", "^rm -rf,a{1,2");
+    expect(() => enforcePolicy("anything at all")).toThrow(/MISCONFIGURED/);
+    expect(() => enforcePolicy("anything at all")).toThrow(/quantifier/);
+    // A well-formed quantifier still compiles and enforces.
+    vi.stubEnv("SSH_MCP_COMMAND_BLACKLIST", "^rm -rf,a{1,2}");
+    expect(() => enforcePolicy("rm -rf /")).toThrow(/BLACKLIST/);
+    expect(() => enforcePolicy("ls")).not.toThrow();
+  });
+
+  it("ONE malformed pattern among valid ones is fatal too", () => {
     vi.stubEnv("SSH_MCP_COMMAND_WHITELIST", "(unclosed,^df");
-    expect(() => enforcePolicy("df -h")).not.toThrow();
-    expect(() => enforcePolicy("rm foo")).toThrow(/does not match any pattern/);
-    expect(() => enforcePolicy("rm foo")).not.toThrow(/MISCONFIGURED/);
-    expect(errSpy).toHaveBeenCalled();
-  });
-
-  it("still logs the skipped pattern to stderr (stdout is JSON-RPC)", () => {
-    vi.stubEnv("SSH_MCP_COMMAND_WHITELIST", "(unclosed");
-    expect(() => enforcePolicy("ls")).toThrow();
-    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("(unclosed"));
+    expect(() => enforcePolicy("df -h")).toThrow(/MISCONFIGURED/);
+    vi.stubEnv("SSH_MCP_COMMAND_WHITELIST", "");
+    vi.stubEnv("SSH_MCP_COMMAND_BLACKLIST", "^reboot,(unclosed");
+    expect(() => enforcePolicy("df -h")).toThrow(/MISCONFIGURED/);
   });
 
   it("ssh_exec refuses the call and contacts no host", async () => {

@@ -15,6 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **A whitelist match no longer lets the rest of the line through.** `^ls( |$)`, the shape the old `env` rejection recommended, admitted `ls ; <anything>` and `ls $(<anything>)`. While `SSH_MCP_COMMAND_WHITELIST` is active, a matching command is now refused if it contains shell control syntax (`;` `&` `|` backtick `$(` `${` `$[` `@{` `(` `)` `<` `>` or a line break, even inside quotes; `@{` is a PowerShell hash literal, which runs its values) or starts with a variable assignment such as `LD_PRELOAD=...` or `PATH=...`. **Breaking:** whitelisted commands that use these, and any `env` parameter under a whitelist, are now refused. `SSH_MCP_COMMAND_ALLOW_SHELL_SYNTAX=1` restores pattern-only matching.
+- **Pattern lists no longer split inside a regex.** Commas in `[,]`, `\,` and `{m,n}` stay in the pattern. Splitting them broke the documented `[,]` form: `^foo[,]bar$` became a dropped `^foo[` plus a live `]bar$`, which allowed `reboot # ]bar`. **Breaking:** an entry like `a{1,3}` now means the quantifier, not the two patterns `a{1` and `3}`.
+- **Any malformed policy entry now fails closed.** One bad entry used to be dropped with a stderr warning, so a broken deny entry silently stopped blocking. A character class that may have swallowed a separator counts as malformed: `^rm[,^reboot,^mkfs[.]` would otherwise compile as one pattern. **Breaking:** every `ssh_exec` and `ssh_multi_exec` call is refused, with an error naming the entry, until it is fixed. A class such as `[a,b]` must now be written `[a\,b]`.
+
+### Changed
+- **Breaking:** a whitespace-only `SSH_MCP_COMMAND_WHITELIST` / `SSH_MCP_COMMAND_BLACKLIST` value (`"   "`) now
+  fails closed -- every `ssh_exec` and `ssh_multi_exec` call is refused with a MISCONFIGURED error -- instead of
+  being read as unset. To disable a policy, unset the variable rather than blank it.
+- The README's policy examples no longer allow `find`, `cat` or `tail` by prefix: `find -exec`, `awk` `system()`, `tar` checkpoint actions and pipes to `curl` got through them. It now states that regex policy is a guard rail rather than a security boundary, covers only the two exec tools, and that denylists are best effort. The exec tool descriptions and server instructions say the same.
+
 ## [0.18.6] — 2026-11-16
 
 ### Changed

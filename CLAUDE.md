@@ -43,6 +43,7 @@ MCP server that makes SSH work for AI tools. 21 tools across 4 categories: SSH e
 - **Host-key algorithms are ordered, never restricted.** `hostKeyAlgorithmOrder` (ssh.ts) permutes ssh2's own `DEFAULT_SERVER_HOST_KEY` so algorithms present in known_hosts negotiate first, matching OpenSSH. It is built from ssh2's list via a deep `createRequire` and returns null if that ever fails, so no reachable host can become unconnectable. Never replace it with a hardcoded list — ssh2 throws "Unsupported algorithm" on an entry it does not know.
 - **Command policy covers `ssh_exec` and `ssh_multi_exec` ONLY.** The SFTP mutation tools (`ssh_write_file`, `ssh_upload`, `ssh_mkdir`, `ssh_delete`) are NOT gated, so a `^rm` blacklist is not whole-server coverage. See the SCOPE LIMIT block in policy.ts.
 - **Policy is enforced against the env-PREFIXED command**, so a `^`-anchored whitelist stops matching once `env` is used. Deliberate and pinned by `src/tests/exec-env-policy.test.ts`; the rejection message explains it when it bites.
+- **Policy is a guard rail, not a security boundary.** Denylists are best effort (`/bin/rm`, `\rm`, `r''m` evade `^rm `). While a whitelist is active, a matching command is still refused for shell control syntax or a leading variable assignment (including the `env` prefix) unless `SSH_MCP_COMMAND_ALLOW_SHELL_SYNTAX=1`. The syntax scan is deliberately quote-blind: the remote shell is unknown and shells disagree about quoting, so do not "improve" it into a quote-aware parser. Any malformed entry in either list fails closed.
 
 ## Commands
 
