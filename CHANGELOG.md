@@ -15,6 +15,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **A whitelist match no longer lets the rest of the line through.** `^ls( |$)`, the shape the old `env` rejection recommended, admitted `ls ; <anything>` and `ls $(<anything>)`. While `SSH_MCP_COMMAND_WHITELIST` is active, a matching command is now refused if it contains shell control syntax (`;` `&` `|` backtick `$(` `${` `$[` `@{` `(` `)` `<` `>` or a line break, even inside quotes; `@{` is a PowerShell hash literal, which runs its values) or starts with a variable assignment such as `LD_PRELOAD=...` or `PATH=...`. **Breaking:** whitelisted commands that use these, and any `env` parameter under a whitelist, are now refused. `SSH_MCP_COMMAND_ALLOW_SHELL_SYNTAX=1` restores pattern-only matching.
+- **Pattern lists no longer split inside a regex.** Commas in `[,]`, `\,` and `{m,n}` stay in the pattern. Splitting them broke the documented `[,]` form: `^foo[,]bar$` became a dropped `^foo[` plus a live `]bar$`, which allowed `reboot # ]bar`. **Breaking:** an entry like `a{1,3}` now means the quantifier, not the two patterns `a{1` and `3}`.
+- **Any malformed policy entry now fails closed.** One bad entry used to be dropped with a stderr warning, so a broken deny entry silently stopped blocking. A character class that may have swallowed a separator counts as malformed: `^rm[,^reboot,^mkfs[.]` would otherwise compile as one pattern. **Breaking:** every `ssh_exec` and `ssh_multi_exec` call is refused, with an error naming the entry, until it is fixed. A class such as `[a,b]` must now be written `[a\,b]`.
+
+### Changed
+- **Breaking:** a whitespace-only `SSH_MCP_COMMAND_WHITELIST` / `SSH_MCP_COMMAND_BLACKLIST` value (`"   "`) now
+  fails closed -- every `ssh_exec` and `ssh_multi_exec` call is refused with a MISCONFIGURED error -- instead of
+  being read as unset. To disable a policy, unset the variable rather than blank it.
+- The README's policy examples no longer allow `find`, `cat` or `tail` by prefix: `find -exec`, `awk` `system()`, `tar` checkpoint actions and pipes to `curl` got through them. It now states that regex policy is a guard rail rather than a security boundary, covers only the two exec tools, and that denylists are best effort. The exec tool descriptions and server instructions say the same.
+
+### Fixed
+- **An escaped brace no longer reads as a loose quantifier.** The malformed-entry refusal tells the operator to "escape the brace as `\{`", but following that advice reproduced the identical refusal: the scan advanced past the backslash only and re-read the `{` as a quantifier, so a valid literal-brace pattern such as `a\{1,2` (and `^a\\{1,2$`) failed closed. The scan now consumes the backslash with the character it escapes, which also fixes a `\]` inside a class being read as the class end (a well-formed `^[a\]b{2]$` was refused).
+- **`env LD_PRELOAD=... ls` and `export PATH=... ls` are now refused under a whitelist.** The leading-assignment check anchored on `NAME=`, so the `env` / `export` spellings -- the same redirection by another name -- passed any pattern loose enough to match the command (`env LD_PRELOAD=/tmp/x.so ls` matched a bare `ls` whitelist). A leading `export ` or `env ` keyword is now treated as an assignment.
+- **`SSH_MCP_COMMAND_ALLOW_SHELL_SYNTAX` is validated whenever a policy is configured,** not only under a whitelist. Under a blacklist-only config an unrecognized value (`yes`) was silently accepted, and the setting meant to control enforcement silently stopped meaning anything. It stays inert when no policy is set.
+- **The README states that the `[,]` class form is refused in a multi-entry list.** `^foo[,]bar$` works as a single pattern but must be `^foo[\,]bar$` (or kept in its own variable) beside another entry, because an unescaped comma in a class is refused as soon as a sibling follows -- the rule that catches the real swallow `^rm[abc,>],^df`.
+
 ## [0.18.6] — 2026-11-16
 
 ### Changed

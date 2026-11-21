@@ -195,10 +195,22 @@ describe("ssh_exec policy enforced against the env-PREFIXED command (gap 2)", ()
     expect(recorder.command).toBe("ls");
   });
 
-  it("a whitelist that anticipates the prefix (^[A-Z_]+='[^']*' ls) DOES match the prefixed command", async () => {
+  it("a whitelist that tolerates the prefix still cannot admit env by default", async () => {
+    // A generic NAME= pattern would otherwise let LD_PRELOAD or PATH redirect `ls`.
+    vi.stubEnv("SSH_MCP_COMMAND_WHITELIST", "^([A-Za-z_][A-Za-z0-9_]*='[^']*' )*ls( |$)");
+    const { handler } = await getExecHandler();
+    await expect(handler({ ...baseConn, command: "ls", env: { LD_PRELOAD: "/tmp/x.so" } })).rejects.toThrow(
+      /variable assignment.*Remove the `env` parameter/,
+    );
+    await expect(handler({ ...baseConn, command: "ls", env: { PATH: "/tmp" } })).rejects.toThrow(/variable assignment/);
+    expect(execSpy).not.toHaveBeenCalled();
+  });
+
+  it("with the opt-out, a pattern naming the variable DOES match the prefixed command", async () => {
     // Shows the footgun is escapable: an admin who knows the prefix shape can write a
     // pattern that allows it. This pins the exact env-prefixed string the policy sees.
     vi.stubEnv("SSH_MCP_COMMAND_WHITELIST", "^FOO='x' ls$,^ls$");
+    vi.stubEnv("SSH_MCP_COMMAND_ALLOW_SHELL_SYNTAX", "1");
     const { handler } = await getExecHandler();
     await expect(handler({ ...baseConn, command: "ls", env: { FOO: "x" } })).resolves.toBeDefined();
     expect(recorder.command).toBe("FOO='x' ls");

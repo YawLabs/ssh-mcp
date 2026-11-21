@@ -36,7 +36,7 @@ export const SERVER_INSTRUCTIONS = [
   "- The SFTP tools take absolute remote paths (ssh_mkdir also accepts a relative one); ~ is not expanded.",
   "- Host keys: a host already in known_hosts must match. An unknown host is trusted on every connection unless strict mode (SSH_MCP_STRICT_HOSTKEYS=1) is on; add it with ssh_known_hosts_fix first.",
   "- On Windows the agent is the OpenSSH Authentication Agent service pipe; if agent auth fails, ssh_agent_ensure checks that the agent is reachable.",
-  "- SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST gate only ssh_exec and ssh_multi_exec, not the SFTP write and delete tools.",
+  "- SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST gate only ssh_exec and ssh_multi_exec, not the SFTP write and delete tools, and are a best-effort guard rail rather than a security boundary. Under a whitelist, run one plain command: shell control syntax and leading variable assignments, including the env parameter, are refused by default.",
 ].join("\n");
 
 export function createServer(pool?: ConnectionPool): McpServer {

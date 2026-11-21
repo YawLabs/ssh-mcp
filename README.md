@@ -154,15 +154,38 @@ The diagnostic tools (`ssh_test`, `ssh_diagnose`) use `StrictHostKeyChecking=no`
 
 When both are set, the command must pass both checks (whitelist first, then blacklist). When neither is set (the default), all commands are allowed.
 
-Patterns are JavaScript regexes. Use `^` and `$` for anchored matches; otherwise patterns are treated as substring matches. Commas are the delimiter, so a literal comma in a pattern needs to be expressed as `\x2c` or via a character class.
+**This is a guard rail, not a security boundary.** A regex over a string that a remote shell will interpret can catch an agent going off-script; it cannot contain a hostile one. It covers only `ssh_exec` and `ssh_multi_exec`: the SFTP tools are not gated at all (see [Scope](#scope-policy-covers-ssh_exec-and-ssh_multi_exec-only)). An agent that also has a shell and the credential can bypass any control in this server. If you need a real boundary, enforce it on the remote host: a restricted account, a forced command in `authorized_keys`, sudo rules, or filesystem permissions.
+
+Patterns are JavaScript regexes. Use `^` and `$` for anchored matches; otherwise patterns are treated as substring matches. Commas separate patterns, except a comma inside a character class (`[,]`), an escaped comma (`\,`), or one in a `{m,n}` quantifier, which all stay part of the pattern. Any other literal comma, including one inside a group, must be written `\,`, `[,]` or `\x2c`. **In a list of more than one pattern, write a literal comma as `\,` (`[a\,b]`) rather than `[,]`**: an unescaped comma in a class is refused whenever another entry follows, so `^foo[,]bar$` works alone but must be `^foo[\,]bar$` (or kept as its own single-pattern variable) beside `^df$`.
+
+**A malformed entry blocks everything.** If any entry in either variable fails to compile, every `ssh_exec` and `ssh_multi_exec` call is refused with an error naming the entry, until you fix or unset the variable. The same applies to a character class that may have swallowed a separator: a class holding an unescaped comma is refused when its content suggests a swallowed separator (an unescaped `[` before the comma, or a letter, digit, `_`, `^`, `[` or another comma after it) or when another entry follows the class, because `^rm[,^reboot,^mkfs[.]` and `^rm[abc,>],^df` would otherwise compile as one pattern and stop blocking `reboot` and `rm`. Escape the stray bracket as `\[`, or write a literal comma as `\,` (`[a\,b]`). This catches likely typos and is not a proof: `^rm[,>]` still reads as one class.
 
 ```bash
-# Read-only allowlist: only ls / df / cat / find / tail
-SSH_MCP_COMMAND_WHITELIST="^ls( .*)?,^df( .*)?,^cat ,^find ,^tail "
+# Allowlist: list directories, check disk space and uptime. Each pattern covers the whole line.
+SSH_MCP_COMMAND_WHITELIST='^ls( [A-Za-z0-9_./:=@%+-]+)*$,^df( -[A-Za-z]+)*$,^uptime$'
 
-# Block destructive ops even if your agent goes off-script
-SSH_MCP_COMMAND_BLACKLIST="^rm ,^shutdown,^reboot,^mkfs,^dd if=,>\s*/dev/"
+# Denylist: best effort only. Catches the obvious spellings of these commands, nothing more.
+SSH_MCP_COMMAND_BLACKLIST='^rm ,^shutdown,^reboot,^mkfs,^dd if=,>\s*/dev/'
 ```
+
+**While a whitelist is active, a matching command is still refused if it:**
+
+- contains shell control syntax anywhere, even inside quotes: `;` `&` `|` a backtick `$(` `${` `$[` `@{` `(` `)` `<` `>` or a line break. Quotes are not interpreted because the remote login shell is unknown and shells disagree about them. So `grep 'a|b' file` is refused too, and so is `git show HEAD@{1}`, because `@{` runs code in PowerShell.
+- starts with a variable assignment, such as `LD_PRELOAD=/tmp/x.so ls` or `PATH=/tmp ls`. This includes the prefix built from the `env` parameter.
+
+Set `SSH_MCP_COMMAND_ALLOW_SHELL_SYNTAX=1` (or `true`) to turn both checks off and go back to pattern-only matching. Each pattern is then responsible for the entire command, so anchor it at both ends as in the example above. Any value other than `1`, `true`, `0`, `false` or empty is rejected as a misconfiguration.
+
+**Choosing what to allow.** Only allow programs that cannot run other programs or write files with the arguments you permit. These look read-only and are not:
+
+- `find` runs commands and deletes files (`-exec`, `-execdir`, `-ok`, `-delete`, `-fprint`).
+- `awk` runs commands (`system()`, `| getline`) and writes files.
+- `tar` runs commands (`--checkpoint-action=exec=...`, `--to-command`, `--use-compress-program`).
+- `sed` (`e` command, `w`), `xargs`, `env`, `sudo`, `ssh`, `git` (`-c`, aliases, hooks), `less` and `vim` can also launch programs.
+- `cat`, `tail` and `head` run nothing, but read any file the account can read, including keys and credentials.
+
+A whitelist only sees the command text, so a broad pattern such as `^find ` allows all of the above.
+
+**Denylists are best effort.** The same command has endless spellings: `^rm ` misses `/bin/rm`, `\rm`, `r''m`, `command rm`, `busybox rm`, and anything run through `sh -c` or a script. Pipes to `curl` and similar exfiltration need no denied word at all. Use a denylist to catch mistakes, never as the control that keeps something from happening.
 
 Blocked commands surface as a clear error mentioning which pattern (or which env var) rejected the call, so the agent can adapt rather than guess. Policy is enforced before the SSH connection opens — no remote process is started for a blocked command.
 
@@ -180,28 +203,26 @@ The structured **read** tools are all exempt, but for two different reasons — 
 
 #### Policy interaction with the `env` parameter (`ssh_exec`, `ssh_multi_exec`)
 
-When `ssh_exec` or `ssh_multi_exec` is called with `env: { KEY: "value" }`, the values are injected as a `KEY='value' ...` shell prefix before the command (see the tool descriptions). **Policy is checked against the full prefixed command**, not the bare `command` argument — once, before fan-out, in the `ssh_multi_exec` case. That's the safer ordering at the protocol layer — but it means whitelist patterns need to anticipate the prefix and must be **anchored**, not substring matches:
+When `ssh_exec` or `ssh_multi_exec` is called with `env: { KEY: "value" }`, the values are injected as a `KEY='value' ...` shell prefix before the command (see the tool descriptions). **Policy is checked against the full prefixed command**, not the bare `command` argument — once, before fan-out, in the `ssh_multi_exec` case. That's the safer ordering at the protocol layer, and it has two effects under a whitelist.
+
+**`env` is refused by default while a whitelist is active.** A variable such as `LD_PRELOAD` or `PATH` changes what an allowed command actually runs, so the prefix counts as a leading assignment (see above). Remove `env` from the call. A `^ls` pattern will not match the prefixed string in any case, and the rejection explains why.
+
+If you must allow a specific variable, set `SSH_MCP_COMMAND_ALLOW_SHELL_SYNTAX=1` and write a pattern that names the variable and spells out the whole command. Never use a generic variable-name pattern, which would admit `LD_PRELOAD` and `PATH`:
 
 ```bash
-# WRONG -- blocks any ssh_exec call that uses `env`, because the final command
-# starts with `KEY='value' ` and never matches `^ls`.
-SSH_MCP_COMMAND_WHITELIST="^ls "
-
-# RIGHT -- allow zero or more `KEY='value' ` prefixes before the real command.
-SSH_MCP_COMMAND_WHITELIST="^([A-Za-z_][A-Za-z0-9_]*='[^']*' )*ls( |$)"
+SSH_MCP_COMMAND_ALLOW_SHELL_SYNTAX=1
+SSH_MCP_COMMAND_WHITELIST="^FOO='(?:[^']|'\\\\'')*' ls( [A-Za-z0-9_./:=@%+-]+)*$"
 ```
 
-You don't have to diagnose this from a bare rejection: when a whitelist blocks a call that used `env`, the error appends a note explaining that the prefix is why the `^` anchor stopped matching, and suggests the tolerant pattern above.
+(That is the double-quoted shell form. The regex itself is `^FOO='(?:[^']|'\\'')*' ls( [A-Za-z0-9_./:=@%+-]+)*$`, which is what belongs in a JSON `env` block after JSON escaping.)
 
-**Avoid substring-match patterns** like ` ls ` if you're worried about a hostile agent. An agent could pass `env: { ATTACK: " ls " }` to make the final command `ATTACK=' ls ' rm -rf /`, which matches a substring ` ls ` and bypasses the whitelist. Anchored patterns of the form above don't have this weakness because they require the real command name to follow the env-prefix block, not appear inside a quoted env value.
+**Avoid substring-match patterns** like ` ls `. An agent could pass `env: { ATTACK: " ls " }` to make the final command `ATTACK=' ls ' some-other-command`, which contains ` ls `. The assignment check refuses that by default, but `some-other-command ls` would still match, so anchor every pattern.
 
-Blacklists need the same care. `^rm ` blocks a bare `rm` call, but doesn't block `FOO='bar' rm`. Use the same env-prefix-tolerant anchor:
+Blacklists see the prefix too. `^rm ` blocks a bare `rm` call, but doesn't block `FOO='bar' rm`. An env-tolerant anchor closes that one spelling, and like every denylist it stays best effort:
 
 ```bash
-SSH_MCP_COMMAND_BLACKLIST="^([A-Za-z_][A-Za-z0-9_]*='[^']*' )*rm( |$)"
+SSH_MCP_COMMAND_BLACKLIST="^([A-Za-z_][A-Za-z0-9_]*='(?:[^']|'\\\\'')*' )*rm( |$)"
 ```
-
-If you don't trust the agent's `env` values at all, the simplest mitigation is to leave `env` unused in your client config and pass everything through the `command` string yourself.
 
 ### Windows support
 
