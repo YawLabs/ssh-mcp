@@ -367,7 +367,7 @@ function plantOam(dir: string): string {
 /**
  * Plant a RUNNABLE oam install and return its path: a hard link to the Node
  * running this suite. Its `--version` really runs; the spy then rewrites Node's
- * "v22.x.y" to "oam 0.20.2" (FAKE_NODE_AS_OAM), which clears the floor. Copied
+ * "v22.x.y" to "oam 0.21.1" (FAKE_NODE_AS_OAM), which clears the floor. Copied
  * when a link cannot be made (another volume, or a hardlink-protected file).
  * Two of these are the same version, which is exactly a tie. The spy stands in
  * for the spawn, so the link is only ever asked for its version.
@@ -432,7 +432,7 @@ function runLauncher(layout: LauncherLayout, opts: LauncherOpts = {}) {
   if (opts.fakeCode !== undefined) env.FAKE_CODE = opts.fakeCode;
   if (opts.fakeSignal) env.FAKE_SIGNAL = opts.fakeSignal;
   if (opts.fakeVersions) env.FAKE_OAM_VERSIONS = JSON.stringify(opts.fakeVersions);
-  const nodeAsOam = opts.nodeAsOam === undefined ? (opts.spy ? "0.20.2" : null) : opts.nodeAsOam;
+  const nodeAsOam = opts.nodeAsOam === undefined ? (opts.spy ? "0.21.1" : null) : opts.nodeAsOam;
   if (nodeAsOam) env.FAKE_NODE_AS_OAM = nodeAsOam;
 
   const nodeArgs = opts.spy ? ["--require", layout.spy] : [];
@@ -505,30 +505,33 @@ describe("launcher: every oam found is asked, and the newest wins", () => {
     // so neither the shim nor the older binaries passed over are named.
     if (isWin) writeFileSync(join(layout.dir, "path-middle", "oam.cmd"), "@echo off\r\n");
 
-    // `oam`, not `auto`: auto runs on Node and discovers nothing while the
-    // launcher's AUTO_PREFERS_OAM is false. Discovery is the same code either way.
+    // `oam` here for symmetry with the other discovery cases; `auto` discovers
+    // the same way now that AUTO_PREFERS_OAM is true again.
     const r = runLauncher(layout, {
       mode: "oam",
       pathDirs,
       spy: true,
-      fakeVersions: { [installed]: "0.20.2", [newest]: "0.21.0", [middle]: "0.20.9" },
+      fakeVersions: { [installed]: "0.21.1", [newest]: "0.21.3", [middle]: "0.21.2" },
     });
     expect(r.status, JSON.stringify(r)).toBe(0);
     expect(spawnedWith(layout).cmd).toBe(newest);
     expect(r.stderr).toBe("");
   });
 
-  it("auto spawns none of them: the default runtime is Node", () => {
+  it("auto spawns the usable one too, now that the default prefers oam", () => {
     // Usable oams installed and on PATH, and no OAM_BIN. The shipped `auto`
-    // does not probe or spawn any of them, and has nothing to say about it.
+    // probes and spawns them, as it did before the Node-only release line. The
+    // INSTALLED copy wins the tie: installed locations are searched first, and
+    // both fakes report the same version.
     const layout = makeLauncherLayout();
-    plantRunnableOam(join(layout.home, ".oam", "bin"));
+    const installed = plantRunnableOam(join(layout.home, ".oam", "bin"));
     plantRunnableOam(join(layout.dir, "pathdir"));
 
     const r = runLauncher(layout, { mode: "auto", pathDirs: [join(layout.dir, "pathdir")], spy: true });
     expect(r.status, JSON.stringify(r)).toBe(0);
-    expect(spawnLog(layout), "auto must not spawn an oam").toEqual([]);
-    expect(r.stdout).toContain(MARKER);
+    expect(spawnLog(layout), "auto must spawn the usable oam").toHaveLength(1);
+    expect(spawnedWith(layout).cmd).toBe(installed);
+    expect(r.stdout).not.toContain(MARKER);
     expect(r.stderr).toBe("");
   });
 
@@ -650,7 +653,7 @@ describe("launcher: the argv handed to oam", () => {
     const node = join(nodeDir, isWin ? "node.exe" : "node");
     // Only has to EXIST: Node on PATH is found by stat, and the spy runs nothing.
     writeFileSync(node, "");
-    const r = runLauncher(layout, { mode: "node", pathDirs: [nodeDir], spy: true, hostOam: "0.20.2", args: ["x"] });
+    const r = runLauncher(layout, { mode: "node", pathDirs: [nodeDir], spy: true, hostOam: "0.21.1", args: ["x"] });
     const call = spawnedWith(layout);
     expect(call.cmd).toBe(node);
     // Node takes the entry directly: no `run`, no separator.
