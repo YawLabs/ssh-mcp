@@ -228,7 +228,7 @@ SSH_MCP_COMMAND_BLACKLIST="^([A-Za-z_][A-Za-z0-9_]*='(?:[^']|'\\\\'')*' )*rm( |$
 
 On Windows, ssh-mcp uses the OpenSSH Authentication Agent's `\\.\pipe\openssh-ssh-agent` named pipe automatically when `SSH_AUTH_SOCK` is not set. No `SSH_AUTH_SOCK` needed — just make sure the OpenSSH agent service is running.
 
-On the [oam](https://oamjs.org) runtime, the launcher serves only on oam 0.20.2 or newer. Agent auth needs a `net` that can dial a named pipe or a Unix socket (that is how ssh2 reaches the agent), which older oam releases could not do. On oam 0.20.2 (Windows) the MCP handshake, `ssh_config_lookup`, `ssh_key_list` and `ssh_agent_ensure` were verified through the launcher, and ssh2's own agent client was verified dialing a named pipe and completing an identities request (against a stand-in agent on a pipe). An agent-only `ssh_exec` end to end has so far been verified on Node only. Started from Node, the launcher only uses oam when asked to (`SSH_MCP_RUNTIME=oam`); if agent auth fails there, unset it to rule the runtime out. Started by oam with no Node on `PATH`, it can still serve on oam: see [Runtime selection](#runtime-selection). ed25519 and ECDSA keys and ed25519-only servers do not work on oam 0.20.2 at all — see [Known limits on oam 0.20.2](#known-limits-on-oam-0202).
+On the [oam](https://oamjs.org) runtime, the launcher serves only on oam 0.21.1 or newer. Agent auth needs a `net` that can dial a named pipe or a Unix socket (that is how ssh2 reaches the agent), which older oam releases could not do. On oam 0.20.2 (Windows) the MCP handshake, `ssh_config_lookup`, `ssh_key_list` and `ssh_agent_ensure` were verified through the launcher, and ssh2's own agent client was verified dialing a named pipe and completing an identities request (against a stand-in agent on a pipe). An agent-only `ssh_exec` end to end has so far been verified on Node only. Started from Node, the launcher prefers oam (`auto`); to rule the runtime out when agent auth fails there, set `SSH_MCP_RUNTIME=node`. Started by oam with no Node on `PATH`, it can still serve on oam: see [Runtime selection](#runtime-selection). ed25519 and ECDSA keys and ed25519-only servers used to be broken on oam 0.20.2; that is fixed as of 0.21.1 — see [oam key support](#oam-key-support).
 
 `ssh_agent_ensure` and `ssh_diagnose` probe that pipe and tell you if the service is down. Remote operations do *not*: they assume the pipe and let the connection fail on its own if the agent isn't there. That is why a stopped agent service shows up as an auth failure rather than an "agent not running" error until you run the diagnostic tools.
 
@@ -349,51 +349,37 @@ for (const check of report.checks) {
 
 ## Runtime selection
 
-The `ssh-mcp` command — what `npx @yawlabs/ssh-mcp` runs — is a small launcher. It runs the server on Node by default. The [oam](https://oamjs.org) runtime is opt-in, with `SSH_MCP_RUNTIME=oam`; its minimum is the **latest oam release, currently 0.20.2**, and the launcher never serves on an older oam.
+The `ssh-mcp` command — what `npx @yawlabs/ssh-mcp` runs — is a small launcher. The default runtime, `auto`, prefers the newest usable [oam](https://oamjs.org) and falls back to Node when there is none. The minimum is the **latest oam release, currently 0.21.1**, and the launcher never serves on an older oam.
 
-The default used to prefer oam whenever a usable one was installed. It is Node until oam closes the `node:crypto` gaps tracked in [YawLabs/oam#489](https://github.com/YawLabs/oam/issues/489): on oam 0.20.2 ed25519 and ECDSA key files and ed25519-only servers do not work (see [Known limits on oam 0.20.2](#known-limits-on-oam-0202)).
+The default prefers oam again as of **oam 0.21.1**, which closed the `node:crypto` gaps it used to trip over: an ed25519 key file, an ECDSA key file, an ed25519-only server and curve25519 key exchange all work there. It was Node-only for one release line (0.18.4-0.18.6), while oam 0.20.2 was the floor; those four gaps are tracked in [YawLabs/oam#489](https://github.com/YawLabs/oam/issues/489), now closed.
 
 Two environment variables control the choice; set them in your MCP client's `env` block:
 
 - `SSH_MCP_RUNTIME` — which runtime to use. Case-insensitive, surrounding whitespace ignored; any value other than `oam` or `node` behaves as `auto`.
-  - `auto` (default) — Node. Started from Node, the launcher does not look for oam, and if `OAM_BIN` is set it says on stderr that it was not used. Started by oam, it hands off to Node on `PATH` and serves on oam only when there is none; see the list below.
+  - `auto` (default) — prefer oam. On a Node host the launcher discovers the newest usable oam and spawns it, falling back to Node in-process when none is found. Started by oam at or above the floor it serves in-process, with no second oam. Started by oam below the floor it hands off to Node on `PATH` (or to a newer oam), or exits with status 1 when there is neither; see the list below.
   - `oam` — require oam. Fails loudly: if no usable oam is found, the launcher prints what it found and why each one was passed over to stderr, and exits with status 1 instead of starting the server.
   - `node` — always Node. The launcher does not look for oam, and `OAM_BIN` is ignored.
-- `OAM_BIN` — with `SSH_MCP_RUNTIME=oam`, path to an oam binary to use in preference to discovery, when it is 0.20.2 or newer. If it does not exist, is older, will not run, or does not answer `--version` with oam's own `oam x.y.z` banner (another program's version, such as Node's `v22.x.y`, does not count), the launcher says so on stderr and carries on with discovery.
+- `OAM_BIN` — with `SSH_MCP_RUNTIME=oam`, path to an oam binary to use in preference to discovery, when it is 0.21.1 or newer. If it does not exist, is older, will not run, or does not answer `--version` with oam's own `oam x.y.z` banner (another program's version, such as Node's `v22.x.y`, does not count), the launcher says so on stderr and carries on with discovery.
 
-Discovery (under `SSH_MCP_RUNTIME=oam`) looks in `$OAM_INSTALL_DIR` (when set — the oam installer's install target), then `%LOCALAPPDATA%\oam\bin` (Windows only), then `~/.oam/bin`, then every directory on `PATH`; asks every oam binary it finds for its version, counting only an answer that carries oam's own `oam x.y.z` banner; and uses the newest one at 0.20.2 or newer. On a tie the one found first wins, so an installed copy beats one on `PATH`. On Windows only `oam.exe` counts: an `oam.cmd`/`oam.bat` shim on `PATH` is never run, and is named on stderr when no usable oam is found.
+Discovery (under `SSH_MCP_RUNTIME=oam`) looks in `$OAM_INSTALL_DIR` (when set — the oam installer's install target), then `%LOCALAPPDATA%\oam\bin` (Windows only), then `~/.oam/bin`, then every directory on `PATH`; asks every oam binary it finds for its version, counting only an answer that carries oam's own `oam x.y.z` banner; and uses the newest one at 0.21.1 or newer. On a tie the one found first wins, so an installed copy beats one on `PATH`. On Windows only `oam.exe` counts: an `oam.cmd`/`oam.bat` shim on `PATH` is never run, and is named on stderr when no usable oam is found.
 
-With `SSH_MCP_RUNTIME=oam` an unusable oam is an error: the launcher names on stderr each oam (and `OAM_BIN`) it passed over and why — older than 0.20.2, not runnable, or a shim — or the chosen oam that failed to start, and exits with status 1. It does not fall back to Node.
+With `SSH_MCP_RUNTIME=oam` an unusable oam is an error: the launcher names on stderr each oam (and `OAM_BIN`) it passed over and why — older than 0.21.1, not runnable, or a shim — or the chosen oam that failed to start, and exits with status 1. It does not fall back to Node.
 
 When the launcher is itself started by oam (`oam run <path>/bin/ssh-mcp.mjs`, which is how Yaw MCP starts an `npx @yawlabs/ssh-mcp` entry when a recent oam is installed):
 
-- In `auto` mode it hands the server off to Node on `PATH`, whatever the oam version, and says so on stderr. Only when there is no Node on `PATH` does oam serve: an oam 0.20.2 or newer runs the server itself, in the same process, with a note on stderr that the key types under [Known limits](#known-limits-on-oam-0202) will not work; an older oam hands off to the newest usable oam it can find, or exits with status 1.
-- With `SSH_MCP_RUNTIME=oam` on oam 0.20.2 or newer, it runs the server on that oam, in the same process. Nothing is discovered or spawned, and `OAM_BIN` is not read: that oam is the one required. On an older oam it never runs the server there; it hands off to the newest usable oam it can find, or exits with status 1.
+- In `auto` mode an oam 0.21.1 or newer serves the server itself, in the same process, with no note about unusable key types -- the gap that used to earn one is closed. An oam below the floor never serves there: it hands off to Node on `PATH`, or to the newest usable oam it can find, or exits with status 1 when there is neither.
+- With `SSH_MCP_RUNTIME=oam` on oam 0.21.1 or newer, it runs the server on that oam, in the same process. Nothing is discovered or spawned, and `OAM_BIN` is not read: that oam is the one required. On an older oam it never runs the server there; it hands off to the newest usable oam it can find, or exits with status 1.
 - With `SSH_MCP_RUNTIME=node` it hands the server off to Node on `PATH`, whatever the oam version, and exits with status 1 when there is none.
 
 Whenever an oam host starts a child (the handoffs above), the launcher removes `--permission` and `--allow-*` flags from the child's inherited `NODE_OPTIONS`. oam (since 0.18.0) adds its own permission flags to every child's `NODE_OPTIONS`, and Node refuses some of them there (`--allow-net is not allowed in NODE_OPTIONS`, exit 9); this server is not sandboxed, so there is nothing to pass on. An oam that was itself started with `--permission` re-adds the flags inside `spawn()`, which the launcher cannot undo, so do not start it that way.
 
-### Known limits on oam 0.20.2
+### oam key support
 
-Four `node:crypto` gaps in oam 0.20.2 are behind these, tracked in [YawLabs/oam#489](https://github.com/YawLabs/oam/issues/489):
+oam 0.21.1 supports ed25519 and ECDSA key files, servers whose only host key is ed25519, and curve25519 key exchange in ssh2. Measured through the launcher on oam 0.21.1 (`oam run bin/ssh-mcp.mjs`): MCP `initialize`, `tools/list` (the same 21 tools as on Node) and `tools/call` on `ssh_key_list`, `ssh_config_lookup` and `ssh_agent_ensure`; and against a local ssh2 server, identical to Node 22, an ed25519 key file, an ECDSA key file, an ed25519-only host key and `curve25519-sha256` all complete an exec, with ssh2's probes reporting `eddsaSupported = true` and `curve25519Supported = true`. An ed25519 key held in the agent was not measured end to end; what used to block it was ssh2 failing to parse an ed25519 public key on oam, and the underlying `crypto.verify` gap is closed.
 
-- `crypto.verify` throws when it is given an Ed25519 private key. ssh2 decides whether it supports ed25519 by signing and then verifying with a private key, so on oam it turns ed25519 off altogether. oam itself can generate ed25519 keys, sign with them and verify with the public key; this one call is what disables ed25519 in ssh2.
-- `crypto.diffieHellman` does not exist, so ssh2 does not offer curve25519 key exchange.
-- x25519 key pairs cannot be generated, which curve25519 key exchange would need as well.
-- Signing with a SEC1 (`EC PRIVATE KEY`) key throws, and that is the form ssh2 converts an ECDSA key file to before signing.
+The four `node:crypto` gaps that used to break these on oam 0.20.2 -- a `crypto.verify` that threw on an Ed25519 private key (which is how ssh2 decides it supports ed25519), a missing `crypto.diffieHellman`, x25519 key pairs that could not be generated, and SEC1 (`EC PRIVATE KEY`) signing that threw -- are listed in the launcher's comments and were tracked in [YawLabs/oam#489](https://github.com/YawLabs/oam/issues/489), now closed.
 
-Measured with this package's ssh2 against a local ssh2 server, each case below works on Node 22 and fails on oam 0.20.2:
-
-- **An ed25519 private key file** — the connection is refused before it starts: `Cannot parse privateKey: Unsupported OpenSSH private key type: ssh-ed25519`. This applies to the key file ssh-mcp picks up on its own (the first usable `IdentityFile`, or `~/.ssh/id_ed25519`) as well as to `privateKeyPath`, and it fails the connection even when an agent is also offered.
-- **An ECDSA private key file** — authentication fails: `Error signing data with key: SEC1 EC private key format not supported; use PKCS#8`.
-- **A server whose only host key is ed25519** — `Handshake failed: no matching host key format`.
-- **An ed25519 key held in the agent** — ssh2 cannot parse an ed25519 public key on oam (`Unsupported key format`), so it is not expected to be usable; this one was not measured end to end.
-
-What was measured working on oam 0.20.2: password auth and an RSA private key file, against servers with an RSA or ECDSA host key, over `ecdh-sha2-nistp256` (curve25519 key exchange is not offered).
-
-This is why the default runtime is Node. The launcher does not check for any of it when you opt in: with `SSH_MCP_RUNTIME=oam`, or an MCP client that starts `oam run .../dist/index.js` itself, the cases above fail as listed.
-
-The default will go back to preferring oam once an oam release handles these cases. To pin Node regardless of what a later release defaults to:
+To pin Node regardless of what the default prefers:
 
 ```json
 {
@@ -413,7 +399,7 @@ On Windows, add the same `env` block to the `cmd /c` form from [Quick start](#qu
 
 - Node.js 18+
 - SSH client installed (for diagnostics and environment management)
-- Optional, opt-in: [oam](https://oamjs.org) 0.20.2+ — see [Runtime selection](#runtime-selection)
+- Optional: [oam](https://oamjs.org) 0.21.1+ (preferred by `auto` when a usable one is installed) — see [Runtime selection](#runtime-selection)
 
 ## License
 
