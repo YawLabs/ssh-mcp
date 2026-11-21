@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] — 2026-11-21
+
 ### Security
 - **A whitelist match no longer lets the rest of the line through.** `^ls( |$)`, the shape the old `env` rejection recommended, admitted `ls ; <anything>` and `ls $(<anything>)`. While `SSH_MCP_COMMAND_WHITELIST` is active, a matching command is now refused if it contains shell control syntax (`;` `&` `|` backtick `$(` `${` `$[` `@{` `(` `)` `<` `>` or a line break, even inside quotes; `@{` is a PowerShell hash literal, which runs its values) or starts with a variable assignment such as `LD_PRELOAD=...` or `PATH=...`. **Breaking:** whitelisted commands that use these, and any `env` parameter under a whitelist, are now refused. `SSH_MCP_COMMAND_ALLOW_SHELL_SYNTAX=1` restores pattern-only matching.
 - **Pattern lists no longer split inside a regex.** Commas in `[,]`, `\,` and `{m,n}` stay in the pattern. Splitting them broke the documented `[,]` form: `^foo[,]bar$` became a dropped `^foo[` plus a live `]bar$`, which allowed `reboot # ]bar`. **Breaking:** an entry like `a{1,3}` now means the quantifier, not the two patterns `a{1` and `3}`.
