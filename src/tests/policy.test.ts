@@ -353,6 +353,24 @@ describe("enforcePolicy", () => {
       }
     });
 
+    it("the assignment check only sees the bare `env ` spelling, so other spellings still pass", () => {
+      // PINS A LIMIT, not desired behaviour. LEADING_ASSIGNMENT anchors on the literal
+      // `env ` keyword, and a whitelist pattern can only match the command if the operator
+      // wrote something that admits `env` in the first place. Once they have, every spelling
+      // except the bare one carries the redirection through: `/usr/bin/env`, a backslash
+      // escape and the `command` builtin all leave the assignment in place. Reading this as
+      // protection `env` does not give would be a mistake -- the guard rail is the pattern.
+      vi.stubEnv("SSH_MCP_COMMAND_WHITELIST", "env");
+      expect(() => enforcePolicy("env LD_PRELOAD=/tmp/x.so ls")).toThrow(/variable assignment/);
+      for (const command of [
+        "/usr/bin/env LD_PRELOAD=/tmp/x.so ls",
+        "\\env LD_PRELOAD=/tmp/x.so ls",
+        "command env LD_PRELOAD=/tmp/x.so ls",
+      ]) {
+        expect(() => enforcePolicy(command)).not.toThrow();
+      }
+    });
+
     it("an unrecognized opt-out value fails closed with only a blacklist configured", () => {
       // The read used to live inside the whitelist branch, so under a blacklist-only config a
       // garbage value was silently accepted and the setting meant to control enforcement

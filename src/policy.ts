@@ -121,6 +121,13 @@ const LOOSE_QUANTIFIER_NOTE =
  * closes that hole. A `{` not followed by a digit is left alone: `a{,3}` and
  * `^a{` are literal text in JS, and patterns that use them are documented and
  * tested as working.
+ *
+ * The digit-run is not bounded on purpose. Measured against V8: `{n}`, `{n,}` and
+ * `{n,m}` stay quantifiers for every digit count tried, including 20 digits
+ * (`/^a{99999999999999999999}$/` still cannot match its own literal text), so
+ * there is no numeric range where V8 reads the brace as literal and this scan
+ * would miss it. `{n,m}` with an empty or reversed range (`{2,0}`) is not literal
+ * either -- `new RegExp` rejects it, which the malformed-entry guard already catches.
  */
 function hasLooseQuantifier(src: string): boolean {
   let inClass = false;
