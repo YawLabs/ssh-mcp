@@ -2,21 +2,18 @@
 /**
  * Runtime launcher for @yawlabs/ssh-mcp.
  *
- * Runs the server on Node by default. The oam runtime (https://oamjs.org) is
- * opt-in with SSH_MCP_RUNTIME=oam, and the launcher never serves on an oam older
- * than the floor below.
+ * Runs the server on Node, or on the oam runtime (https://oamjs.org) when one
+ * is available at or above the floor below. `auto` (the default) prefers the
+ * newest usable oam and falls back to Node; SSH_MCP_RUNTIME=oam demands oam,
+ * =node demands Node. The launcher never serves on an oam older than the floor.
  *
- * AUTO MEANS NODE, FOR NOW
- * `auto` used to prefer the newest usable oam and fall back to Node. It is
- * switched to Node by AUTO_PREFERS_OAM (below) because oam 0.20.2's node:crypto
- * cannot do what ordinary SSH setups need -- see KNOWN LIMITS ON 0.20.2 -- and a
- * default that breaks ed25519 keys is not a default. Everything below that
- * describes `auto` discovering or preferring oam describes AUTO_PREFERS_OAM =
- * true; with it false, `auto` behaves as SSH_MCP_RUNTIME=node does, plus two
- * things node mode does not do: on an oam host with no Node on PATH it serves on
- * that oam (at the floor) or looks for a newer one (below it) rather than
- * exiting, and it says on stderr when it moved off an oam host or ignored an
- * OAM_BIN. SSH_MCP_RUNTIME=oam is untouched by the switch.
+ * AUTO PREFERS OAM AGAIN
+ * `auto` prefers the newest usable oam and falls back to Node -- its original
+ * behaviour. It was switched to Node-only by AUTO_PREFERS_OAM for one release
+ * line, because oam 0.20.2 could not do what ordinary SSH setups need; oam 0.21.1
+ * closed those gaps (YawLabs/oam#489) and the switch is back on. Everything below
+ * describes `auto` discovering or preferring oam. SSH_MCP_RUNTIME=oam and =node
+ * are unchanged either way.
  *
  * WHY THE FALLBACK COSTS NOTHING
  * npm has already started Node to run this launcher, so falling back is a
@@ -89,12 +86,14 @@
  * wired up here.
  *
  * MINIMUM OAM VERSION
- * The latest oam release, 0.20.2 -- bump OAM_MIN when oam ships a newer one.
+ * The latest oam release, 0.21.1 -- bump OAM_MIN when oam ships a newer one.
  * Only the current oam is used and verified; an older one is passed over.
- * Verified on 0.20.2 through this launcher (`oam run bin/ssh-mcp.mjs`): MCP
- * initialize, tools/list and tools/call on ssh_key_list, ssh_config_lookup and
- * ssh_agent_ensure, plus ssh2's agent client dialing a Windows named pipe (a
- * stand-in agent on a pipe; the OpenSSH agent service was stopped on that machine).
+ * Verified on 0.21.1 through this launcher (`oam run bin/ssh-mcp.mjs`): MCP
+ * initialize, tools/list (the same 21 tools as on Node) and tools/call on
+ * ssh_key_list, ssh_config_lookup and ssh_agent_ensure. Also measured on 0.21.1
+ * against a local ssh2 server, identical to Node 22: an ed25519 key file, an
+ * ECDSA key file, a server whose only host key is ed25519, and curve25519-sha256
+ * key exchange all complete an exec.
  *
  * The floor is not cosmetic. Two things this server does were first fixed in
  * oam 0.18.0, so anyone taking it below that has to answer for both:
@@ -136,31 +135,33 @@
  * Password auth and an RSA private key file both worked, as did password auth
  * against an ECDSA host key.
  *
- * KNOWN LIMITS ON 0.20.2 -- that measurement is NOT "ssh works on oam". Four
- * node:crypto gaps in oam 0.20.2, tracked as YawLabs/oam#489, each measured:
- *   1. crypto.verify (and createPublicKey) throws when handed an Ed25519
- *      PRIVATE key. ssh2's eddsaSupported probe (ssh2 lib/protocol/constants.js)
- *      signs and then verifies with the private key, so it is false and ssh2
- *      drops ed25519 altogether. oam does generate ed25519 keys, sign with
- *      them and verify with the public key; this probe is the whole cause.
- *   2. crypto.diffieHellman is undefined, so ssh2's curve25519Supported probe
- *      is false and curve25519-sha256 key exchange is not offered.
- *   3. generateKeyPairSync('x25519') throws: what curve25519 key exchange
+ * KNOWN LIMITS ON 0.20.2 -- CLOSED AS OF 0.21.1; kept as history, because the
+ * messages and tests that once described them have been reworded and this is what
+ * they were about. Four node:crypto gaps in oam 0.20.2, tracked as
+ * YawLabs/oam#489, each measured then:
+ *   1. crypto.verify (and createPublicKey) threw when handed an Ed25519 PRIVATE
+ *      key. ssh2's eddsaSupported probe (ssh2 lib/protocol/constants.js) signs and
+ *      then verifies with the private key, so it was false and ssh2 dropped
+ *      ed25519 altogether. oam does generate ed25519 keys, sign with them and
+ *      verify with the public key; this probe is the whole cause.
+ *   2. crypto.diffieHellman was undefined, so ssh2's curve25519Supported probe
+ *      was false and curve25519-sha256 key exchange was not offered.
+ *   3. generateKeyPairSync('x25519') threw: what curve25519 key exchange
  *      would need next, once 2 is closed.
- *   4. signing with a SEC1 ("EC PRIVATE KEY") PEM throws, and that is the form
+ *   4. signing with a SEC1 ("EC PRIVATE KEY") PEM threw, and that is the form
  *      ssh2 converts an ECDSA key file to before signing.
- * Measured against the same local server, fine on Node 22 and failing on oam
- * 0.20.2:
- *   - an ed25519 private key file: connect() throws "Cannot parse privateKey:
+ * Measured then against the same local server: fine on Node 22, failing on oam
+ * 0.20.2 --
+ *   - an ed25519 private key file: connect() threw "Cannot parse privateKey:
  *     Unsupported OpenSSH private key type: ssh-ed25519", agent or not;
  *   - an ECDSA private key file: "Error signing data with key: SEC1 EC private
  *     key format not supported; use PKCS#8";
  *   - a server whose only host key is ed25519: "Handshake failed: no matching
- *     host key format" (ssh-ed25519 is absent from ssh2's host key list there).
- * ssh2 cannot parse an ed25519 PUBLIC key on oam either, so an ed25519 key in
- * the agent is not expected to work (not measured end to end). Whether 0.19.5
- * behaved the same was not measured. This is why `auto` runs on Node: see
- * AUTO_PREFERS_OAM. Under SSH_MCP_RUNTIME=oam the limits apply as listed.
+ *     host key format" (ssh-ed25519 absent from ssh2's host key list there).
+ * As of oam 0.21.1 all four are fixed and all four cases pass, matching Node 22
+ * (measured), and ssh2's own probes report eddsaSupported = true and
+ * curve25519Supported = true. That is what allowed AUTO_PREFERS_OAM to return to
+ * true and OAM_MIN to move to 0.21.1.
  *
  * Background, long before the current floor: before 0.9.0
  * `child_process.execFile` ran its arguments through a SHELL, `exec` accepted
@@ -198,32 +199,30 @@ import { fileURLToPath } from "node:url";
  * sockets (needed by ssh2's agent client, src/ssh.ts). See MINIMUM OAM VERSION
  * above.
  */
-const OAM_MIN = [0, 20, 2];
+const OAM_MIN = [0, 21, 1];
 
 /**
  * Whether `auto` (the default mode) prefers a usable oam over Node.
  *
- * FALSE because of oam 0.20.2's node:crypto gaps (KNOWN LIMITS ON 0.20.2 above,
- * YawLabs/oam#489): crypto.verify throws on an Ed25519 private key, which turns
- * off ssh2's ed25519 support, and signing with a SEC1 EC private key throws.
- * So on oam ssh_exec fails for ed25519 and ECDSA key files and for ed25519-only
- * servers. Until that is fixed `auto` runs on Node and oam is opt-in via
- * SSH_MCP_RUNTIME=oam.
+ * TRUE again as of oam 0.21.1, which closed all four node:crypto gaps that made
+ * this false (YawLabs/oam#489). Measured on oam 0.21.1 against a local ssh2
+ * server, identical to Node 22: an ed25519 key file, an ECDSA key file, a server
+ * whose only host key is ed25519, and curve25519-sha256 key exchange all complete
+ * an exec. ssh2's own probes now report eddsaSupported = true and
+ * curve25519Supported = true there. Also verified through this launcher on 0.21.1:
+ * MCP initialize, tools/list (the same 21 tools) and tools/call on ssh_key_list,
+ * ssh_config_lookup and ssh_agent_ensure.
  *
- * Flip back to true -- this one line -- once an oam release has ALL of:
- *   - crypto.verify and createPublicKey accepting an Ed25519 private key, so
- *     ssh2's eddsaSupported probe is true (ed25519 key files and host keys);
- *   - signing with a SEC1 "EC PRIVATE KEY" PEM (ECDSA key files);
- *   - crypto.diffieHellman and x25519 key pairs (generate, import, export),
- *     so ssh2 offers and completes curve25519-sha256 key exchange;
- * and, measured on that release through this package's ssh2: an ed25519 key
- * file, an ECDSA key file, an ed25519-only server, an ed25519 key held in the
- * agent, and a curve25519-sha256 key exchange. Raise OAM_MIN to that release in
- * the same change. Then restore the docs that describe the default: README
- * (Runtime selection), CLAUDE.md, and the "auto runs on Node" tests in
- * src/tests/launcher.test.ts.
+ * It was FALSE while 0.20.2 was the floor: crypto.verify threw on an Ed25519
+ * private key, which turns off ssh2's ed25519 support, and signing with a SEC1 EC
+ * private key threw, so ssh_exec failed for ed25519 and ECDSA key files and for
+ * ed25519-only servers.
+ *
+ * Flip back to false only against a measured regression on the floor release --
+ * and note that the "KNOWN LIMITS ON 0.20.2" block above no longer applies to the
+ * current floor; 0.20.2 is now merely an older release the launcher passes over.
  */
-const AUTO_PREFERS_OAM = false;
+const AUTO_PREFERS_OAM = true;
 
 /**
  * Bound on each `oam --version` probe. A healthy oam answers in milliseconds;
@@ -336,7 +335,7 @@ function parseVersion(text) {
 
 /**
  * `oam --version` output -> [major, minor, patch], or null unless it carries
- * oam's own banner ("oam 0.20.2" at the start of a line). Any x.y.z is NOT
+ * oam's own banner ("oam 0.21.1" at the start of a line). Any x.y.z is NOT
  * enough: an OAM_BIN (or an oam.exe on disk) that is really another program --
  * node prints "v22.22.2" -- would clear the floor, and the launcher would then
  * spawn `<it> run dist/index.js`, which dies with no Node fallback because the
@@ -394,12 +393,12 @@ function pickNewest(candidates) {
  *   "in-process"   import it into THIS process
  *   "discover"     choose an oam and spawn it, or fall back to Node
  *   "handoff-node" hand it off to Node on PATH: THIS process is an oam, and
- *                  Node was asked for -- by SSH_MCP_RUNTIME=node, or by `auto`
- *                  while AUTO_PREFERS_OAM is false
+ *                  Node was asked for, by SSH_MCP_RUNTIME=node
  *
- * While AUTO_PREFERS_OAM is false, every mode other than `oam` plans exactly as
- * `node` does. What `auto` does differently when an oam host has no Node on
- * PATH is decided at the call site, which is where PATH is read.
+ * `auto`, and any value that is neither `oam` nor `node`, prefers oam: on an oam
+ * host at or above the floor it serves in-process, and otherwise it plans
+ * "discover" -- choose an oam and spawn it, falling back to Node when there is
+ * none. That is what AUTO_PREFERS_OAM = true restores.
  *
  * `hostOam` is `process.versions.oam`: oam's own key, absent on Node. An oam
  * host whose version cannot be read is treated as below the floor -- it never
@@ -415,8 +414,8 @@ function pickNewest(candidates) {
  */
 function runtimePlan({ mode, hostOam }) {
   const onOam = hostOam !== undefined;
-  const wantsNode = mode === "node" || (mode !== "oam" && !AUTO_PREFERS_OAM);
-  if (wantsNode) return onOam ? "handoff-node" : "in-process";
+  if (mode === "node") return onOam ? "handoff-node" : "in-process";
+  if (mode !== "oam" && AUTO_PREFERS_OAM === false) return onOam ? "handoff-node" : "in-process";
   return atLeast(parseVersion(hostOam ?? ""), OAM_MIN) ? "in-process" : "discover";
 }
 
@@ -737,9 +736,9 @@ async function launchChild(cmd, args, onLaunchFailed) {
 }
 
 /**
- * Hand the server to Node on PATH. Only reachable when THIS process is oam --
- * one below the floor, or any oam under SSH_MCP_RUNTIME=node or under `auto`
- * while AUTO_PREFERS_OAM is false. `reason`, when given, is noted on stderr.
+ * Hand the server to Node on PATH. Only reachable when THIS process is oam under
+ * SSH_MCP_RUNTIME=node -- a supported one asked for Node, or one below the floor
+ * (which never serves). `reason`, when given, is noted on stderr.
  */
 async function handOffToNode(reason) {
   const node = findNodeOnPath();
@@ -780,8 +779,6 @@ async function fallBackToNode(hostOam, why) {
 const mode = (process.env.SSH_MCP_RUNTIME ?? "auto").trim().toLowerCase();
 const hostOam = process.versions.oam;
 const plan = runtimePlan({ mode, hostOam });
-/** `auto`, or any value that is neither `oam` nor `node`, while auto means Node. */
-const autoOnNode = !AUTO_PREFERS_OAM && mode !== "oam" && mode !== "node";
 
 /** Choose an oam and spawn it; without one, fall back to Node or exit (oam mode). */
 async function discoverAndServe() {
@@ -834,42 +831,17 @@ async function discoverAndServe() {
 }
 
 if (plan === "in-process") {
-  // auto never looks for oam while AUTO_PREFERS_OAM is false, so an OAM_BIN
-  // someone set expecting oam would be dropped without a word. errSync because
-  // the server's `--version` exits right after the import; see discoverAndServe.
-  if (autoOnNode && hostOam === undefined && process.env.OAM_BIN) {
-    await errSync(
-      "ssh-mcp: OAM_BIN is set but not used: the default runtime is Node until oam can run ssh2's ed25519, curve25519 and ECDSA key support (YawLabs/oam#489). Set SSH_MCP_RUNTIME=oam to run on it.\n",
-    );
-  }
   // Guarded like every other in-process fallback: a broken install (missing
   // dist/index.js) must print this launcher's diagnostic, not a raw Node stack
   // trace from the bare import().
   await runInProcess().catch(fallbackFailed);
 } else if (plan === "handoff-node") {
+  // Only SSH_MCP_RUNTIME=node reaches here: `auto` prefers oam and so plans
+  // "discover" (or serves in-process on a supported oam host) instead. Node or
+  // nothing -- an oam below the floor says why, a supported one is the caller's
+  // explicit choice.
   const belowFloor = !atLeast(parseVersion(hostOam), OAM_MIN);
-  const floorReason = `this process is oam ${hostOam}, older than ${OAM_MIN.join(".")}`;
-  if (!autoOnNode) {
-    // SSH_MCP_RUNTIME=node: Node or nothing.
-    await handOffToNode(belowFloor ? floorReason : "");
-  } else if (findNodeOnPath()) {
-    await handOffToNode(
-      belowFloor
-        ? floorReason
-        : `this process is oam ${hostOam}, and the default runtime is Node until oam can run ssh2's ed25519, curve25519 and ECDSA key support (YawLabs/oam#489; SSH_MCP_RUNTIME=oam to stay on oam)`,
-    );
-  } else if (belowFloor) {
-    // No Node to move to, and this oam may not serve: a newer oam is the only
-    // thing left, exactly as before the switch. It errors out when there is none.
-    await discoverAndServe();
-  } else {
-    // No Node to move to. A supported oam that serves everything but the keys in
-    // KNOWN LIMITS beats not starting at all, as long as it is said out loud.
-    await errSync(
-      `ssh-mcp: the default runtime is Node, but no Node was found on PATH; serving on this oam ${hostOam}, where ed25519 and ECDSA key files and ed25519-only servers do not work.\n`,
-    );
-    await runInProcess().catch(fallbackFailed);
-  }
+  await handOffToNode(belowFloor ? `this process is oam ${hostOam}, older than ${OAM_MIN.join(".")}` : "");
 } else {
   await discoverAndServe();
 }
