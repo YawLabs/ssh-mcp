@@ -90,9 +90,13 @@ const ALLOW_SHELL_SYNTAX_VAR = "SSH_MCP_COMMAND_ALLOW_SHELL_SYNTAX";
 // `@{` because a PowerShell hash literal runs its values while the argument is evaluated.
 const SHELL_CONTROL_SYNTAX = /\$[([{]|@\{|[;&|`<>()\r\n]/;
 
-// `NAME=`, `NAME+=` or `NAME[i]=` at the start of the command: the shell applies it to the
-// command that follows, which is how LD_PRELOAD and PATH redirect an allowed program.
-const LEADING_ASSIGNMENT = /^\s*[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=/;
+// An assignment at the start of the command -- `NAME=`, `NAME+=` or `NAME[i]=` -- which the
+// shell applies to the command that follows, the way LD_PRELOAD and PATH redirect an allowed
+// program. The `export` / `env` spellings are the same redirection by another name
+// (`env LD_PRELOAD=... ls`), so a leading `export ` or `env ` is refused too. The keyword
+// needs a following whitespace, so a word that merely STARTS with one (`environment`) is
+// unaffected, and a later `env` argument (`ls env x`) is untouched because the anchor is `^`.
+const LEADING_ASSIGNMENT = /^\s*(?:[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=|(?:export|env)\s)/;
 
 // A `{m,n}` or `{m,}` quantifier. `{,n}` is not one in JS (it matches literally), so that
 // comma stays a delimiter, as it always has been.
@@ -124,18 +128,16 @@ function hasLooseQuantifier(src: string): boolean {
   while (i < src.length) {
     const c = src[i] as string;
     if (c === "\\") {
-      // Only a `{` DIRECTLY after a single backslash (`\{`) is a guaranteed
-      // escaped brace, which can never start a quantifier. `\\{` is an escaped
-      // backslash followed by a literal `{` -- V8 reads a `{` that is not a
-      // valid quantifier as literal text anyway, so that shape (and any longer
-      // backslash run) is skipped as a whole and left to the check below,
-      // because treating it as escaped refused `^a\\{1,2$`, a pattern that
-      // compiles correctly.
-      if (src[i + 1] === "\\" && src[i + 2] !== "\\") {
-        i += 2; // exactly one backslash: the next char is escaped
-        continue;
-      }
-      i++; // part of a longer run (or a trailing lone backslash): move on
+      // A backslash escapes the NEXT character, so consume both and skip the
+      // escaped character whatever it is. Later chars are unaffected: `\{1`
+      // is an escaped brace, never a quantifier, and `\]` is a literal `]`
+      // that does NOT close a class. Advancing only past the backslash
+      // misread both -- `\{1` as a loose quantifier and `\]` as the class
+      // end -- so a well-formed pattern such as `^[a\]b{2,3]$` (whose `{2,3}`
+      // is legal class content) was refused, and the refusal's own advice
+      // ("escape the brace as \{") reproduced the refusal. A trailing lone
+      // backslash has nothing to escape, so `i++` covers it.
+      i += 2;
       continue;
     }
     if (inClass) {
@@ -171,10 +173,13 @@ function hasLooseQuantifier(src: string): boolean {
  * deny entries inside it would silently stop applying. A class holding an unescaped comma is
  * therefore returned in `ambiguousClasses` when EITHER its content suggests a swallowed
  * separator (an unescaped `[` before the comma, or pattern-like text after it) OR a real
- * top-level entry follows the class -- the class's comma then sits exactly where a delimiter
- * would (`^rm[abc,>],^df` absorbed the `>` entry into the class). The second rule fires only
- * when another entry follows, so a single pattern like `^[a-z,_]+$`, where no comma in the
- * value could be a delimiter, is never refused. A class that never closes needs no check: it
+ * top-level entry follows the class. The content heuristic alone covers the plain swallow
+ * (`^rm[,reboot]` -- `reboot` reads as pattern text), but not one whose comma is followed only
+ * by shell punctuation: `^rm[abc,>],^df` and `^rm[,>|],^df` both compile to a class that never
+ * denies `rm`, and only the "another entry follows" rule catches them. The cost is that the
+ * documented `[,]` idiom is refused in a MULTI-entry list (`^foo[,]bar$,^df$`), where its
+ * comma could equally be a delimiter; a single-entry value like `^[a-z,_]+$` is unaffected,
+ * and `\,` (`[a\,b]`) is accepted in a list. A class that never closes needs no check: it
  * fails to compile.
  */
 function splitPatternList(raw: string): { entries: string[]; ambiguousClasses: string[] } {
@@ -372,9 +377,15 @@ export function enforcePolicy(command: string, context: PolicyContext = {}): voi
   const whitelist = parsePatterns(process.env.SSH_MCP_COMMAND_WHITELIST, "SSH_MCP_COMMAND_WHITELIST");
   const blacklist = parsePatterns(process.env.SSH_MCP_COMMAND_BLACKLIST, "SSH_MCP_COMMAND_BLACKLIST");
 
+  // Read the opt-out whenever ANY policy is configured, not only under a whitelist. It has no
+  // effect without a whitelist, but a value the server cannot interpret is a misconfiguration
+  // the operator needs to hear: reading it inside the whitelist branch alone let
+  // SSH_MCP_COMMAND_ALLOW_SHELL_SYNTAX=garbage sit silently accepted under a blacklist-only
+  // config, and even after the whitelist was removed, so the setting meant to control
+  // enforcement silently stopped meaning anything. With no policy at all it stays inert.
+  const allowShellSyntax = whitelist.length > 0 || blacklist.length > 0 ? shellSyntaxAllowed() : false;
+
   if (whitelist.length > 0) {
-    // Read first so a bad opt-out value is reported as misconfiguration on every call.
-    const allowShellSyntax = shellSyntaxAllowed();
     if (!whitelist.some((r) => r.test(command))) {
       let message = `Command blocked: does not match any pattern in SSH_MCP_COMMAND_WHITELIST. Configured patterns: ${whitelist.map((r) => r.source).join(", ")}`;
       if (context.envPrefixApplied) {

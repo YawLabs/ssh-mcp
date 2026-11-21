@@ -738,6 +738,29 @@ describe("command policy fails CLOSED when any pattern in a configured list is m
     expect(() => enforcePolicy("ls")).not.toThrow();
   });
 
+  it("an ESCAPED brace is not read as a loose quantifier (the error's own advice works)", () => {
+    // The refusal above tells the operator to "escape the brace as \{". Following that advice
+    // used to reproduce the identical refusal, because the scan advanced past the backslash
+    // only and re-read the `{` as a quantifier. `new RegExp("a\\{1,2")` is a valid regex whose
+    // braces are literal, so it must compile and enforce, not misconfigure.
+    vi.stubEnv("SSH_MCP_COMMAND_BLACKLIST", "a\\{1,2");
+    expect(() => enforcePolicy("zzz")).not.toThrow();
+    vi.stubEnv("SSH_MCP_COMMAND_BLACKLIST", "^literal\\{2\\}$");
+    expect(() => enforcePolicy("literal{2}")).toThrow(/BLACKLIST/);
+    expect(() => enforcePolicy("literal2")).not.toThrow();
+  });
+
+  it("an escaped ] does not close a class, so a brace inside the class stays literal", () => {
+    // ^[a\]b{2]$ is a well-formed regex -- the class runs to the final ] and {2 is class
+    // content. Advancing only past the backslash made the scan see the class end at \], then
+    // read `{2` as a loose quantifier and refuse a valid pattern.
+    vi.stubEnv("SSH_MCP_COMMAND_BLACKLIST", "^[a\\]b{2]$");
+    expect(() => enforcePolicy("zzz")).not.toThrow();
+    // The real shape is still caught: a quantifier that never closes AFTER a genuine class end.
+    vi.stubEnv("SSH_MCP_COMMAND_BLACKLIST", "^[ab]{2,3$");
+    expect(() => enforcePolicy("zzz")).toThrow(/MISCONFIGURED/);
+  });
+
   it("ONE malformed pattern among valid ones is fatal too", () => {
     vi.stubEnv("SSH_MCP_COMMAND_WHITELIST", "(unclosed,^df");
     expect(() => enforcePolicy("df -h")).toThrow(/MISCONFIGURED/);

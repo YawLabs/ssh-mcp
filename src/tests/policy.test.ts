@@ -169,9 +169,10 @@ describe("enforcePolicy", () => {
       ["one plain entry follows", "^rm[,reboot]"],
       ["the [ comes before the comma", "^rm[a[,]"],
       ["the next entry is only an anchor", "^rm[,^]"],
-      // Measured before the fix: both compiled as ONE pattern. The first's empty
-      // `|` branch makes a whitelist matching everything; the second's `>` and
-      // `^df` entries were absorbed into the class and stopped denying.
+      // Measured: these two compile as ONE pattern (a class that never denies `rm`), and the
+      // content heuristic does NOT catch them -- their comma is followed only by shell
+      // punctuation. Only the "another entry follows" rule refuses them, so they pin that rule
+      // and are why the documented `[,]` form is not accepted in a multi-entry list.
       ["a swallow with letters before the comma", "^rm[abc,>],^df"],
       ["a swallow with only punctuation after the comma", "^rm[,>|],^df"],
     ])("fails closed when a class may have swallowed entries: %s", (_name, value) => {
@@ -200,13 +201,31 @@ describe("enforcePolicy", () => {
       ["^[0-9,]+$", "1,2"],
       ["^[a-z,]+$", "a,b"],
       ["^a[,\\s]b$", "a b"],
-      // KNOWN WART (deferred): `^[a-z,_]+$` alone is refused even though no comma
-      // in the value could be a delimiter, because `_` after the class comma trips
-      // PATTERN_TEXT_AFTER_CLASS_COMMA. Pre-existing behavior, shared with every
-      // swallow case above; narrowing it needs a classifier redesign, not a row here.
+      // KNOWN WART (deferred): `^[a-z,_]+$` is refused even as a SINGLE pattern, though no
+      // comma in the value could be a delimiter, because `_` after the class comma trips
+      // PATTERN_TEXT_AFTER_CLASS_COMMA. Pre-existing; narrowing it needs a classifier
+      // redesign, not a row here.
     ])("still accepts the unambiguous class in %j", (pattern, command) => {
       vi.stubEnv("SSH_MCP_COMMAND_WHITELIST", pattern);
       expect(() => enforcePolicy(command)).not.toThrow();
+    });
+
+    it("refuses an unescaped [,] class as soon as a sibling entry follows, and says so", () => {
+      // The `[,]` idiom is fine alone (row above), but in a LIST its comma is
+      // indistinguishable from a delimiter, so it is refused -- the error names the class
+      // and points at `\,`. The escaped form is accepted in a list. README documents this.
+      vi.stubEnv("SSH_MCP_COMMAND_WHITELIST", "^foo[,]bar$,^df$");
+      expect(() => enforcePolicy("df")).toThrow(/MISCONFIGURED: SSH_MCP_COMMAND_WHITELIST/);
+      expect(() => enforcePolicy("df")).toThrow(/ambiguous character class/);
+      vi.stubEnv("SSH_MCP_COMMAND_WHITELIST", "^foo[\\,]bar$,^df$");
+      expect(() => enforcePolicy("foo,bar")).not.toThrow();
+      expect(() => enforcePolicy("df")).not.toThrow();
+    });
+
+    it("does not refuse an unescaped [,] class that is the only pattern in the list", () => {
+      // No comma in the value could be a delimiter, so the single-pattern case is unaffected.
+      vi.stubEnv("SSH_MCP_COMMAND_WHITELIST", "^foo[,]bar$");
+      expect(() => enforcePolicy("foo,bar")).not.toThrow();
     });
 
     it("an escaped comma keeps working where an unescaped one is ambiguous", () => {
@@ -314,6 +333,42 @@ describe("enforcePolicy", () => {
       vi.stubEnv("SSH_MCP_COMMAND_ALLOW_SHELL_SYNTAX", "yes");
       expect(() => enforcePolicy("ls")).toThrow(/MISCONFIGURED: SSH_MCP_COMMAND_ALLOW_SHELL_SYNTAX/);
       expect(() => enforcePolicy("ls")).toThrow(/Set it to 1 or true/);
+    });
+
+    it("refuses the export and env spellings of a leading assignment", () => {
+      // `env LD_PRELOAD=... ls` is the same redirection as `LD_PRELOAD=... ls` by another
+      // name, and matched a bare `ls` whitelist pattern before this was added.
+      vi.stubEnv("SSH_MCP_COMMAND_WHITELIST", "ls");
+      for (const command of [
+        "env LD_PRELOAD=/tmp/x.so ls",
+        "export PATH=/tmp; ls",
+        "export FOO=ops ls",
+        "  env FOO=1 ls",
+      ]) {
+        expect(() => enforcePolicy(command)).toThrow(/variable assignment/);
+      }
+      // A word that merely STARTS with `env`, or `env` as a later argument, is untouched.
+      for (const command of ["ls environment", "ls -la env", "ls env x"]) {
+        expect(() => enforcePolicy(command)).not.toThrow();
+      }
+    });
+
+    it("an unrecognized opt-out value fails closed with only a blacklist configured", () => {
+      // The read used to live inside the whitelist branch, so under a blacklist-only config a
+      // garbage value was silently accepted and the setting meant to control enforcement
+      // silently stopped meaning anything.
+      vi.stubEnv("SSH_MCP_COMMAND_BLACKLIST", "^reboot");
+      vi.stubEnv("SSH_MCP_COMMAND_ALLOW_SHELL_SYNTAX", "yes");
+      expect(() => enforcePolicy("ls")).toThrow(/MISCONFIGURED: SSH_MCP_COMMAND_ALLOW_SHELL_SYNTAX/);
+    });
+
+    it("the opt-out stays inert when no policy is configured at all", () => {
+      // With no whitelist or blacklist there is nothing for it to control, so a value is not
+      // worth refusing every command over.
+      vi.stubEnv("SSH_MCP_COMMAND_WHITELIST", "");
+      vi.stubEnv("SSH_MCP_COMMAND_BLACKLIST", "");
+      vi.stubEnv("SSH_MCP_COMMAND_ALLOW_SHELL_SYNTAX", "yes");
+      expect(() => enforcePolicy("ls ; id")).not.toThrow();
     });
 
     it("the opt-out does not disable the patterns or the blacklist", () => {
