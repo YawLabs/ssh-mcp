@@ -9,19 +9,11 @@ import { registerTools } from "./tools.js";
 // what they're talking to. package.json is always present in published npm packages
 // (the files allow-list does not affect it) and at the repo root in dev.
 //
-// `__VERSION__` is a hook for a single-file binary build, which would have no
-// package.json beside the executable and would inline the version with an esbuild
-// `define: { __VERSION__: '"x.y.z"' }`. NO build in this repo sets it today:
-// tsup.config.ts has no `define` and no binary build script is wired up (see
-// src/index.ts), so on every current build the branch is dead and the version comes
-// from package.json.
-//
 // The package.json read must never throw at import time: this module is imported
 // before src/index.ts answers --version, so a throw here would crash `ssh-mcp
-// --version` (the Homebrew `test do`) with a stack trace instead of an answer. A
-// missing or unreadable package.json yields UNKNOWN_VERSION and a one-line stderr
-// warning naming the path, so the failure is visible rather than silent.
-declare const __VERSION__: string;
+// --version` with a stack trace instead of an answer. A missing or unreadable
+// package.json yields UNKNOWN_VERSION and a one-line stderr warning naming the
+// path, so the failure is visible rather than silent.
 export const UNKNOWN_VERSION = "0.0.0-unknown";
 
 export function readPackageVersion(packageJsonPath: string): string {
@@ -37,10 +29,7 @@ export function readPackageVersion(packageJsonPath: string): string {
   return UNKNOWN_VERSION;
 }
 
-export const version =
-  typeof __VERSION__ !== "undefined"
-    ? __VERSION__
-    : readPackageVersion(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"));
+export const version = readPackageVersion(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"));
 
 /**
  * Routing guidance sent once, at initialize. Yaw MCP shows it when this server is

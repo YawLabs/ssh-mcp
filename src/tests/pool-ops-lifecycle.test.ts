@@ -1699,7 +1699,7 @@ describe("src/server.ts: readPackageVersion never throws", () => {
 
   it("reads the version, and reports UNKNOWN_VERSION with a stderr line for a missing or versionless package.json", async () => {
     // server.ts runs this at import time, before src/index.ts answers --version, so a throw
-    // would crash `ssh-mcp --version` (the Homebrew test) instead of printing.
+    // would crash `ssh-mcp --version` instead of printing.
     const dir = mkdtempSync(join(tmpdir(), "ssh-mcp-pkg-"));
     dirs.push(dir);
     const good = join(dir, "good.json");
@@ -1744,7 +1744,7 @@ describe("src/server.ts: readPackageVersion never throws", () => {
   it("a built dist/index.js with no package.json beside it still answers --version", async () => {
     // server.ts reads ../package.json at IMPORT time, before src/index.ts answers --version. A
     // throw there (an inline JSON.parse(readFileSync(...)), say) would crash `ssh-mcp --version`
-    // -- the Homebrew `test do` -- with a stack trace. Bundle the real entry the way tsup does
+    // with a stack trace. Bundle the real entry the way tsup does
     // (dependencies external) into a dir with no package.json and run it. The dir sits under
     // the repo's node_modules so the external imports still resolve; ../package.json from its
     // dist/ is the dir itself, which has none.

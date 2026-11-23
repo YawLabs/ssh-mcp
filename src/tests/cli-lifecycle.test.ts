@@ -21,8 +21,8 @@ import { afterAll, describe, expect, it } from "vitest";
 // what no unit test can reach by importing a module:
 //
 //   * the server's --version short-circuit, which must answer BEFORE main()
-//     attaches a stdio transport (Homebrew's `brew test` depends on it, and
-//     that never runs on a win32/linux build)
+//     attaches a stdio transport (an MCP host or a script probing the version
+//     must get an answer and an exit, not a server waiting on stdin)
 //   * the process.on("exit") backstop, the ONLY thing that reaps a self-spawned
 //     ssh-agent when the host closes the pipe -- which fires neither SIGINT nor
 //     SIGTERM

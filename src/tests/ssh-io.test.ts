@@ -1,8 +1,8 @@
 import { EventEmitter } from "node:events";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ---------------------------------------------------------------------------
 // What this suite pins
@@ -152,6 +152,7 @@ const {
 // ---------------------------------------------------------------- fixtures
 
 const FIXTURE_ROOT = mkdtempSync(join(tmpdir(), "ssh-mcp-io-"));
+afterAll(() => rmSync(FIXTURE_ROOT, { recursive: true, force: true }));
 /** Deliberately never created: resolveConfig must find no default keys under it. */
 const FAKE_HOME = join(FIXTURE_ROOT, "home");
 stubs.home = FAKE_HOME;

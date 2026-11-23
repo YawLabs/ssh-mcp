@@ -26,40 +26,43 @@ const WRITER_DELAY_MS = 2000;
 const hasFifo =
   process.platform !== "win32" && spawnSync("mkfifo", ["--help"], { stdio: "ignore" }).error === undefined;
 
-describe.skipIf(!hasFifo)("scanPrivateKeyFiles on a real directory (skipped: needs POSIX mkfifo, not win32)", () => {
-  let dir: string | undefined;
-  let writer: ChildProcess | undefined;
+describe.skipIf(!hasFifo)(
+  `scanPrivateKeyFiles on a real directory${hasFifo ? "" : " (skipped: needs POSIX mkfifo, not win32)"}`,
+  () => {
+    let dir: string | undefined;
+    let writer: ChildProcess | undefined;
 
-  afterEach(() => {
-    writer?.kill("SIGKILL");
-    writer = undefined;
-    if (dir) rmSync(dir, { recursive: true, force: true });
-    dir = undefined;
-  });
+    afterEach(() => {
+      writer?.kill("SIGKILL");
+      writer = undefined;
+      if (dir) rmSync(dir, { recursive: true, force: true });
+      dir = undefined;
+    });
 
-  it("skips a FIFO without blocking and returns only the regular key file", () => {
-    dir = mkdtempSync(join(tmpdir(), "ssh-mcp-scan-"));
-    writeFileSync(join(dir, "id_ed25519"), KEY);
-    writeFileSync(join(dir, ".hidden_key"), KEY); // dotfile: skipped by name
-    writeFileSync(join(dir, "id_ed25519.pub"), "ssh-ed25519 AAAA test\n");
-    writeFileSync(join(dir, "notes.txt"), "not a key\n");
-    mkdirSync(join(dir, "subdir"));
-    const fifo = join(dir, "control-fifo");
-    expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
+    it("skips a FIFO without blocking and returns only the regular key file", () => {
+      dir = mkdtempSync(join(tmpdir(), "ssh-mcp-scan-"));
+      writeFileSync(join(dir, "id_ed25519"), KEY);
+      writeFileSync(join(dir, ".hidden_key"), KEY); // dotfile: skipped by name
+      writeFileSync(join(dir, "id_ed25519.pub"), "ssh-ed25519 AAAA test\n");
+      writeFileSync(join(dir, "notes.txt"), "not a key\n");
+      mkdirSync(join(dir, "subdir"));
+      const fifo = join(dir, "control-fifo");
+      expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
 
-    writer = spawn(
-      process.execPath,
-      ["-e", `setTimeout(() => require("node:fs").openSync(${JSON.stringify(fifo)}, "w"), ${WRITER_DELAY_MS})`],
-      { stdio: "ignore" },
-    );
+      writer = spawn(
+        process.execPath,
+        ["-e", `setTimeout(() => require("node:fs").openSync(${JSON.stringify(fifo)}, "w"), ${WRITER_DELAY_MS})`],
+        { stdio: "ignore" },
+      );
 
-    const start = Date.now();
-    const found = scanPrivateKeyFiles(dir);
-    const elapsed = Date.now() - start;
+      const start = Date.now();
+      const found = scanPrivateKeyFiles(dir);
+      const elapsed = Date.now() - start;
 
-    expect(elapsed).toBeLessThan(WRITER_DELAY_MS / 2);
-    expect(found.map((c) => c.name)).toEqual(["id_ed25519"]);
-    expect(found[0].content).toBe(KEY);
-    expect(found[0].path).toBe(join(dir, "id_ed25519"));
-  });
-});
+      expect(elapsed).toBeLessThan(WRITER_DELAY_MS / 2);
+      expect(found.map((c) => c.name)).toEqual(["id_ed25519"]);
+      expect(found[0].content).toBe(KEY);
+      expect(found[0].path).toBe(join(dir, "id_ed25519"));
+    });
+  },
+);

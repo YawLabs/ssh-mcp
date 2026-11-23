@@ -5,7 +5,7 @@ import { createServer, version } from "./server.js";
 
 // Handle --version BEFORE main() (which connects stdio and blocks forever).
 //
-// Four consumers depend on this, and a change here is only safe if it holds for
+// Two consumers depend on this, and a change here is only safe if it holds for
 // every one of them. Not CI: this repo has no .github/workflows, it releases
 // from the workstation via ./release.sh.
 //
@@ -29,22 +29,9 @@ import { createServer, version } from "./server.js";
 //    newer oam to spawn), forward the flag unchanged into a
 //    subprocess running this same module, so the answer has to come from here
 //    either way.
-// 3. A single-file binary. Such a build bundles src/index.ts straight into the
-//    executable and does NOT go through bin/ssh-mcp.mjs, so the early exit below
-//    is inlined and is what makes the binary terminate on --version at all. A
-//    --version that reached main() would attach the transport to whatever stdin
-//    the binary inherited and HANG. (This repo has no binary build script wired
-//    up right now; the Homebrew/Scoop manifests scripts/update-manifests.mjs
-//    generates still point at per-arch binaries, so the invariant stands.)
-// 4. scripts/update-manifests.mjs, the formula template's `test do` block -- the generated Homebrew formula's
-//    `test do assert_match version.to_s, shell_output("#{bin}/ssh-mcp --version")`.
-//    `brew test` runs that against the RELEASED binary, so it fails if this stops
-//    printing a bare version to stdout or stops exiting.
 //
 // So: keep this synchronous, keep it above main(), keep the exit, and keep the
-// output a bare version on stdout. (Verified against a built single-file binary:
-// `ssh-mcp --version` prints and exits 0 -- argv[2] is still the first user arg
-// there.)
+// output a bare version on stdout.
 if (process.argv[2] === "--version" || process.argv[2] === "version") {
   console.log(version);
   process.exit(0);

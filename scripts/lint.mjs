@@ -32,10 +32,9 @@
  *
  * Why it matters here specifically: this repo has no .github/workflows and
  * GitHub Actions is disabled on it, so there is no runner to arbitrate
- * formatting later. `release.sh` documents a CI mode driven by
- * `.github/workflows/release.yml`, but no such workflow exists; the
- * workstation run is what publishes. Whatever this script reports is the ONLY
- * lint signal that exists before `release.sh` publishes to npm.
+ * formatting later: the workstation run of `release.sh` is the only publisher.
+ * Whatever this script reports is the ONLY lint signal that exists before
+ * `release.sh` publishes to npm.
  *
  * Escape hatches, in case the platform assumption ages badly:
  *   YAWLABS_BIOME_BIN=<path>   use exactly this binary, skip all detection

@@ -150,6 +150,20 @@ describe("release.sh pre-flight", () => {
     const firstUse = releaseSh.search(/^\s*[^#\n]*\$\(jq |^\s*jq /m);
     expect(firstUse).toBeGreaterThan(check);
   });
+
+  // The workstation is the only publisher. The fleet copy's CI mode (CI=true,
+  // version from GITHUB_REF_NAME, --provenance) and its hand-off to a
+  // release.yml run were removed, so no environment variable or stray workflow
+  // file can turn the local publish into a skip or a wait on a run.
+  it("has one workstation path: no CI mode, no release.yml hand-off", () => {
+    const code = releaseSh
+      .split("\n")
+      .filter((l) => !/^\s*#/.test(l))
+      .join("\n");
+    expect(code).not.toMatch(/IS_CI|GITHUB_REF_NAME|--provenance|release\.yml|gh run (watch|list)/);
+    expect(code).toMatch(/^command -v gh >\/dev\/null \|\| fail/m);
+    expect(code).toContain("npm publish --access public 2>&1");
+  });
 });
 
 describe("npm run test:integration", () => {
