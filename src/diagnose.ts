@@ -8,8 +8,10 @@ import {
   readdirSync,
   readFileSync,
 } from "node:fs";
+import { isIP } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { domainToASCII } from "node:url";
 
 export interface DiagnosticResult {
   status: "ok" | "warning" | "error";
@@ -102,6 +104,73 @@ export function isValidHostname(host: string): boolean {
   // Underscore is allowed even though DNS labels technically forbid it, because SSH config
   // aliases commonly use it (e.g. "my_server") and rejecting them would surprise users.
   return /^[a-zA-Z0-9._-]+$/.test(host);
+}
+
+// The connection path's host check (resolveConfig in ssh.ts, so ssh_exec, the SFTP
+// tools, ssh_multi_exec, every pool acquire, and each ProxyJump hop). It is
+// isValidHostname plus three more shapes the connection path dialed long before this
+// check existed, and must keep dialing:
+//
+//   - a BARE IPv6 literal such as `::1`, `fe80::1` or `fe80::1%eth0`. ssh2 dials those
+//     as-is, `ssh -G '[::1]'` prints the bare form, and a ProxyJump hop arrives bare
+//     after parseJumpSpec strips its brackets.
+//   - a BRACKETED IPv6 literal with a zone id, `[fe80::1%eth0]` (isValidHostname's
+//     bracket form is hex and colons only). resolveConfig dials it unbracketed.
+//   - an internationalized hostname, `bücher.de` (isInternationalHostname below).
+//
+// `net.isIP` decides the IPv6 shapes, and an IPv6 literal can never start with '-',
+// so nothing option-shaped gets through. The diagnostic and env tools keep the
+// narrower isValidHostname: their hosts go to ssh / ssh-keygen / ssh-keyscan argv
+// positionally.
+export const INVALID_SSH_HOST_SUGGESTION =
+  "Use a hostname, ssh_config alias or IPv4 address (letters, digits, dots, underscores and hyphens, not starting with a hyphen; an internationalized name such as bücher.de is accepted too), or an IPv6 literal, bare (::1, fe80::1%eth0) or bracketed ([::1], [fe80::1%eth0]). Pass the port separately, not as host:port.";
+
+/** `[x]` where x is an IPv6 literal (zone id allowed) -> x; anything else -> null. */
+export function bracketedIpv6Inner(host: string): string | null {
+  if (host.length < 3 || !host.startsWith("[") || !host.endsWith("]")) return null;
+  const inner = host.slice(1, -1);
+  return isIP(inner) === 6 ? inner : null;
+}
+
+// Unicode controls, format characters (zero-width, bidi overrides) and separators.
+// UTS #46 maps some of them to nothing, so domainToASCII alone would let a host carry
+// an invisible character the resolver is then handed verbatim.
+const UNICODE_CONTROL_OR_SPACE = /[\p{C}\p{Z}]/u;
+
+/**
+ * An internationalized hostname such as `bücher.de`. OpenSSH's own valid_hostname
+ * accepts UTF-8, and the connection path dialed these directly before it had a host
+ * check (Node's resolver handles them). The rule is deliberately narrow:
+ *
+ *   - no leading '-' (checked on the raw text, since punycode moves it inside),
+ *   - at least one non-ASCII character (an all-ASCII host is isValidHostname's job),
+ *   - every ASCII character is a letter, digit, '.', '_' or '-' -- the same set
+ *     isValidHostname allows, so no ':', '@', '/', '%', whitespace or shell syntax
+ *     (domainToASCII would percent-decode `%41`, so this must not be left to it),
+ *   - no Unicode control, format or separator character (a soft hyphen, which IDNA
+ *     maps to nothing, is a format character -- so `­-x` cannot hide a '-'),
+ *   - and its IDNA (punycode) form, `url.domainToASCII`, is non-empty and passes
+ *     isValidHostname (length, and characters the mapping produced).
+ *
+ * Such a host never reaches an argv: `ssh -G` and the known_hosts lookups only take
+ * isValidHostname's shapes and skip it, exactly as before the check existed.
+ */
+export function isInternationalHostname(host: string): boolean {
+  // Checked on the raw text: punycode hides a leading '-' ("-bücher" -> "xn---bcher-kva").
+  if (host.startsWith("-")) return false;
+  const asciiChars = [...host].filter((c) => (c.codePointAt(0) ?? 0) < 0x80).join("");
+  if (asciiChars.length === host.length) return false;
+  if (!/^[a-zA-Z0-9._-]*$/.test(asciiChars)) return false;
+  if (UNICODE_CONTROL_OR_SPACE.test(host)) return false;
+  const ascii = domainToASCII(host);
+  return ascii !== "" && isValidHostname(ascii);
+}
+
+export function isValidSshHost(host: string): boolean {
+  if (typeof host !== "string") return false; // library callers are not type-checked
+  return (
+    isValidHostname(host) || isIP(host) === 6 || bracketedIpv6Inner(host) !== null || isInternationalHostname(host)
+  );
 }
 
 /** Default kill timeout for every runArgs child. */

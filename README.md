@@ -112,6 +112,18 @@ Tools that wrap common patterns agents build with ssh_exec — faster and less e
 
 When any remote operation fails, ssh-mcp automatically runs diagnostics and includes the results in the error response. Your agent doesn't need to call `ssh_diagnose` separately — it gets told what's wrong and how to fix it right in the error message.
 
+The diagnostics are matched to the kind of failure, so the real cause is not buried under checks that cannot explain it:
+
+| Failure | What the error carries |
+|---------|------------------------|
+| Network (refused, DNS, unreachable, timed out, a ProxyJump hop that cannot reach the target) | The host and port actually dialed, the `~/.ssh/config` alias it came from, and any ProxyJump. No agent, key or known_hosts checks. |
+| Host key rejected | Why the key was rejected (mismatch, missing algorithm, or strict mode with no entry) and the exact fix command. |
+| Authentication | The agent check, but only when that agent was offered on this connection (so a dead `SSH_AUTH_SOCK` is named as the reason no agent key was tried), the key check for the default offer, and which user, agent and key file were offered. An explicit `password` or `privateKeyPath` offers no agent, so neither check is shown. |
+| Any of the above on a ProxyJump hop, before the target was reached | A `Jump host` line naming the hop, then the row above for THAT hop: its dial target, or the agent and key it offered (a bastion offers the default agent and key even when the target was given a `password`). |
+| Anything else | Every check: agent, keys, ssh config, known_hosts. |
+
+An invalid `host` is the exception: it is refused up front with a one-line `Invalid SSH host "..."` error and no diagnostics, since nothing was looked up or dialed (see [Authentication](#authentication)). In the library, `resolveConfig()`, `connect()` and `ConnectionPool.acquire()` throw it as an `InvalidHostError` (`code: "ERR_SSH_MCP_INVALID_HOST"`, `isInvalidHostError()`).
+
 ### Connection pooling
 
 Remote operations reuse SSH connections automatically. When your agent makes multiple calls to the same host, the first call opens a connection and subsequent calls reuse it. Connections are kept alive for 60 seconds after the last use, then closed automatically.
@@ -234,7 +246,7 @@ On Windows, ssh-mcp uses the OpenSSH Authentication Agent's `\\.\pipe\openssh-ss
 
 On the [oam](https://oamjs.org) runtime, the launcher serves only on oam 0.21.1 or newer. Agent auth needs a `net` that can dial a named pipe or a Unix socket (that is how ssh2 reaches the agent), which older oam releases could not do. On oam 0.20.2 (Windows) the MCP handshake, `ssh_config_lookup`, `ssh_key_list` and `ssh_agent_ensure` were verified through the launcher, and ssh2's own agent client was verified dialing a named pipe and completing an identities request (against a stand-in agent on a pipe). An agent-only `ssh_exec` end to end has so far been verified on Node only. Started from Node, the launcher prefers oam (`auto`); to rule the runtime out when agent auth fails there, set `SSH_MCP_RUNTIME=node`. Started by oam with no Node on `PATH`, it can still serve on oam: see [Runtime selection](#runtime-selection). ed25519 and ECDSA keys and ed25519-only servers used to be broken on oam 0.20.2; that is fixed as of 0.21.1 — see [oam key support](#oam-key-support).
 
-`ssh_agent_ensure` and `ssh_diagnose` probe that pipe and tell you if the service is down. Remote operations do *not*: they assume the pipe and let the connection fail on its own if the agent isn't there. That is why a stopped agent service shows up as an auth failure rather than an "agent not running" error until you run the diagnostic tools.
+`ssh_agent_ensure` and `ssh_diagnose` probe that pipe and tell you if the service is down. Remote operations do *not*: they assume the pipe and let the connection fail on its own if the agent isn't there. That is why a stopped agent service shows up as an auth failure (ssh2's `Failed to connect to agent`) rather than an "agent not running" error; that failure's [auto-diagnostics](#auto-diagnostics) carry the agent check.
 
 ## Authentication
 
@@ -242,7 +254,7 @@ All remote operations accept connection parameters:
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `host` | SSH hostname or IP (required) | — |
+| `host` | SSH hostname, `~/.ssh/config` alias, or IP (required). An IPv6 literal may be bare (`::1`, `fe80::1%eth0`) or bracketed (`[::1]`, `[fe80::1%eth0]`), and is dialed bare. An internationalized name such as `bücher.de` is accepted and dialed as given, but skips the `~/.ssh/config` and known_hosts lookups (as it always has), so it is trusted on every connection even with a known_hosts entry and refused in strict mode: give it in punycode (`xn--bcher-kva.de`) for those. A host that starts with `-`, carries a port (`host:22`), a login (`user@host`) or shell syntax is refused before any `ssh -G` lookup, DNS query or connection. | — |
 | `port` | SSH port | From SSH config or `22` |
 | `username` | SSH username | From SSH config or current user |
 | `privateKeyPath` | Path to SSH private key | Auto-detect |

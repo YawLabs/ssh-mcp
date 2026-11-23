@@ -997,12 +997,12 @@ describe("`ssh -G` probing", () => {
     expect(probe?.args).toEqual(["-G", "--", "plain-host.test"]);
   });
 
-  it("never spawns ssh for an option-shaped or injection-shaped host", () => {
+  it("never spawns ssh for an option-shaped or injection-shaped host -- resolveConfig refuses it", () => {
     for (const host of ["-oProxyCommand=evil", "-E/tmp/x", "host; rm -rf /"]) {
       clearSshConfigCache();
-      resolveConfig({ host, password: "x" });
+      expect(() => resolveConfig({ host, password: "x" })).toThrow(`Invalid SSH host ${JSON.stringify(host)}`);
     }
-    expect(stubs.runArgsCalls.filter((c) => c.cmd === "ssh")).toEqual([]);
+    expect(stubs.runArgsCalls).toEqual([]);
   });
 
   it("still probes a bracketed or bare IPv6 literal", () => {
@@ -1056,7 +1056,10 @@ describe("enhanceSshError", () => {
     expect(enhanceSshError(original, "quiet.test")).toBe(original);
   });
 
-  it("folds the host-key rejection reason in ahead of the diagnostics", () => {
+  it("folds the host-key rejection reason in, and that reason is the whole diagnosis", () => {
+    // The verifier's reason is already the known_hosts answer, remedy included, so a
+    // recorded rejection gets no environment checks: before failure classification it
+    // was followed by agent / keys / known_hosts lines that could not explain it.
     stubs.knownHostsCheck = { status: "warning", message: "TEST-DIAG-MARKER" };
     const resolved = {
       connectConfig: {},
@@ -1067,10 +1070,8 @@ describe("enhanceSshError", () => {
     const enhanced = enhanceSshError(new Error("Host denied (verification failed)"), "x.test", resolved);
     expect(enhanced).toBeInstanceOf(Error);
     const message = (enhanced as Error).message;
-    expect(message).toContain("Host denied (verification failed)");
-    expect(message).toContain("TEST-REJECTION-DETAIL");
-    expect(message).toContain("TEST-DIAG-MARKER");
-    expect(message.indexOf("TEST-REJECTION-DETAIL")).toBeLessThan(message.indexOf("TEST-DIAG-MARKER"));
+    expect(message).toBe("Host denied (verification failed)\n\nHost key check failed -- TEST-REJECTION-DETAIL");
+    expect(stubs.knownHostsCheckCalls).toEqual([]);
   });
 
   it("handles a non-Error rejection value", () => {

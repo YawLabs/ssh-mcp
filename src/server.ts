@@ -92,6 +92,7 @@ export { ConnectionPool, isPoolFullError, POOL_FULL_ERROR_CODE, PoolFullError } 
 // HostKeyRejection / HostKeyRejectionReason are named by the public ResolvedConfig,
 // so a consumer cannot fully type that value without them.
 export type {
+  DiagnosticsContext,
   ExecResult,
   FileRange,
   FileStats,
@@ -99,8 +100,10 @@ export type {
   HostKeyRejectionReason,
   ResolvedConfig,
   SSHConfig,
+  SshFailureKind,
 } from "./ssh.js";
 export {
+  classifySshFailure,
   connect,
   connectRaw,
   connectWithProxy,
@@ -108,6 +111,9 @@ export {
   downloadFile,
   exec,
   formatDiagnostics,
+  INVALID_HOST_ERROR_CODE,
+  InvalidHostError,
+  isInvalidHostError,
   listDir,
   makeDir,
   readFile,

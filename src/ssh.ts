@@ -12,13 +12,16 @@ import {
 } from "ssh2";
 import {
   agentStartSuggestion,
+  bracketedIpv6Inner,
   checkKnownHosts,
   checkSshAgent,
   checkSshConfig,
   checkSshKeys,
   type DiagnosticResult,
+  INVALID_SSH_HOST_SUGGESTION,
   isStrictHostKeyMode,
   isValidHostname,
+  isValidSshHost,
   keyscanCommand,
   runArgs,
   WINDOWS_AGENT_PIPE,
@@ -86,6 +89,24 @@ export interface ResolvedConfig {
    * hand-built ResolvedConfig, so callers use `?.()`.
    */
   applyHostKeyAlgorithms?: () => void;
+  /**
+   * Which credentials `resolveConfig` chose, for the failure diagnostics only (the
+   * dial reads `connectConfig`). `source` is the branch taken: an explicit
+   * `privateKeyPath`, an explicit `password`, or the default agent-plus-key-file
+   * offer. `keyFile` is the key file loaded, if any. Absent on a hand-built
+   * ResolvedConfig, which the diagnostics treat as "unknown, assume default".
+   */
+  auth?: { source: "privateKeyPath" | "password" | "default"; keyFile?: string };
+  /**
+   * Written by `connectWithProxy` when the connection to a ProxyJump hop failed, so
+   * the target was never reached: the DEEPEST hop that failed, as named in the
+   * ProxyJump value (`host`, and `label` in its full `user@host:port` spelling), and
+   * that hop's own ResolvedConfig. The failure diagnostics describe this hop's dial
+   * target and credentials instead of the target's -- a bastion that refuses the
+   * dead SSH_AUTH_SOCK agent is not explained by the target's `password`. Cleared at
+   * the start of every dial; absent when the failure was the target's own.
+   */
+  failedJumpHop?: { host: string; label: string; resolved: ResolvedConfig };
 }
 
 // `ssh -G <host>` is a synchronous subprocess spawn costing ~0.3-0.9s (worst on
@@ -556,7 +577,55 @@ function isEncryptedKey(content: Buffer): boolean {
   return false;
 }
 
+/** `code` of the error the connection path throws for a host it refuses to look up or dial. */
+export const INVALID_HOST_ERROR_CODE = "ERR_SSH_MCP_INVALID_HOST";
+
+// Longest prefix of a rejected host echoed back. The value is caller input of any
+// length; the message only needs enough of it to recognise.
+const REJECTED_HOST_ECHO_MAX = 64;
+
+/**
+ * Thrown by `resolveConfig` (and so by `connect`, `ConnectionPool.acquire` and every
+ * tool built on them) when the host fails `isValidSshHost`, and by `connectWithProxy`
+ * when a ProxyJump hop does. It is an INPUT error, raised before `ssh -G` is spawned or
+ * anything is dialed, so `enhanceSshError` passes it through untouched: the SSH
+ * environment diagnostics describe this machine's agent and keys, which are not why a
+ * call naming `-oProxyCommand=x` failed. The rejected value is echoed JSON-quoted (so
+ * a control character or a newline cannot forge extra lines) and truncated.
+ */
+export class InvalidHostError extends Error {
+  readonly code = INVALID_HOST_ERROR_CODE;
+  /** The rejected value, verbatim. */
+  readonly host: string;
+  constructor(host: string, options?: { role?: string; context?: string; refusedBefore?: string }) {
+    const text = String(host);
+    const shown =
+      text.length > REJECTED_HOST_ECHO_MAX
+        ? `${JSON.stringify(text.slice(0, REJECTED_HOST_ECHO_MAX))}... (${text.length} characters)`
+        : JSON.stringify(text);
+    const role = options?.role ?? "SSH host";
+    const context = options?.context ? ` ${options.context}` : "";
+    const refusedBefore = options?.refusedBefore ?? "any ssh_config lookup or connection";
+    super(`Invalid ${role} ${shown}${context}: refused before ${refusedBefore}. ${INVALID_SSH_HOST_SUGGESTION}`);
+    this.name = "InvalidHostError";
+    this.host = text;
+  }
+}
+
+/** True for the connection path's invalid-host rejection. Checks `code`, like isPoolFullError. */
+export function isInvalidHostError(err: unknown): err is InvalidHostError {
+  return typeof err === "object" && err !== null && (err as { code?: unknown }).code === INVALID_HOST_ERROR_CODE;
+}
+
 export function resolveConfig(config: SSHConfig): ResolvedConfig {
+  // The connection path's single input gate. Every way in -- connect(), each pool
+  // acquire (so every remote tool), and connectWithProxy's hops -- resolves through
+  // here, so a host such as `-oProxyCommand=x` or `host:22` is refused before the
+  // `ssh -G` spawn, before the known_hosts reads, and before DNS. Only the CALLER's
+  // host is checked: the HostName `ssh -G` resolves it to is the operator's own config
+  // and is dialed as given.
+  if (!isValidSshHost(config.host)) throw new InvalidHostError(config.host);
+
   // Resolve SSH config for the host (hostname aliases, user, port, identity files, proxy)
   const sshConfig = resolveFromSshConfig(config.host);
 
@@ -574,7 +643,11 @@ export function resolveConfig(config: SSHConfig): ResolvedConfig {
     verifierHosts.push(candidate);
   }
   const hostKeyRejection: { current: HostKeyRejection | null } = { current: null };
-  const dialHost = sshConfig?.hostname || config.host;
+  // A bracketed IPv6 literal is dialed bare: the brackets are URL / ssh_config
+  // spelling, and the resolver refuses them (`[fe80::1%eth0]` is ENOTFOUND). `ssh -G`
+  // already answers the bare form when it runs; this covers the case it does not --
+  // a zone id, which isValidHostname's bracket form refuses, or no ssh client at all.
+  const dialHost = sshConfig?.hostname || bracketedIpv6Inner(config.host) || config.host;
   // Username fallback chain: explicit > ssh_config User > $USER/$USERNAME > "root".
   // The trailing "root" is a last-ditch default for env-stripped contexts (containers
   // without USER/USERNAME and without ssh installed for `ssh -G` to provide a user).
@@ -637,11 +710,16 @@ export function resolveConfig(config: SSHConfig): ResolvedConfig {
   // is an encrypted or malformed one when an agent is configured. Both filters live
   // on that branch; see the comment there.
   const home = homedir();
+  let auth: NonNullable<ResolvedConfig["auth"]>;
   if (config.privateKeyPath) {
-    connectConfig.privateKey = readFileSync(expandTilde(config.privateKeyPath, home));
+    const keyFile = expandTilde(config.privateKeyPath, home);
+    connectConfig.privateKey = readFileSync(keyFile);
+    auth = { source: "privateKeyPath", keyFile };
   } else if (config.password) {
     connectConfig.password = config.password;
+    auth = { source: "password" };
   } else {
+    auth = { source: "default" };
     const agentSock =
       config.agent || process.env.SSH_AUTH_SOCK || (process.platform === "win32" ? WINDOWS_AGENT_PIPE : undefined);
     if (agentSock) {
@@ -692,11 +770,12 @@ export function resolveConfig(config: SSHConfig): ResolvedConfig {
       if (!looksLikePrivateKey(keyData)) continue;
       if (agentSock && isEncryptedKey(keyData)) continue;
       connectConfig.privateKey = keyData;
+      auth.keyFile = keyPath;
       break;
     }
   }
 
-  return { connectConfig, proxyJump: sshConfig?.proxyJump, hostKeyRejection, applyHostKeyAlgorithms };
+  return { connectConfig, proxyJump: sshConfig?.proxyJump, hostKeyRejection, applyHostKeyAlgorithms, auth };
 }
 
 // Short TTL cache for the non-host-specific diagnostic checks. Under a burst of
@@ -729,40 +808,255 @@ function cachedKeysCheck(): DiagnosticResult {
 }
 
 /**
- * `dial` is the RESOLVED hostname and port when the caller has them (enhanceSshError
- * passes the ResolvedConfig's). It only steers the ssh-keyscan suggestion, which must
- * name what ssh-keyscan can actually reach -- see keyscanCommand.
+ * What kind of failure a connection error is, which decides the local checks that
+ * can explain it (see formatDiagnostics):
+ *
+ *   network  -- the server was never reached, or stopped answering: refused, DNS,
+ *               unreachable, timed out, or a ProxyJump hop could not open the
+ *               forwarded channel. This machine's agent and keys cannot cause it.
+ *   host-key -- our hostVerifier turned the server's key down.
+ *   auth     -- the server was reached and refused every credential offered, or a
+ *               credential could not be used at all (unparseable key file, an agent
+ *               that did not answer).
+ *   unknown  -- anything else; gets the full set of checks, as before.
  */
-export function formatDiagnostics(host: string, dial?: { host: string; port?: number }): string {
-  // Run fast local checks only — skip connectivity re-test to avoid adding seconds of delay
-  try {
-    const checks = [
-      { name: "SSH Agent", ...cachedAgentCheck() },
-      { name: "SSH Keys", ...cachedKeysCheck() },
-      { name: "SSH Config", ...checkSshConfig(host) },
-      // known_hosts records the RESOLVED name and port, not the ssh_config alias.
-      { name: "Known Hosts", ...checkKnownHosts(dial?.host ?? host, dial?.port ?? 22) },
-    ];
+export type SshFailureKind = "network" | "host-key" | "auth" | "unknown";
 
+const NETWORK_ERROR_CODES: ReadonlySet<string> = new Set([
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ETIMEDOUT",
+  "EHOSTUNREACH",
+  "EHOSTDOWN",
+  "ENETUNREACH",
+  "ENETDOWN",
+]);
+const NETWORK_CODE_IN_MESSAGE = new RegExp(`\\b(?:${[...NETWORK_ERROR_CODES].join("|")})\\b`);
+
+/**
+ * Classify a connection failure. ssh2 tags every error it emits with a `level`, and
+ * that tag is read FIRST: it is the only thing that tells an agent socket that
+ * refused (`level: "agent"`, possibly with code ECONNREFUSED or ENOENT) from a server
+ * that refused (`level: "client-socket"`). ssh2 tries the agent last, after any key
+ * file, and our config enables nothing after it, so an agent-level error means
+ * authentication has already failed -- connectRaw rejects on it, ahead of ssh2's own
+ * "All configured authentication methods failed". Codes and message text are the
+ * fallback for errors that carry no level (a ProxyJump channel failure, a
+ * privateKey ssh2 could not parse, an error built elsewhere).
+ */
+export function classifySshFailure(err: unknown, resolved?: ResolvedConfig): SshFailureKind {
+  if (resolved?.hostKeyRejection?.current) return "host-key";
+  if (typeof err !== "object" || err === null) return "unknown";
+  const { level, code, message } = err as { level?: unknown; code?: unknown; message?: unknown };
+  const text = typeof message === "string" ? message : "";
+
+  if (level === "agent" || level === "client-authentication") return "auth";
+  if (level === "client-socket" || level === "client-dns" || level === "client-timeout") return "network";
+  if (text.startsWith("Host denied (verification failed)")) return "host-key";
+  if (
+    text.startsWith("All configured authentication methods failed") ||
+    text.startsWith("Cannot parse privateKey") ||
+    text.startsWith("privateKey value does not contain a (valid) private key")
+  ) {
+    return "auth";
+  }
+  if (typeof code === "string" && NETWORK_ERROR_CODES.has(code)) return "network";
+  if (
+    text.startsWith("Timed out while waiting for handshake") ||
+    text.startsWith("(SSH) Channel open failure") ||
+    NETWORK_CODE_IN_MESSAGE.test(text)
+  ) {
+    return "network";
+  }
+  return "unknown";
+}
+
+/** What `formatDiagnostics` knows about the failure it is describing. */
+export interface DiagnosticsContext {
+  /** From `classifySshFailure`. Omitted means "unknown": every check runs. */
+  kind?: SshFailureKind;
+  /** The failed connection's resolved config, when resolution got that far. */
+  resolved?: ResolvedConfig;
+}
+
+// Does checkSshAgent describe the agent this connection actually offered? It probes
+// SSH_AUTH_SOCK (falling back to the Windows pipe), so it does for the default offer,
+// and not for an explicit `agent` elsewhere or for a privateKeyPath / password call,
+// which offers no agent at all. A hand-built ResolvedConfig (no `auth`) is assumed
+// default, like the pre-classification behaviour.
+function offeredAgentIsProbed(resolved: ResolvedConfig | undefined): boolean {
+  if (!resolved?.auth) return true;
+  if (resolved.auth.source !== "default") return false;
+  const offered = resolved.connectConfig.agent;
+  // None offered (no SSH_AUTH_SOCK, not Windows): the check says why, which is relevant.
+  if (offered === undefined) return true;
+  if (typeof offered !== "string") return false;
+  const sock = process.env.SSH_AUTH_SOCK;
+  if (sock) return offered === sock;
+  return process.platform === "win32" && offered.toLowerCase() === WINDOWS_AGENT_PIPE;
+}
+
+/** How the agent the connection offered is named in the auth-failure note. */
+function offeredAgentLabel(agent: string): string {
+  if (agent === process.env.SSH_AUTH_SOCK) return `SSH_AUTH_SOCK (${JSON.stringify(agent)})`;
+  if (agent.toLowerCase() === WINDOWS_AGENT_PIPE) return `the Windows OpenSSH agent pipe (${agent})`;
+  return JSON.stringify(agent);
+}
+
+/** One line naming who authenticated with what, so an auth failure says what was tried. */
+function describeAuthOffer(resolved: ResolvedConfig): string | null {
+  const { auth, connectConfig } = resolved;
+  if (!auth) return null;
+  const user = JSON.stringify(String(connectConfig.username ?? ""));
+  const target = `${connectConfig.host} port ${connectConfig.port ?? 22}`;
+  let offered: string;
+  if (auth.source === "password") {
+    offered = "the password given (no key, no agent)";
+  } else if (auth.source === "privateKeyPath") {
+    offered = `only the key file ${JSON.stringify(auth.keyFile ?? "")} given as privateKeyPath (no agent)`;
+  } else {
+    const items: string[] = [];
+    if (typeof connectConfig.agent === "string") items.push(`the agent at ${offeredAgentLabel(connectConfig.agent)}`);
+    if (auth.keyFile) items.push(`the key file ${JSON.stringify(auth.keyFile)}`);
+    offered = items.length > 0 ? items.join(" and ") : "nothing: no agent and no usable key file was found";
+  }
+  return `[INFO] Authentication: user ${user} at ${target} offered ${offered}.`;
+}
+
+/** One line naming what was actually dialed, so a network failure says where it went. */
+function describeDialTarget(host: string, resolved: ResolvedConfig): string | null {
+  const dialHost = resolved.connectConfig.host;
+  if (!dialHost) return null;
+  let line = `[INFO] Target: dialed ${dialHost} port ${resolved.connectConfig.port ?? 22}`;
+  // Case-insensitive: hostnames are, and `ssh -G` lowercases the HostName it prints,
+  // so a plain `Example.COM` with no ssh_config entry comes back as example.com.
+  if (unbracketHost(dialHost).toLowerCase() !== unbracketHost(host).toLowerCase()) {
+    line += ` for ${JSON.stringify(host)} (its HostName from ssh_config)`;
+  }
+  if (resolved.proxyJump) {
+    line += `, through ProxyJump ${JSON.stringify(resolved.proxyJump)} from ssh_config, so the failure may be on that hop`;
+  }
+  return `${line}.`;
+}
+
+/**
+ * The local checks that can explain a failure of the given kind, non-ok ones first
+ * by relevance, then suggested fixes. Fast local checks only -- no connectivity
+ * re-test, which would add seconds.
+ *
+ *   network  -- the dial target (resolved HostName / port / ProxyJump) and an
+ *               unreadable ~/.ssh/config. No agent, key or known_hosts check, and so
+ *               no ssh-add / ssh-keygen spawn: none of them can refuse a TCP connect.
+ *   host-key -- nothing when the verifier recorded why (enhanceSshError prints that,
+ *               and it is already the known_hosts answer, remedy included); otherwise
+ *               the Known Hosts check.
+ *   auth     -- the agent check (only when it describes the agent this connection
+ *               offered, with a note saying so), the keys check (only for the default
+ *               offer), then what was offered as whom.
+ *   unknown  -- every check, as before classification existed.
+ *
+ * When `context.resolved.failedJumpHop` is set the target was never reached: a
+ * `Jump host` line names the hop that failed, and every section above describes
+ * THAT hop -- its dial target, its credentials (a bastion offers the default agent
+ * and key even when the target was called with a password) and its known_hosts
+ * entry -- instead of the target's.
+ *
+ * `dial` is the RESOLVED hostname and port when the caller has them; it steers the
+ * known_hosts lookup and the ssh-keyscan suggestion, which must name what
+ * ssh-keyscan can actually reach -- see keyscanCommand. It defaults to
+ * `context.resolved`'s, and is ignored for a failed jump hop, whose own resolved
+ * config is the one that was dialed.
+ */
+export function formatDiagnostics(
+  host: string,
+  dial?: { host: string; port?: number },
+  context: DiagnosticsContext = {},
+): string {
+  const kind = context.kind ?? "unknown";
+  const jump = context.resolved?.failedJumpHop;
+  // The connection the failure happened on, and the name it was asked for by.
+  const resolved = jump?.resolved ?? context.resolved;
+  const subjectHost = jump?.host ?? host;
+  const target =
+    (jump ? undefined : dial) ??
+    (resolved?.connectConfig.host
+      ? { host: resolved.connectConfig.host, port: resolved.connectConfig.port as number | undefined }
+      : undefined);
+  try {
     const parts: string[] = [];
     const suggestions: string[] = [];
-
-    for (const check of checks) {
-      if (check.status !== "ok") {
-        parts.push(`[${check.status.toUpperCase()}] ${check.name}: ${check.message}`);
-      }
+    // A recorded host-key rejection already names the jump host (connectWithProxy
+    // labels it), and that rejection alone is the host-key answer.
+    if (jump && !(kind === "host-key" && resolved?.hostKeyRejection?.current)) {
+      parts.push(
+        `[INFO] Jump host: the connection failed on ProxyJump hop ${JSON.stringify(jump.label)}, so ${JSON.stringify(host)} was never reached; the lines below describe that hop.`,
+      );
     }
+    const report = (name: string, check: DiagnosticResult, note?: string) => {
+      if (check.status === "ok") return false;
+      parts.push(`[${check.status.toUpperCase()}] ${name}: ${check.message}${note ? ` ${note}` : ""}`);
+      return true;
+    };
 
-    const agent = checks[0];
-    if (agent.status === "error") suggestions.push(agentStartSuggestion());
-    if (agent.status === "warning") suggestions.push("Load a key: ssh-add ~/.ssh/id_ed25519");
+    const agentSection = (forAuth: boolean) => {
+      const agent = cachedAgentCheck();
+      const offered = resolved?.connectConfig.agent;
+      // Why it matters HERE: the agent that failed the check is the one this
+      // connection's authentication went to, so it got no agent key.
+      const who = jump ? `The connection to jump host ${JSON.stringify(jump.label)}` : "This connection";
+      const note =
+        forAuth && typeof offered === "string"
+          ? `${who} offered the agent at ${offeredAgentLabel(offered)} for authentication, so no agent key was tried.`
+          : undefined;
+      if (!report("SSH Agent", agent, note)) return;
+      if (agent.status === "error") suggestions.push(agentStartSuggestion());
+      // A stale SSH_AUTH_SOCK beside a live Windows agent is a warning too, and loading
+      // a key is not its fix -- the check's own message names the real one.
+      if (agent.status === "warning" && agent.message.includes("no keys loaded")) {
+        suggestions.push("Load a key: ssh-add ~/.ssh/id_ed25519");
+      }
+    };
+    const keysSection = () => {
+      const keys = cachedKeysCheck();
+      if (report("SSH Keys", keys) && keys.status === "error") {
+        suggestions.push('Generate a key: ssh-keygen -t ed25519 -C "your@email.com"');
+      }
+    };
+    const configSection = () => {
+      report("SSH Config", checkSshConfig(subjectHost));
+    };
+    const knownHostsSection = () => {
+      // known_hosts records the RESOLVED name and port, not the ssh_config alias.
+      const known = checkKnownHosts(target?.host ?? subjectHost, target?.port ?? 22);
+      if (report("Known Hosts", known) && known.status === "warning") {
+        suggestions.push(`Add host key: ${keyscanCommand(target?.host ?? subjectHost, target?.port)}`);
+      }
+    };
 
-    const keys = checks[1];
-    if (keys.status === "error") suggestions.push('Generate a key: ssh-keygen -t ed25519 -C "your@email.com"');
-
-    const known = checks[3];
-    if (known.status === "warning") {
-      suggestions.push(`Add host key: ${keyscanCommand(dial?.host ?? host, dial?.port)}`);
+    switch (kind) {
+      case "network": {
+        const line = resolved ? describeDialTarget(subjectHost, resolved) : null;
+        if (line) parts.push(line);
+        configSection();
+        break;
+      }
+      case "host-key":
+        if (!resolved?.hostKeyRejection?.current) knownHostsSection();
+        break;
+      case "auth": {
+        if (offeredAgentIsProbed(resolved)) agentSection(true);
+        if (!resolved?.auth || resolved.auth.source === "default") keysSection();
+        const line = resolved ? describeAuthOffer(resolved) : null;
+        if (line) parts.push(line);
+        break;
+      }
+      default:
+        agentSection(false);
+        keysSection();
+        configSection();
+        knownHostsSection();
     }
 
     if (suggestions.length > 0) {
@@ -913,10 +1207,26 @@ export async function connectWithProxy(
   // so materialize the host-key preference order now. Deliberately not done in
   // resolveConfig: see the comment on the thunk there.
   resolved.applyHostKeyAlgorithms?.();
+  // Describes THIS dial only; the pool can dial again on the same `resolved`.
+  resolved.failedJumpHop = undefined;
 
   const hops = resolved.proxyJump ? parseJumpSpec(resolved.proxyJump) : [];
   if (hops.length === 0) {
     return connectRaw(resolved.connectConfig);
+  }
+  // resolveConfig would refuse a bad hop too, but as an "SSH host" the caller never
+  // named. Check EVERY hop here, left to right, before anything is resolved or
+  // dialed, so the refusal quotes the ProxyJump value as `ssh -G` reported it for
+  // this target. Checking only the last hop pushed the others one recursion level
+  // down, where the context was the re-bracketed spelling synthesized for that level
+  // and the intermediate hop instead of the target.
+  const badHop = hops.find((hop) => !isValidSshHost(hop.host));
+  if (badHop) {
+    throw new InvalidHostError(badHop.host, {
+      role: "ProxyJump hop",
+      context: `in ProxyJump ${JSON.stringify(resolved.proxyJump)} for ${JSON.stringify(String(resolved.connectConfig.host))} (from ssh_config)`,
+      refusedBefore: "any connection was made",
+    });
   }
   const chain = new Set(visited);
   chain.add(`${resolved.connectConfig.host}:${resolved.connectConfig.port ?? 22}`);
@@ -963,6 +1273,15 @@ export async function connectWithProxy(
         message: `on jump host ${jumpLabel} -- ${jumpRejection.message}`,
       };
     }
+    // Same blindness for every other failure on the way to the bastion: the caller's
+    // diagnostics would otherwise describe the TARGET's user, host and credentials
+    // (a `password` call shows no agent check) for a hop that offered the agent. A
+    // deeper hop already recorded itself one level down; keep that one.
+    resolved.failedJumpHop = jumpResolved.failedJumpHop ?? {
+      host: jumpHop.host,
+      label: jumpLabel,
+      resolved: jumpResolved,
+    };
     throw err;
   }
 
@@ -1015,20 +1334,22 @@ export async function connectWithProxy(
  *
  * Attaches, when available: the host-key rejection reason recorded by our
  * hostVerifier (ssh2 itself only ever says "Host denied (verification failed)"),
- * then the local SSH environment diagnostics. Returns the original error untouched
- * when there is nothing to add, so `cause` chains stay short.
+ * then the local SSH environment diagnostics that can explain THIS kind of failure
+ * (classifySshFailure) -- a refused TCP connect does not get a warning about the
+ * agent. Returns the original error untouched when there is nothing to add, so
+ * `cause` chains stay short.
  */
 export function enhanceSshError(err: unknown, host: string, resolved?: ResolvedConfig): unknown {
+  // An input error, not an SSH failure: see InvalidHostError. Diagnostics here would
+  // spawn `ssh -G` / `ssh-keygen` for the very value that was just refused, and bury
+  // the one-line reason under warnings about this machine's agent and keys.
+  if (isInvalidHostError(err)) return err;
   const extra: string[] = [];
 
   const rejection = resolved?.hostKeyRejection?.current;
   if (rejection) extra.push(`Host key check failed -- ${rejection.message}`);
 
-  const dialHost = resolved?.connectConfig.host;
-  const diag = formatDiagnostics(
-    host,
-    dialHost ? { host: dialHost, port: resolved?.connectConfig.port as number | undefined } : undefined,
-  );
+  const diag = formatDiagnostics(host, undefined, { kind: classifySshFailure(err, resolved), resolved });
   if (diag) extra.push(`SSH Diagnostics:\n${diag}`);
 
   if (extra.length === 0) return err;
