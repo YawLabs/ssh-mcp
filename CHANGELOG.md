@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] — 2026-11-23
+
 ### Security
 - **`ssh_test` and `ssh_diagnose` no longer write `known_hosts`.** Their probe ran `ssh` with `StrictHostKeyChecking=no` and the default files, so OpenSSH "Permanently added" an unknown host's key: one diagnostic against an unverified (possibly intercepted) host pinned that key, after which the connection path trusted it -- and it silently satisfied `SSH_MCP_STRICT_HOSTKEYS`. The probe now uses `StrictHostKeyChecking=accept-new` (or `=yes` under `SSH_MCP_STRICT_HOSTKEYS`, so the probe refuses an unpinned host exactly as `ssh_exec` does) with the null device first in `UserKnownHostsFile`, so a new key is accepted but never stored. `ssh_known_hosts_fix` is again the only tool that writes the file.
 - **A changed host key is now reported by `ssh_test` / `ssh_diagnose`.** The old `StrictHostKeyChecking=no` tolerated a mismatching key and went on to authenticate, so a changed key read as `Permission denied` or even as reachable; the probe now fails with "Host key verification failed".
