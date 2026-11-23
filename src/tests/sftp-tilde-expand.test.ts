@@ -7,13 +7,15 @@ import { downloadFile, expandTilde, uploadFile } from "../ssh.js";
 function makeFakeSftp() {
   const calls = { fastPut: [] as string[], fastGet: [] as string[] };
   const sftp = {
-    fastPut: vi.fn((localPath: string, _remotePath: string, cb: (err: null) => void) => {
+    // uploadFile/downloadFile pass an options object ({ step }) before the callback,
+    // so the callback is always the LAST argument.
+    fastPut: vi.fn((localPath: string, _remotePath: string, ...rest: unknown[]) => {
       calls.fastPut.push(localPath);
-      cb(null);
+      (rest[rest.length - 1] as (err: null) => void)(null);
     }),
-    fastGet: vi.fn((_remotePath: string, localPath: string, cb: (err: null) => void) => {
+    fastGet: vi.fn((_remotePath: string, localPath: string, ...rest: unknown[]) => {
       calls.fastGet.push(localPath);
-      cb(null);
+      (rest[rest.length - 1] as (err: null) => void)(null);
     }),
     end: vi.fn(),
   };

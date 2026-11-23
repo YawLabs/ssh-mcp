@@ -832,6 +832,26 @@ describe("a non-22 port: [host]:port entries decide, a bare-host entry can only 
     expect(resolved.hostKeyRejection?.current?.reason).toBe("key-mismatch");
   });
 
+  it("orders algorithms from the [host]:port entries alone when any exist, so the offered key can be accepted", () => {
+    // [h]:2222 holds rsa; the bare line (the port-22 sshd) holds ed25519. Ordering from
+    // the union negotiated ed25519 first, and the verifier -- which lets only the
+    // [host]:port entries accept -- then rejected it as algorithm-not-in-known-hosts.
+    const RSA_KEY = keyBlob("ssh-rsa", "the-2222-rsa");
+    knownHostsTable({
+      [QUALIFIED]: [{ type: "ssh-rsa", blob: RSA_KEY }],
+      [HOST]: [{ type: "ssh-ed25519", blob: PORT22_KEY }],
+    });
+    const { resolved, verify } = verifierFor();
+    resolved.applyHostKeyAlgorithms?.();
+    const order = (resolved.connectConfig.algorithms?.serverHostKey ?? []) as string[];
+    // The first algorithm the server (which holds both key types) would be asked for
+    // must be an rsa one, and the rsa key it then presents must be accepted.
+    expect(order[0]).toMatch(/^(rsa-sha2-|ssh-rsa)/);
+    expect(order.indexOf("ssh-ed25519")).toBeGreaterThan(order.findIndex((a) => a.startsWith("rsa-sha2-")));
+    expect(verify(RSA_KEY)).toBe(true);
+    expect(resolved.hostKeyRejection?.current).toBeNull();
+  });
+
   it("still orders host-key algorithms from bare-host entries", () => {
     knownHostsTable({ [HOST]: [{ type: "ecdsa-sha2-nistp256", blob: keyBlob("ecdsa-sha2-nistp256", "k") }] });
     const { resolved } = verifierFor();
@@ -893,22 +913,41 @@ describe("remediation commands use the RESOLVED hostname and port", () => {
 });
 
 describe("`ssh -G` probing", () => {
-  it("does not memoize a FAILED probe, so a transient failure is retried", () => {
-    let calls = 0;
-    stubs.runArgs.fn = (cmd) => {
-      if (cmd !== "ssh") return { stdout: "", ok: false };
-      calls++;
-      return calls === 1
-        ? { stdout: "timed out", ok: false }
-        : { stdout: sshConfigOutput({ hostname: "real.internal", port: "2200" }), ok: true };
-    };
-    expect(resolveConfig({ host: "flaky.test" }).connectConfig.host).toBe("flaky.test");
-    const second = resolveConfig({ host: "flaky.test" }).connectConfig;
-    expect(second.host).toBe("real.internal"); // was: the failure cached until restart
-    expect(second.port).toBe(2200);
-    // ...while a SUCCESSFUL answer stays memoized for the process lifetime.
-    resolveConfig({ host: "flaky.test" });
-    expect(calls).toBe(2);
+  it("caches a FAILED probe only briefly, so a transient failure is retried after the TTL", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      let calls = 0;
+      stubs.runArgs.fn = (cmd) => {
+        if (cmd !== "ssh") return { stdout: "", ok: false };
+        calls++;
+        return calls === 1
+          ? { stdout: "timed out", ok: false }
+          : { stdout: sshConfigOutput({ hostname: "real.internal", port: "2200" }), ok: true };
+      };
+      expect(resolveConfig({ host: "flaky.test" }).connectConfig.host).toBe("flaky.test");
+      // Inside the negative-cache window: no second spawn, still the fallback answer.
+      vi.advanceTimersByTime(29_000);
+      expect(resolveConfig({ host: "flaky.test" }).connectConfig.host).toBe("flaky.test");
+      expect(calls).toBe(1);
+      // Past it: retried, and the real answer arrives (was: cached until restart).
+      vi.advanceTimersByTime(2_000);
+      const second = resolveConfig({ host: "flaky.test" }).connectConfig;
+      expect(second.host).toBe("real.internal");
+      expect(second.port).toBe(2200);
+      // ...while a SUCCESSFUL answer stays memoized for the process lifetime.
+      vi.advanceTimersByTime(3_600_000);
+      resolveConfig({ host: "flaky.test" });
+      expect(calls).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a deterministically failing probe does not spawn ssh on every acquire", () => {
+    // e.g. `UseKeychain` in ~/.ssh/config on a non-macOS ssh: exit 255 every time.
+    stubs.runArgs.fn = () => ({ stdout: "Bad configuration option: usekeychain", ok: false });
+    for (let i = 0; i < 5; i++) resolveConfig({ host: "bad-config.test", password: "x" });
+    expect(stubs.runArgsCalls.filter((c) => c.cmd === "ssh")).toHaveLength(1);
   });
 
   it("puts `--` before the host so it can never be parsed as an option", () => {

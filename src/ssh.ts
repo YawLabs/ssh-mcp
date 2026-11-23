@@ -94,21 +94,34 @@ export interface ResolvedConfig {
 // one host pay N spawns for an answer that cannot differ between them. A
 // SUCCESSFUL answer is cached for process lifetime: ssh_config is read at
 // startup-ish cadence and a running server is expected to be restarted after
-// config edits. A FAILED probe is never cached -- one transient `ssh -G` failure
-// (runArgs' 10s timeout, a slow `Match exec`) would otherwise drop that host's
-// HostName / User / Port / IdentityFile / ProxyJump until restart.
+// config edits. A FAILED probe is cached only briefly (SSH_CONFIG_FAILURE_TTL_MS):
+// caching it for the process lifetime would let one transient failure (runArgs'
+// 10s timeout, a slow `Match exec`) drop that host's HostName / User / Port /
+// IdentityFile / ProxyJump until restart, while not caching it at all made a
+// DETERMINISTIC failure (e.g. a macOS-only `UseKeychain` line -> "Bad configuration
+// option", exit 255) pay a blocking spawn on every single acquire.
+const SSH_CONFIG_FAILURE_TTL_MS = 30_000;
 const sshConfigCache = new Map<string, SshConfigResult>();
+const sshConfigFailures = new Map<string, number>();
 
 /** Test-only: drop memoized `ssh -G` results so a suite can vary ssh_config. */
 export function clearSshConfigCache(): void {
   sshConfigCache.clear();
+  sshConfigFailures.clear();
 }
 
 function resolveFromSshConfig(host: string): SshConfigResult | null {
   const cached = sshConfigCache.get(host);
   if (cached) return cached;
+  const failedAt = sshConfigFailures.get(host);
+  if (failedAt !== undefined && Date.now() - failedAt < SSH_CONFIG_FAILURE_TTL_MS) return null;
   const result = resolveFromSshConfigUncached(host);
-  if (result) sshConfigCache.set(host, result);
+  if (result) {
+    sshConfigCache.set(host, result);
+    sshConfigFailures.delete(host);
+  } else {
+    sshConfigFailures.set(host, Date.now());
+  }
   return result;
 }
 
@@ -191,8 +204,9 @@ export interface KnownHostEntry {
 // transparently without us reimplementing HMAC.
 //
 // Returns the entries for EVERY spelling knownHostsTargets yields (for a non-22
-// port: `[host]:port` and the bare host). That union is right for algorithm
-// ORDERING; the accept/reject decision must not use it -- see buildHostVerifier.
+// port: `[host]:port` and the bare host). Neither the accept/reject decision nor
+// the algorithm ordering may use that union -- see buildHostVerifier and
+// cachedKnownHostTypes, which both prefer the port-qualified entries.
 export function readKnownHostsEntries(host: string, port?: number): KnownHostEntry[] {
   return knownHostsTargets(host, port).flatMap(readKnownHostsTarget);
 }
@@ -373,12 +387,23 @@ export function clearKnownHostTypeCache(): void {
   knownHostTypeCache.clear();
 }
 
+// The types come from the SAME entry set buildHostVerifier decides with. For a
+// non-22 port that means: the `[host]:port` entries ALONE when any exist (they are
+// authoritative, and only they can accept), else the bare-host fallback entries.
+// Ordering from the union instead -- `[h]:2222 ssh-rsa` plus a bare `h ssh-ed25519`
+// line for the port-22 sshd -- negotiated ed25519 first, and the verifier then
+// rejected that key as algorithm-not-in-known-hosts because the bare entry cannot
+// accept once a port-qualified one exists. OpenSSH orders from the port-qualified
+// entries the same way.
 function cachedKnownHostTypes(hosts: ReadonlyArray<string>, port: number | undefined): string[] {
   const cacheKey = `${hosts.join(" ")}:${port ?? ""}`;
   const now = Date.now();
   const hit = knownHostTypeCache.get(cacheKey);
   if (hit && now - hit.at < KNOWN_HOST_TYPE_TTL_MS) return hit.types;
-  const types = [...new Set(hosts.flatMap((h) => readKnownHostsEntries(h, port).map((e) => e.type)))];
+  const targets = hosts.map((h) => knownHostsTargets(h, port)).filter((t) => t.length > 0);
+  let entries = targets.flatMap((t) => readKnownHostsTarget(t[0]));
+  if (entries.length === 0) entries = targets.flatMap((t) => t.slice(1).flatMap(readKnownHostsTarget));
+  const types = [...new Set(entries.map((e) => e.type))];
   knownHostTypeCache.set(cacheKey, { at: now, types });
   return types;
 }
@@ -1204,7 +1229,12 @@ function getSftp(client: Client): Promise<SFTPWrapper> {
  * end a hang, not to race a slow-but-working server.
  */
 export const DEFAULT_SFTP_TIMEOUT_MS = 120_000;
-/** The same deadline for whole-file transfers (fastPut / fastGet), which legitimately run long. */
+/**
+ * The INACTIVITY timeout for whole-file transfers (fastPut / fastGet). Unlike the
+ * per-call deadline above it is reset by every chunk the transfer moves, so a
+ * healthy multi-gigabyte transfer may run as long as it needs; only a transfer that
+ * makes no progress for this long is aborted.
+ */
 export const DEFAULT_SFTP_TRANSFER_TIMEOUT_MS = 600_000;
 
 /**
@@ -1212,12 +1242,17 @@ export const DEFAULT_SFTP_TRANSFER_TIMEOUT_MS = 600_000;
  * on failure, and on timeout. When `timeoutMs` elapses first the session is ended
  * (which aborts whatever is in flight on it) and the call rejects; a late result
  * from `fn` is ignored.
+ *
+ * With `idle` set, `timeoutMs` is an inactivity timeout instead of a whole-call
+ * deadline: each call of the `progress` callback handed to `fn` restarts it.
+ * Without it `progress` is a no-op, so the deadline stays absolute.
  */
 function withSftp<T>(
   client: Client,
   what: string,
   timeoutMs: number,
-  fn: (sftp: SFTPWrapper) => Promise<T>,
+  fn: (sftp: SFTPWrapper, progress: () => void) => Promise<T>,
+  idle = false,
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     let settled = false;
@@ -1239,16 +1274,22 @@ function withSftp<T>(
       end();
       complete();
     };
-    const timer = setTimeout(
-      () => finish(() => reject(new Error(`SFTP ${what} timed out after ${timeoutMs}ms`))),
-      timeoutMs,
-    );
+    const onTimeout = () =>
+      finish(() =>
+        reject(new Error(`SFTP ${what} timed out after ${timeoutMs}ms${idle ? " with no transfer progress" : ""}`)),
+      );
+    let timer = setTimeout(onTimeout, timeoutMs);
+    const progress = () => {
+      if (!idle || settled) return;
+      clearTimeout(timer);
+      timer = setTimeout(onTimeout, timeoutMs);
+    };
     getSftp(client).then(
       (s) => {
         sftp = s;
         // The deadline passed while the subsystem was still opening: close it now.
         if (settled) return end();
-        fn(s).then(
+        fn(s, progress).then(
           (value) => finish(() => resolve(value)),
           (err: unknown) => finish(() => reject(err)),
         );
@@ -1342,8 +1383,13 @@ export interface FileRange {
   offset: number;
   /** Number of bytes actually read: less than requested at end of file. */
   bytesRead: number;
-  /** Size of the whole file, from the same stat. */
-  size: number;
+  /**
+   * Size of the whole file, from the same stat. ABSENT when the stat reported 0:
+   * for a /proc file, a device or a FIFO that means "unknown", not "empty", so the
+   * page may hold data and more may follow. (A genuinely empty file lands here too
+   * and simply reads 0 bytes.)
+   */
+  size?: number;
 }
 
 /**
@@ -1374,8 +1420,11 @@ export async function readFileRange(
     const stats = await sftpStat(sftp, remotePath);
     // A size of 0 is not "empty" for a /proc file or a device -- it is "unknown" --
     // so do not clamp the page to it; the read loop below stops at EOF either way.
-    const want = stats.size === 0 ? length : Math.max(0, Math.min(length, stats.size - offset));
-    if (want === 0) return { text: "", offset, bytesRead: 0, size: stats.size };
+    const sizeKnown = stats.size !== 0;
+    const sized = <T extends object>(page: T): T & { size?: number } =>
+      sizeKnown ? { ...page, size: stats.size } : page;
+    const want = sizeKnown ? Math.max(0, Math.min(length, stats.size - offset)) : length;
+    if (want === 0) return sized({ text: "", offset, bytesRead: 0 });
     const handle = await sftpOpenRead(sftp, remotePath);
     try {
       const buf = Buffer.alloc(want);
@@ -1387,7 +1436,7 @@ export async function readFileRange(
         if (n === 0) break;
         got += n;
       }
-      return { text: buf.subarray(0, got).toString("utf8"), offset, bytesRead: got, size: stats.size };
+      return sized({ text: buf.subarray(0, got).toString("utf8"), offset, bytesRead: got });
     } finally {
       sftp.close(handle, () => {});
     }
@@ -1422,10 +1471,11 @@ export async function uploadFile(
     client,
     `upload to ${remotePath}`,
     timeoutMs,
-    (sftp) =>
+    (sftp, progress) =>
       new Promise<void>((resolve, reject) => {
-        sftp.fastPut(resolvedLocal, remotePath, (err) => (err ? reject(err) : resolve()));
+        sftp.fastPut(resolvedLocal, remotePath, { step: progress }, (err) => (err ? reject(err) : resolve()));
       }),
+    true, // an inactivity timeout: a long transfer that keeps moving bytes is not aborted
   );
 }
 
@@ -1440,10 +1490,11 @@ export async function downloadFile(
     client,
     `download of ${remotePath}`,
     timeoutMs,
-    (sftp) =>
+    (sftp, progress) =>
       new Promise<void>((resolve, reject) => {
-        sftp.fastGet(remotePath, resolvedLocal, (err) => (err ? reject(err) : resolve()));
+        sftp.fastGet(remotePath, resolvedLocal, { step: progress }, (err) => (err ? reject(err) : resolve()));
       }),
+    true, // an inactivity timeout, as for uploadFile
   );
 }
 
@@ -1486,11 +1537,12 @@ export interface FileStats {
   targetResolved?: boolean;
 }
 
-// SFTP status codes (draft-ietf-secsh-filexfer-02), as ssh2 sets them on `err.code`.
-// OpenSSH's sftp-server maps ENOENT to NO_SUCH_FILE and errnos it has no code for --
-// ELOOP among them -- to FAILURE.
+// SFTP status code (draft-ietf-secsh-filexfer-02), as ssh2 sets it on `err.code`.
+// OpenSSH's sftp-server (errno_to_portable) maps ENOENT, ENOTDIR, EBADF and ELOOP
+// ALL to NO_SUCH_FILE, so a dangling link and a looping one both arrive as this
+// code. FAILURE (4) is the catch-all for every errno it has no code for (EIO,
+// ESTALE, ...): an unknown error, never evidence that the target is missing.
 const SFTP_NO_SUCH_FILE = 2;
-const SFTP_FAILURE = 4;
 // The status-less error ssh2's SFTP cleanupRequests() hands every pending callback when
 // the channel goes away (node_modules/ssh2/lib/protocol/SFTP.js).
 const SSH2_SFTP_CHANNEL_LOST = "No response from server";
@@ -1539,15 +1591,16 @@ async function statOn(sftp: SFTPWrapper, remotePath: string): Promise<FileStats>
       meta = await call("stat");
       targetResolved = true;
     } catch (err) {
-      // Dangling (NO_SUCH_FILE) or looping (FAILURE) symlink -- keep the link's own
-      // stats and report it as an unresolved symlink rather than rejecting. Any other
-      // SFTP status (PERMISSION_DENIED above all) is a real failure and propagates. A
+      // Dangling or looping symlink (both NO_SUCH_FILE from OpenSSH) -- keep the link's
+      // own stats and report it as an unresolved symlink rather than rejecting. Any
+      // other SFTP status (PERMISSION_DENIED, and the FAILURE catch-all for an I/O
+      // error) is a real failure and propagates. A
       // lost connection carries NO status: ssh2 fails every pending request with a bare
       // "No response from server" when the channel closes, so that one is matched by
       // message and rethrown too -- rendering it as "dangling" would report a missing
       // target that was never checked. Any other status-less error keeps the fallback.
       const code = (err as { code?: unknown }).code;
-      if (typeof code === "number" && code !== SFTP_NO_SUCH_FILE && code !== SFTP_FAILURE) throw err;
+      if (typeof code === "number" && code !== SFTP_NO_SUCH_FILE) throw err;
       if (code === undefined && err instanceof Error && err.message === SSH2_SFTP_CHANNEL_LOST) throw err;
       targetResolved = false;
     }

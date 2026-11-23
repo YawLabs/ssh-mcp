@@ -71,6 +71,8 @@ const SDK_STDIO_URL = (import.meta as unknown as { resolve(s: string): string })
 );
 
 const STUB_VERSION = "9.9.9-stub";
+/** How long the stub server takes to answer a `slow` request. */
+const SLOW_MS = 600;
 
 // Every stub records what it was asked to do, in order, to a FILE rather than
 // to stdout: a process.on("exit") handler must be synchronous, and an async
@@ -90,19 +92,42 @@ const STUB_POOL = [
   "",
 ].join("\n");
 
+// The stub also answers requests the way the SDK's Protocol does, closely
+// enough for the EOF drain: it chains any onmessage already on the transport
+// (Protocol.connect calls the prior handler first), answers a `slow` request
+// SLOW_MS later through transport.send, drops the answer to a request the
+// client cancelled, and -- like Protocol._onclose aborting in-flight handlers
+// -- drops every answer once close() has run.
 const STUB_SERVER_MODULE = [
   'import { appendFileSync } from "node:fs";',
   "export const version = process.env.STUB_VERSION;",
   "export function createServer() {",
+  "  let closed = false;",
+  "  const cancelled = new Set();",
   "  return {",
   "    async connect(transport) {",
   '      appendFileSync(process.env.MARK, "connect\\n");',
+  "      const prior = transport.onmessage;",
+  "      transport.onmessage = (message, extra) => {",
+  "        prior?.(message, extra);",
+  '        if (message.method === "notifications/cancelled") {',
+  "          cancelled.add(message.params.requestId);",
+  "          return;",
+  "        }",
+  '        if (message.method !== "slow" || message.id === undefined) return;',
+  "        appendFileSync(process.env.MARK, 'request ' + message.id + '\\n');",
+  "        setTimeout(async () => {",
+  "          if (closed || cancelled.has(message.id)) return;",
+  "          appendFileSync(process.env.MARK, 'respond ' + message.id + '\\n');",
+  '          await transport.send({ jsonrpc: "2.0", id: message.id, result: { ok: message.id } });',
+  "        }, Number(process.env.SLOW_MS));",
+  "      };",
   "      // What McpServer.connect does that matters here: it starts the",
   "      // transport, and starting the transport is what attaches to stdin.",
   "      await transport.start();",
   '      appendFileSync(process.env.MARK, "ready\\n");',
   "    },",
-  '    async close() { appendFileSync(process.env.MARK, "close\\n"); },',
+  '    async close() { closed = true; appendFileSync(process.env.MARK, "close\\n"); },',
   "  };",
   "}",
   "",
@@ -145,6 +170,7 @@ function serverEnv(layout: ServerLayout): Record<string, string> {
   for (const [k, v] of Object.entries(process.env)) if (typeof v === "string") env[k] = v;
   env.MARK = layout.mark;
   env.STUB_VERSION = STUB_VERSION;
+  env.SLOW_MS = String(SLOW_MS);
   return env;
 }
 
@@ -236,6 +262,113 @@ describe("server: stdin EOF runs shutdown(), then the exit backstop", () => {
     // An ssh-agent this process spawned itself gets reaped rather than leaked
     // once per session, silently and cumulatively, if this regresses.
     expect(steps(layout)).toEqual(EOF_STEPS);
+  });
+
+  /** Spawn the server, write `lines` to stdin and close it at once (`printf ... | ssh-mcp`). */
+  async function pipeAndClose(layout: ServerLayout, lines: object[]) {
+    const child = spawn(process.execPath, [layout.entry], {
+      env: serverEnv(layout),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    const started = Date.now();
+    // A regression would hold the child for the whole drain grace (5 min) and
+    // outlive the test; kill it well before that so a red run leaks nothing.
+    const killer = setTimeout(() => child.kill(), 20_000);
+    const code = await new Promise<number | null>((res) => {
+      child.on("close", (c) => res(c));
+      child.stdin.end(lines.map((l) => `${JSON.stringify(l)}\n`).join(""));
+    }).finally(() => clearTimeout(killer));
+    return { code, stdout, elapsed: Date.now() - started };
+  }
+
+  it("answers requests already received before shutting down on EOF", async () => {
+    // A client that pipes its requests and closes stdin straight away. Running
+    // shutdown() at EOF closed the server -- which aborts in-flight handlers and
+    // drops their responses -- so the tools/call was never answered.
+    const layout = makeServerLayout();
+    const r = await pipeAndClose(layout, [
+      { jsonrpc: "2.0", id: 1, method: "slow" },
+      { jsonrpc: "2.0", id: 2, method: "slow" },
+    ]);
+    expect(r.code).toBe(0);
+    const responses = r.stdout
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l));
+    expect(responses).toEqual([
+      { jsonrpc: "2.0", id: 1, result: { ok: 1 } },
+      { jsonrpc: "2.0", id: 2, result: { ok: 2 } },
+    ]);
+    // Both answered, THEN the normal shutdown sequence and exit backstop.
+    expect(steps(layout)).toEqual([
+      "connect",
+      "ready",
+      "request 1",
+      "request 2",
+      "respond 1",
+      "respond 2",
+      ...EOF_STEPS.slice(2),
+    ]);
+  });
+
+  it("stops waiting for a request the client cancelled", async () => {
+    // A cancelled request is never answered, so waiting for it would hold the
+    // process for the whole drain grace window.
+    const layout = makeServerLayout();
+    const r = await pipeAndClose(layout, [
+      { jsonrpc: "2.0", id: 7, method: "slow" },
+      { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 7 } },
+    ]);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe("");
+    expect(steps(layout)).toEqual(["connect", "ready", "request 7", ...EOF_STEPS.slice(2)]);
+    expect(r.elapsed).toBeLessThan(10_000);
+  });
+
+  it("relies on SDK behaviour the real McpServer still has", async () => {
+    // The drain tracks requests by setting transport.onmessage BEFORE connect()
+    // and wrapping transport.send; the stub above only imitates the SDK. Pin
+    // both assumptions against the real Protocol: it chains the prior
+    // onmessage (calling it with every message), and answers through the
+    // transport's own send. If an SDK upgrade breaks either, EOF would shut
+    // down with requests unanswered (or never shut down until the grace).
+    const { createServer } = await import("../server.js");
+    const seen: unknown[] = [];
+    const sent: unknown[] = [];
+    const transport: {
+      onmessage?: (m: unknown, extra?: unknown) => void;
+      onclose?: () => void;
+      onerror?: (e: Error) => void;
+      start(): Promise<void>;
+      close(): Promise<void>;
+      send(m: unknown): Promise<void>;
+    } = {
+      async start() {},
+      async close() {
+        transport.onclose?.();
+      },
+      async send(m) {
+        sent.push(m);
+      },
+    };
+    transport.onmessage = (m) => {
+      seen.push(m);
+    };
+    const server = createServer();
+    // A minimal fake Transport; connect() only needs these members.
+    await server.connect(transport as any);
+    const ping = { jsonrpc: "2.0", id: 41, method: "ping" };
+    transport.onmessage?.(ping);
+    const deadline = Date.now() + 5_000;
+    while (sent.length === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+    expect(seen).toEqual([ping]);
+    expect(sent).toEqual([{ jsonrpc: "2.0", id: 41, result: {} }]);
+    await server.close();
   });
 
   it("reaps the agent even when stdin was never open", () => {

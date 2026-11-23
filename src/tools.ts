@@ -244,17 +244,31 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
             const content = await readFile(client, path);
             return { content: [{ type: "text", text: content }] };
           }
-          const page = await readFileRange(client, path, offset ?? 0, length ?? DEFAULT_MAX_READ_BYTES);
+          const requested = length ?? DEFAULT_MAX_READ_BYTES;
+          const page = await readFileRange(client, path, offset ?? 0, requested);
           const end = page.offset + page.bytesRead;
           // The position goes FIRST, for the same reason ssh_exec's status does: a proxy
           // that cuts the result cuts the last block, and the caller still learns where
           // to continue from.
-          const where =
-            page.bytesRead === 0
-              ? `[no bytes at offset ${page.offset}: the file is ${page.size} bytes]`
-              : end < page.size
-                ? `[bytes ${page.offset}-${end} of ${page.size}; next offset: ${end}]`
-                : `[bytes ${page.offset}-${end} of ${page.size}; end of file]`;
+          let where: string;
+          if (page.size === undefined) {
+            // The server reported size 0 (/proc, a device, a FIFO): the size is UNKNOWN,
+            // so never claim "of 0". A full page may have more behind it; a short one
+            // is the end.
+            where =
+              page.bytesRead === 0
+                ? `[no bytes at offset ${page.offset}: end of file (size not reported)]`
+                : page.bytesRead >= requested
+                  ? `[bytes ${page.offset}-${end} of unknown size; next offset: ${end}]`
+                  : `[bytes ${page.offset}-${end}; end of file]`;
+          } else {
+            where =
+              page.bytesRead === 0
+                ? `[no bytes at offset ${page.offset}: the file is ${page.size} bytes]`
+                : end < page.size
+                  ? `[bytes ${page.offset}-${end} of ${page.size}; next offset: ${end}]`
+                  : `[bytes ${page.offset}-${end} of ${page.size}; end of file]`;
+          }
           const content: { type: "text"; text: string }[] = [{ type: "text", text: where }];
           if (page.bytesRead > 0) content.push({ type: "text", text: page.text });
           return { content };

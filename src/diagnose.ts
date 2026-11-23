@@ -364,6 +364,27 @@ export function keyscanCommand(host: string, port = 22): string {
 const UNPINNED_BEHAVIOUR =
   "ssh-mcp accepts an unpinned host's key unverified on every connection (it is never saved), or refuses it when SSH_MCP_STRICT_HOSTKEYS=1";
 
+/** Whether `ssh-keygen -F <target>` finds an entry in ~/.ssh/known_hosts. */
+function knownHostsHas(target: string): boolean {
+  const { stdout, ok } = runArgs("ssh-keygen", ["-F", target]);
+  return ok && stdout.trim() !== "";
+}
+
+/**
+ * Explains a strict-mode probe refusal (host-key-unknown) on a non-22 port when the
+ * host IS pinned, but only by its bare (port-22) entry. OpenSSH's strict checking
+ * looks up only `[host]:port` and refuses that host, while ssh_exec's verifier
+ * accepts it if the key matches the port-22 entry. Returns null when that is not the
+ * situation (port 22, or no bare entry), so callers keep their "not in known_hosts"
+ * wording. Callers have validated `host`.
+ */
+export function portPinnedOnlyAt22Note(host: string, port: number): string | null {
+  if (port === 22) return null;
+  const bare = knownHostsLookupTargets(host, port)[1];
+  if (bare === undefined || !knownHostsHas(bare)) return null;
+  return `${host} is pinned in known_hosts only for port 22 (its bare "${bare}" entry), not for port ${port}. With SSH_MCP_STRICT_HOSTKEYS on, OpenSSH's strict checking looks up only "${knownHostsEntryName(host, port)}" and refuses it; ssh_exec accepts it only if the key matches the port-22 entry. To pin port ${port}: ${keyscanCommand(host, port)}`;
+}
+
 export function checkKnownHosts(host: string, port = 22): DiagnosticResult {
   if (!isValidHostname(host)) {
     return { status: "error", message: `Invalid hostname: "${host}"` };
@@ -379,9 +400,18 @@ export function checkKnownHosts(host: string, port = 22): DiagnosticResult {
     };
   }
 
-  for (const target of knownHostsLookupTargets(host, port)) {
-    const { stdout, ok } = runArgs("ssh-keygen", ["-F", target]);
-    if (ok && stdout.trim()) return { status: "ok", message: `Host ${quoted} found in known_hosts` };
+  // Only the entry for THIS port is a pass. On a non-22 port the bare (port-22) entry
+  // is still looked up, because the connection verifier (buildHostVerifier, ssh.ts)
+  // consults it -- but only to ACCEPT a matching key; it never rejects a different
+  // one there, so a host pinned only bare is still unverified on this port. Reporting
+  // that as "found" showed PASS for a host a MITM on :port gets through.
+  const [portTarget, bareTarget] = knownHostsLookupTargets(host, port);
+  if (knownHostsHas(portTarget)) return { status: "ok", message: `Host ${quoted} found in known_hosts` };
+  if (bareTarget !== undefined && knownHostsHas(bareTarget)) {
+    return {
+      status: "warning",
+      message: `Host ${quoted} is pinned in known_hosts only for port 22 (its bare "${bareTarget}" entry), not for port ${port}. That entry can accept but never reject a key on port ${port}, so a different key there is accepted unverified (or refused when SSH_MCP_STRICT_HOSTKEYS=1). To pin port ${port}: ${keyscanCommand(host, port)}`,
+    };
   }
 
   return {
@@ -567,11 +597,14 @@ export function checkConnectivity(host: string, port = 22): DiagnosticResult {
         status: "error",
         message: `Host key verification failed for ${host}. The host key changed (instance recreated?). Fix: ssh-keygen -R "${knownHostsEntryName(host, port)}" && ${keyscanCommand(host, port)}`,
       };
-    case "host-key-unknown":
+    case "host-key-unknown": {
+      const note = portPinnedOnlyAt22Note(host, port);
+      if (note) return { status: "error", message: `Host ${note}` };
       return {
         status: "error",
         message: `Host ${host} (port ${port}) is not in known_hosts and SSH_MCP_STRICT_HOSTKEYS is on, so it is refused. To pin it: ${keyscanCommand(host, port)}`,
       };
+    }
     case "dns-failure":
       return {
         status: "error",

@@ -50,6 +50,12 @@ if (process.argv[2] === "--version" || process.argv[2] === "version") {
   process.exit(0);
 }
 
+// How long stdin EOF waits for already-received requests to be answered before
+// shutting down anyway. Generous on purpose: a command's `timeout` defaults to
+// 30s (and the pool wait is bounded separately by the same value), so this
+// covers a defaulted ssh_exec several times over while still ending a hung call.
+const EOF_DRAIN_GRACE_MS = 5 * 60_000;
+
 async function main() {
   const pool = new ConnectionPool();
   const server = createServer(pool);
@@ -86,9 +92,61 @@ async function main() {
   // idle TTL (60s) for idle connections and the rest of the command for a
   // checked-out one -- live SSH sessions and any self-started agent included.
   // EOF and pipe-close therefore take the same shutdown() path as SIGTERM
-  // (shutdown() is guarded, so 'end' followed by 'close' runs it once).
-  const onStdinGone = () => {
+  // (shutdown() is guarded, so 'end' followed by 'close' runs it once) -- but
+  // NOT immediately. EOF means "no more requests", not "abandon the ones already
+  // sent": `printf '<initialize>\n<tools/call>\n' | ssh-mcp` closes stdin right
+  // after writing, and server.close() aborts in-flight handlers and drops their
+  // responses. So EOF waits for every request already received to be answered
+  // (or cancelled by the client), bounded by EOF_DRAIN_GRACE_MS so a hung call
+  // cannot keep the process alive forever. SIGINT/SIGTERM still shut down at once.
+  //
+  // In-flight requests are tracked at the transport boundary: an onmessage set
+  // BEFORE server.connect() is chained by the SDK's Protocol.connect (it calls the
+  // prior handler first), and Protocol sends every response through
+  // transport.send, so wrapping that instance method sees each answer.
+  const inFlight = new Set();
+  let stdinGone = false;
+  const maybeShutdownAfterEof = () => {
+    if (!stdinGone || inFlight.size > 0) return;
+    // The grace timer below is left running: shutdown() ends in process.exit.
     shutdown().catch(() => process.exit(1));
+  };
+  transport.onmessage = (message) => {
+    if ("method" in message) {
+      if ("id" in message) {
+        inFlight.add(message.id);
+      } else if (message.method === "notifications/cancelled") {
+        // A cancelled request gets no response, so stop waiting for it. Mirror
+        // Protocol._oncancel exactly: it ignores a falsy requestId (so a cancel
+        // of id 0 aborts nothing and that request is still answered).
+        const params = message.params;
+        if (params && typeof params === "object" && "requestId" in params && params.requestId) {
+          inFlight.delete(params.requestId);
+          maybeShutdownAfterEof();
+        }
+      }
+    }
+  };
+  const sendRaw = transport.send.bind(transport);
+  transport.send = async (message) => {
+    try {
+      await sendRaw(message);
+    } finally {
+      if (!("method" in message) && "id" in message && inFlight.delete(message.id)) {
+        maybeShutdownAfterEof();
+      }
+    }
+  };
+  const onStdinGone = () => {
+    if (stdinGone) return;
+    stdinGone = true;
+    if (inFlight.size > 0) {
+      setTimeout(() => {
+        inFlight.clear();
+        maybeShutdownAfterEof();
+      }, EOF_DRAIN_GRACE_MS);
+    }
+    maybeShutdownAfterEof();
   };
   process.stdin.once("end", onStdinGone);
   process.stdin.once("close", onStdinGone);

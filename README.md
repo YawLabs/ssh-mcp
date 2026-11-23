@@ -88,7 +88,7 @@ Tools that fix your local SSH setup so everything else — git, deploys, tunnels
 | Tool | Description |
 |------|-------------|
 | `ssh_exec` | Execute a command on a remote host. Returns up to three content blocks, status first: `[exit code: N]` (plus `[signal: NAME]` with `code: -1` when the channel closed signal-only, and a flag when a stream hit the 10 MB cap), then `[stderr]`, then `[stdout]`. Status leads so a proxy that cuts long results — Yaw MCP keeps about 100 KB by default — never drops the exit code. A non-zero exit or a signal is reported as a normal result, not a tool error (`isError` is not set): read the `[exit code: N]` block. Optional `env` param sets per-call environment variables (POSIX-safe prefix, works regardless of sshd's `AcceptEnv`). Subject to [command policy](#command-policy) if configured. |
-| `ssh_read_file` | Read a file from a remote host via SFTP (whole file up to 10 MB). Optional `offset` and `length` (bytes) read one page and return a `[bytes A-B of SIZE; next offset: N]` status block before the text — use them for a large file, or behind a proxy that caps results. |
+| `ssh_read_file` | Read a file from a remote host via SFTP (whole file up to 10 MB). Optional `offset` and `length` (bytes) read one page and return a `[bytes A-B of SIZE; next offset: N]` status block before the text — use them for a large file, or behind a proxy that caps results. A file that reports size 0 (/proc, a device, a FIFO) pages as `of unknown size`. |
 | `ssh_write_file` | Write content to a file on a remote host via SFTP. |
 | `ssh_upload` | Upload a local file to a remote host via SFTP. |
 | `ssh_download` | Download a file from a remote host to local filesystem. |
@@ -129,7 +129,7 @@ The library's `acquire()` / `withConnection()` do not wait by default: they reje
 
 All connections respect your `~/.ssh/config`. Host aliases, custom ports, usernames, identity files, and ProxyJump settings are used automatically. If you have `Host myserver` configured in your SSH config, just pass `host: "myserver"` — ssh-mcp resolves everything.
 
-**Edits to `~/.ssh/config` need a server restart.** The config resolved for each host (via `ssh -G`) is memoized for the life of the server process, so a running server keeps using what it resolved first; `ssh_config_lookup` is not cached and shows the new values straight away. A lookup that failed (no SSH client, a timed-out `ssh -G`) is not cached and is retried on the next call.
+**Edits to `~/.ssh/config` need a server restart.** The config resolved for each host (via `ssh -G`) is memoized for the life of the server process, so a running server keeps using what it resolved first; `ssh_config_lookup` is not cached and shows the new values straight away. A lookup that failed (no SSH client, a timed-out `ssh -G`, an option your `ssh` rejects) is cached for only 30 seconds and then retried.
 
 **ProxyJump / bastion hosts** are supported automatically. If your SSH config has `ProxyJump bastion` for a host, ssh-mcp connects through the bastion transparently. Chained proxies work too.
 
@@ -141,7 +141,7 @@ All remote operations verify the server's host key against `~/.ssh/known_hosts`:
 - **Known host, key changed** — reject (MITM protection). The rejection message distinguishes a genuine key mismatch from "the server offered a key type your `known_hosts` entry doesn't cover", so a missing ed25519 line doesn't read as an attack.
 - **Unknown host** — accept, unless strict mode is on (`SSH_MCP_STRICT_HOSTKEYS=1`).
 
-**On a port other than 22, only `[host]:port` entries can reject a key.** ssh-mcp also consults the bare-host entry, as OpenSSH does, but only to ACCEPT a key that matches it: a bare entry describes whatever answers on port 22, often a different sshd. So a second sshd on `host:2222` with no `[host]:2222` line is an unknown host (accepted, or refused in strict mode), not a key mismatch. To pin it, add a port-qualified entry (`ssh-keyscan -p 2222 host`, or `ssh_known_hosts_fix` with the port).
+**On a port other than 22, only `[host]:port` entries can reject a key.** ssh-mcp also consults the bare-host entry, as OpenSSH does, but only to ACCEPT a key that matches it: a bare entry describes whatever answers on port 22, often a different sshd. So a second sshd on `host:2222` with no `[host]:2222` line is an unknown host (accepted, or refused in strict mode), not a key mismatch. To pin it, add a port-qualified entry (`ssh-keyscan -p 2222 host`, or `ssh_known_hosts_fix` with the port). Once `[host]:port` entries exist, the host-key algorithm preference is built from them alone, so the server is asked for a key type they can accept.
 
 **That last branch is trust-always, not TOFU.** Real trust-on-first-use pins the key it saw the first time and rejects a change afterwards. The connection path never writes to `known_hosts` — no tool adds an entry as a side effect of connecting — so connecting pins nothing: *every* connection to a host absent from `known_hosts` is a "first" use and is accepted, including one where an attacker swapped the key since your last call. Only hosts put into `known_hosts` out of band get mismatch protection — by you, by `ssh-keyscan`, or by `ssh_known_hosts_fix`, the one tool here that does write the file. Call it explicitly to add an entry so future changes are caught.
 

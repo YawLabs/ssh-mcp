@@ -876,7 +876,12 @@ describe("probeAgent picks the right channel for the socket it was given", () =>
     const r = ensureAgent();
     expect(r.reachable).toBe(true);
     expect(r.socket).toBe(NAMED_PIPE);
-    expect(r.message).toBe("Windows OpenSSH agent running with 1 key(s) loaded");
+    // The pipe answered, but connections still try the stale SSH_AUTH_SOCK first
+    // (resolveConfig, ssh.ts), so success alone would mislead: the caveat says so.
+    expect(r.message).toMatch(/^Windows OpenSSH agent running with 1 key\(s\) loaded Note: SSH_AUTH_SOCK is set to /);
+    expect(r.message).toContain('"/mnt/wsl/ssh-agent.sock", where no agent answers');
+    expect(r.message).toContain("connections use SSH_AUTH_SOCK first");
+    expect(r.message).toContain("Unset SSH_AUTH_SOCK");
 
     // First probe: the stale socket, passed through as-is.
     expect(childEnv(0).SSH_AUTH_SOCK).toBe("/mnt/wsl/ssh-agent.sock");
@@ -894,6 +899,7 @@ describe("probeAgent picks the right channel for the socket it was given", () =>
 
     const r = ensureAgent();
     expect(r.socket).toBe(NAMED_PIPE);
+    expect(r.message).toBe("Windows OpenSSH agent running with 1 key(s) loaded");
     expect(calls).toHaveLength(1);
     expect(Object.hasOwn(childEnv(0), "SSH_AUTH_SOCK")).toBe(false);
   });
@@ -995,7 +1001,13 @@ describe("follow-up ssh-add calls use the channel ensureAgent validated", () => 
 
     const r = loadKey("~/.ssh/id_ed25519");
 
-    expect(r).toEqual({ status: "ok", message: `Key loaded: ${join(homedir(), ".ssh", "id_ed25519")}` });
+    // Loaded into the pipe's agent, which ssh_exec will not reach while the stale
+    // SSH_AUTH_SOCK is set, so the success message carries the same caveat.
+    expect(r.status).toBe("ok");
+    expect(r.message).toMatch(/^Key loaded: .*id_ed25519\. Note: SSH_AUTH_SOCK is set to /);
+    expect(r.message).toContain(`Key loaded: ${join(homedir(), ".ssh", "id_ed25519")}.`);
+    expect(r.message).toContain("connections use SSH_AUTH_SOCK first");
+    expect(r.message).toContain("Unset SSH_AUTH_SOCK");
     const load = calls.find((c) => c.cmd === "ssh-add" && c.args[0] !== "-l");
     expect(load?.env).toBeDefined();
     expect(Object.hasOwn(load?.env ?? {}, "SSH_AUTH_SOCK")).toBe(false);
@@ -1009,13 +1021,24 @@ describe("follow-up ssh-add calls use the channel ensureAgent validated", () => 
     expect(listSshKeysDetailed().keys.map((k) => k.loadedInAgent)).toEqual([true]);
   });
 
+  it("loadKey adds no caveat on win32 when the named pipe is reached with no SSH_AUTH_SOCK set", () => {
+    setEnv("SSH_AUTH_SOCK", undefined);
+    sshDir = { kind: "files", files: { id_ed25519: OPENSSH_PRIV } };
+    execHandler = () => ({ stdout: "Identity added" });
+
+    expect(loadKey("~/.ssh/id_ed25519")).toEqual({
+      status: "ok",
+      message: `Key loaded: ${join(homedir(), ".ssh", "id_ed25519")}`,
+    });
+  });
+
   it("loadKey passes a Unix socket through unchanged when that socket is the live one", () => {
     setPlatform("linux");
     setEnv("SSH_AUTH_SOCK", "/tmp/live.sock");
     sshDir = { kind: "files", files: { id_ed25519: OPENSSH_PRIV } };
     execHandler = () => ({ stdout: "Identity added" });
 
-    loadKey("~/.ssh/id_ed25519");
+    expect(loadKey("~/.ssh/id_ed25519").message).toBe(`Key loaded: ${join(homedir(), ".ssh", "id_ed25519")}`);
     const load = calls.find((c) => c.cmd === "ssh-add" && c.args[0] !== "-l");
     expect(load?.env?.SSH_AUTH_SOCK).toBe("/tmp/live.sock");
   });
@@ -1412,6 +1435,54 @@ describe("probeSshConnection builds the ssh argv it claims to", () => {
     );
   });
 
+  describe("strict refusal on a non-22 port of a host pinned only by its bare entry", () => {
+    const REFUSAL =
+      "No ED25519 host key is known for [box.example.test]:2222 and you have requested strict checking.\nHost key verification failed.";
+
+    it("says it is pinned only for port 22 -- in both checkConnectivity and testConnection", () => {
+      execHandler = (cmd, args) => {
+        if (cmd === "ssh") return { fail: true, stderr: REFUSAL };
+        if (cmd === "ssh-keygen" && args[0] === "-F" && args[1] === "box.example.test") {
+          return { stdout: "# Host box.example.test found: line 1" };
+        }
+        return { stdout: "" };
+      };
+
+      for (const message of [
+        checkConnectivity("box.example.test", 2222).message,
+        testConnection("box.example.test", 2222).message,
+      ]) {
+        expect(message).toContain("pinned in known_hosts only for port 22");
+        expect(message).toContain("OpenSSH's strict checking");
+        expect(message).toContain("ssh_exec accepts it only if the key matches the port-22 entry");
+        expect(message).toContain('ssh-keyscan -H -p 2222 "box.example.test" >> ~/.ssh/known_hosts');
+        expect(message).not.toContain("is not in known_hosts");
+      }
+      expect(calls.filter((c) => c.cmd === "ssh-keygen").map((c) => c.args)).toEqual([
+        ["-F", "box.example.test"],
+        ["-F", "box.example.test"],
+      ]);
+    });
+
+    it("keeps the 'not in known_hosts' wording when the bare entry is absent too", () => {
+      execHandler = (cmd) => (cmd === "ssh" ? { fail: true, stderr: REFUSAL } : { stdout: "" });
+
+      expect(checkConnectivity("box.example.test", 2222).message).toMatch(
+        /is not in known_hosts and SSH_MCP_STRICT_HOSTKEYS is on/,
+      );
+      expect(testConnection("box.example.test", 2222).message).toMatch(
+        /is not in known_hosts and SSH_MCP_STRICT_HOSTKEYS is on/,
+      );
+    });
+
+    it("does not look up the bare entry on port 22, where it IS the port's own entry", () => {
+      execHandler = (cmd) => (cmd === "ssh" ? { fail: true, stderr: REFUSAL } : { stdout: "# found" });
+
+      expect(testConnection("box.example.test", 22).message).toMatch(/is not in known_hosts/);
+      expect(calls.some((c) => c.cmd === "ssh-keygen")).toBe(false);
+    });
+  });
+
   it("classifies runArgs' own kill-on-timeout as timed-out, not unknown", () => {
     // execFileSync's timeout throws code ETIMEDOUT with empty streams and the
     // message "spawnSync ssh ETIMEDOUT", which contains no "timed out".
@@ -1776,13 +1847,41 @@ describe("G3 -- checkKnownHosts' three outcomes, with the subprocess faked", () 
     expect(calls.map((c) => c.args)).toEqual([["-F", "[web1.test]:2222"]]);
   });
 
-  it("falls back to the bare entry on a non-default port, as the connection verifier does", () => {
+  it("WARNS when only the bare (port-22) entry exists on a non-default port -- it cannot reject a key there", () => {
+    // buildHostVerifier (ssh.ts) uses a bare entry on a non-22 port only to ACCEPT a
+    // matching key; a different key is still accepted unverified. A PASS here hid that.
     sshDir = { kind: "files", files: { known_hosts: "x" } };
     execHandler = (_cmd, args) =>
       args[1] === "web1.test" ? { stdout: "# Host web1.test found: line 1" } : { stdout: "" };
 
-    expect(checkKnownHosts("web1.test", 2222).status).toBe("ok");
+    const result = checkKnownHosts("web1.test", 2222);
+
+    expect(result.status).toBe("warning");
+    expect(result.message).toContain("pinned in known_hosts only for port 22");
+    expect(result.message).toContain("can accept but never reject a key on port 2222");
+    // Strict mode DOES refuse a key the bare entry does not match (unknown-host-strict
+    // in buildHostVerifier), so "accepted unverified" must carry that qualifier.
+    expect(result.message).toContain("accepted unverified (or refused when SSH_MCP_STRICT_HOSTKEYS=1)");
+    expect(result.message).toContain('ssh-keyscan -H -p 2222 "web1.test" >> ~/.ssh/known_hosts');
     expect(calls.map((c) => c.args[1])).toEqual(["[web1.test]:2222", "web1.test"]);
+  });
+
+  it("diagnose() keeps the port-aware keyscan suggestion when the host is pinned only bare", () => {
+    setPlatform("linux");
+    setEnv("SSH_AUTH_SOCK", undefined);
+    sshDir = { kind: "files", files: { known_hosts: "x" } };
+    execHandler = (cmd, args) => {
+      if (cmd === "ssh-keygen" && args[0] === "-F") {
+        return args[1] === "web1.test" ? { stdout: "# Host web1.test found: line 1" } : { stdout: "" };
+      }
+      if (cmd === "ssh") return { stdout: "SSH_OK" };
+      return { fail: true, stderr: "" };
+    };
+
+    const report = diagnose("web1.test", 2222);
+
+    expect(report.checks.find((c) => c.name === "Known Hosts")?.status).toBe("warning");
+    expect(report.suggestions).toContain('Add host key: ssh-keyscan -H -p 2222 "web1.test" >> ~/.ssh/known_hosts');
   });
 
   it("looks up an IPv6 host by its BARE address at the default port", () => {

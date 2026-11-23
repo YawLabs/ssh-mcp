@@ -1,6 +1,7 @@
+import { rmSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { Server, utils } from "ssh2";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { connectWithProxy, exec, type ResolvedConfig } from "../ssh.js";
 
 // Isolate the JUMP hop from the developer's machine. connectWithProxy builds each hop via
@@ -13,13 +14,20 @@ vi.mock("../diagnose.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../diagnose.js")>();
   return { ...actual, runArgs: () => ({ stdout: "", ok: false }) };
 });
+// The fake home is created inside the mock factory (it must exist before ssh.ts imports
+// node:os) and recorded here so afterAll can remove it instead of leaking one dir per run.
+const fakeHome = vi.hoisted(() => ({ path: "" }));
 vi.mock("node:os", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:os")>();
   const { mkdtempSync } = await import("node:fs");
   const { join } = await import("node:path");
-  const home = mkdtempSync(join(actual.tmpdir(), "ssh-mcp-proxyjump-home-"));
+  fakeHome.path = mkdtempSync(join(actual.tmpdir(), "ssh-mcp-proxyjump-home-"));
+  const home = fakeHome.path;
   const homedir = () => home;
   return { ...actual, default: { ...actual, homedir }, homedir };
+});
+afterAll(() => {
+  if (fakeHome.path) rmSync(fakeHome.path, { recursive: true, force: true });
 });
 
 beforeEach(() => {

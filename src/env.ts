@@ -6,6 +6,7 @@ import {
   classifySshProbe,
   isValidHostname,
   type PrivateKeyCandidate,
+  portPinnedOnlyAt22Note,
   probeSshConnection,
   runArgs,
   scanPrivateKeyFiles,
@@ -84,6 +85,17 @@ interface AgentChannel {
    * the probe found. Undefined means "the inherited process.env already points there".
    */
   env?: AgentEnv;
+  /**
+   * Set when the agent was reached only through the Windows named pipe while
+   * SSH_AUTH_SOCK names a socket where nothing answers. The connection path
+   * (resolveConfig, ssh.ts) still tries SSH_AUTH_SOCK first, so a key reported as
+   * running/loaded here is not what ssh_exec sees. Same caveat as checkSshAgent.
+   */
+  caveat?: string;
+}
+
+function staleSockCaveat(sock: string): string {
+  return `Note: SSH_AUTH_SOCK is set to "${sock}", where no agent answers, and connections use SSH_AUTH_SOCK first, so ssh_exec will not see this agent's keys. Unset SSH_AUTH_SOCK so every tool reaches the agent through its named pipe.`;
 }
 
 // Finds an agent that answers, without starting one: SSH_AUTH_SOCK first, then (on
@@ -107,13 +119,14 @@ function findReachableAgent(): AgentChannel | null {
   if (process.platform === "win32") {
     const env = agentChildEnv(WINDOWS_AGENT_PIPE);
     const agent = probeAgent(WINDOWS_AGENT_PIPE, "Windows OpenSSH agent", env);
-    if (agent) return { agent, env };
+    if (agent) return sock ? { agent, env, caveat: staleSockCaveat(sock) } : { agent, env };
   }
   return null;
 }
 
 export function ensureAgent(): AgentResult {
-  return ensureAgentChannel().agent;
+  const { agent, caveat } = ensureAgentChannel();
+  return caveat ? { ...agent, message: `${agent.message} ${caveat}` } : agent;
 }
 
 function ensureAgentChannel(): AgentChannel {
@@ -298,7 +311,7 @@ export function listSshKeysDetailed(): SshKeyListing {
 
 export function loadKey(keyPath: string): { status: "ok" | "error"; message: string } {
   // Ensure agent is running first
-  const { agent, env: agentEnv } = ensureAgentChannel();
+  const { agent, env: agentEnv, caveat } = ensureAgentChannel();
   if (!agent.reachable) {
     return { status: "error", message: agent.message };
   }
@@ -314,7 +327,7 @@ export function loadKey(keyPath: string): { status: "ok" | "error"; message: str
   // a stale SSH_AUTH_SOCK that is the named pipe, which the inherited value misses.
   const { stdout, ok } = runArgs("ssh-add", [resolved], agentEnv ? { env: agentEnv } : undefined);
   if (ok) {
-    return { status: "ok", message: `Key loaded: ${resolved}` };
+    return { status: "ok", message: caveat ? `Key loaded: ${resolved}. ${caveat}` : `Key loaded: ${resolved}` };
   }
 
   // Permissions check first: ssh-add prints "Permissions ... are too open" /
@@ -586,11 +599,16 @@ export function testConnection(host: string, port = 22): { status: "ok" | "warni
       };
     case "timed-out":
       return { status: "error", message: `Connection timed out to ${host}:${port}. Host down or firewall blocking.` };
-    case "host-key-unknown":
+    case "host-key-unknown": {
+      // Shared with checkConnectivity: a host pinned only by its bare (port-22) entry
+      // is refused here but accepted by ssh_exec when the key matches that entry.
+      const note = portPinnedOnlyAt22Note(host, port);
+      if (note) return { status: "error", message: note };
       return {
         status: "error",
         message: `${host}:${port} is not in known_hosts and SSH_MCP_STRICT_HOSTKEYS is on, so it is refused. Pin it with ssh_known_hosts_fix.`,
       };
+    }
     case "host-key-mismatch":
       return {
         status: "error",

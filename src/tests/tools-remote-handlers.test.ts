@@ -556,13 +556,16 @@ describe("real statFile: which target failures fall back and which propagate", (
   };
   const realStatFile = async () => (await vi.importActual<typeof import("../ssh.js")>("../ssh.js")).statFile;
 
-  it.each([
-    ["NO_SUCH_FILE (dangling)", 2],
-    ["FAILURE (OpenSSH's code for ELOOP)", 4],
-  ])("falls back to the link's own stats on %s and marks targetResolved false", async (_l, code) => {
+  it("falls back to the link's own stats on NO_SUCH_FILE (dangling, or a loop) and marks targetResolved false", async () => {
+    // OpenSSH's sftp-server maps ENOENT and ELOOP alike to NO_SUCH_FILE (errno_to_portable).
     const statFile = await realStatFile();
-    const result = await statFile(clientWith(sftpError("x", code)), "/l");
+    const result = await statFile(clientWith(sftpError("No such file", 2)), "/l");
     expect(result).toMatchObject({ isSymbolicLink: true, targetResolved: false, size: 11 });
+  });
+
+  it("rethrows the FAILURE catch-all (e.g. EIO) instead of rendering it as dangling", async () => {
+    const statFile = await realStatFile();
+    await expect(statFile(clientWith(sftpError("Failure", 4)), "/l")).rejects.toThrow("Failure");
   });
 
   it("rethrows PERMISSION_DENIED on the target instead of rendering it as dangling", async () => {
@@ -755,6 +758,24 @@ describe("ssh_read_file paging (offset / length)", () => {
     readFileRangeSpy.mockResolvedValue({ text: "x", offset: 3, bytesRead: 1, size: 4 });
     await call("ssh_read_file", { ...HOST, path: "/f", offset: 3 });
     expect(lastCall(readFileRangeSpy).slice(1)).toEqual(["/f", 3, 10 * 1024 * 1024]);
+  });
+
+  it("an unknown size (/proc reports 0) with a FULL page gives a next offset, never 'of 0'", async () => {
+    readFileRangeSpy.mockResolvedValue({ text: "MemTotal", offset: 0, bytesRead: 8 });
+    const result = await call("ssh_read_file", { ...HOST, path: "/proc/meminfo", length: 8 });
+    expect(result.content.map((c) => c.text)).toEqual(["[bytes 0-8 of unknown size; next offset: 8]", "MemTotal"]);
+  });
+
+  it("an unknown size with a SHORT page is the end of file", async () => {
+    readFileRangeSpy.mockResolvedValue({ text: "cpu 1\n", offset: 16, bytesRead: 6 });
+    const result = await call("ssh_read_file", { ...HOST, path: "/proc/stat", offset: 16, length: 100 });
+    expect(result.content[0].text).toBe("[bytes 16-22; end of file]");
+  });
+
+  it("an unknown size with no bytes does not claim the file is 0 bytes", async () => {
+    readFileRangeSpy.mockResolvedValue({ text: "", offset: 40, bytesRead: 0 });
+    const result = await call("ssh_read_file", { ...HOST, path: "/proc/stat", offset: 40, length: 10 });
+    expect(result.content.map((c) => c.text)).toEqual(["[no bytes at offset 40: end of file (size not reported)]"]);
   });
 
   it("the description tells the caller paging exists", () => {

@@ -450,7 +450,10 @@ describe("readFileRange -- the paged half of ssh_read_file", () => {
     // returned no bytes for a file a whole read could see.
     const { client, probe } = rangeClient(Buffer.from("MemTotal: 1 kB\n"), Number.POSITIVE_INFINITY, 0);
     const page = await readFileRange(client, "/proc/meminfo", 0, 8);
-    expect(page).toEqual({ text: "MemTotal", offset: 0, bytesRead: 8, size: 0 });
+    // ...and the size is reported as UNKNOWN (absent), not 0: "of 0" next to 8 bytes
+    // of data told the caller the file had ended.
+    expect(page).toStrictEqual({ text: "MemTotal", offset: 0, bytesRead: 8 });
+    expect("size" in page).toBe(false);
     expect(probe.opened).toBe(1);
   });
 
@@ -1141,6 +1144,77 @@ describe("the SFTP helpers have a per-call deadline", () => {
       const { client } = fakeSftpClient({ stat: () => ({ size: 2 }), readFile: () => Buffer.from("ok") });
       await expect(readFile(client, "/f")).resolves.toBe("ok");
       expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("whole-file transfers time out on INACTIVITY, not on total duration", () => {
+  /**
+   * An sftp whose fastPut / fastGet report a chunk of progress every `stepMs` through
+   * the `step` option, `steps` times, then complete -- or, with `stallAfter`, go
+   * silent forever instead of completing.
+   */
+  function transferringSftp(op: "fastPut" | "fastGet", stepMs: number, steps: number, stallAfter = false) {
+    const probe = { ended: 0 };
+    const transfer = (_a: string, _b: string, opts: { step?: (...a: number[]) => void }, cb: (e?: Error) => void) => {
+      let done = 0;
+      const tick = () => {
+        if (done === steps) return stallAfter ? undefined : cb();
+        done++;
+        opts.step?.(done * 32768, 32768, steps * 32768);
+        setTimeout(tick, stepMs);
+      };
+      setTimeout(tick, stepMs);
+    };
+    const sftp = {
+      [op]: transfer,
+      end: () => {
+        probe.ended++;
+      },
+    };
+    return { client: { sftp: (cb: (e: any, s: any) => void) => cb(null, sftp) } as any, probe };
+  }
+
+  it.each([
+    ["uploadFile", "fastPut" as const, (c: any) => uploadFile(c, "/l", "/r", 1000)],
+    ["downloadFile", "fastGet" as const, (c: any) => downloadFile(c, "/r", "/l", 1000)],
+  ])("%s survives a transfer far longer than its timeout while bytes keep moving", async (_n, op, run) => {
+    vi.useFakeTimers();
+    try {
+      // 20 chunks, 500ms apart: 10s total against a 1s timeout. A whole-call
+      // deadline aborted this at 1s.
+      const { client, probe } = transferringSftp(op, 500, 20);
+      const settled = vi.fn();
+      const pending = run(client).then(() => settled("ok"), settled);
+      await vi.advanceTimersByTimeAsync(10_500);
+      await pending;
+      expect(settled).toHaveBeenCalledWith("ok");
+      expect(probe.ended).toBe(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    ["uploadFile", "fastPut" as const, (c: any) => uploadFile(c, "/l", "/r", 1000)],
+    ["downloadFile", "fastGet" as const, (c: any) => downloadFile(c, "/r", "/l", 1000)],
+  ])("%s still aborts a transfer that stops making progress", async (_n, op, run) => {
+    vi.useFakeTimers();
+    try {
+      const { client, probe } = transferringSftp(op, 500, 4, true); // moves for 2s, then hangs
+      const settled = vi.fn();
+      const pending = run(client).then(() => settled("ok"), settled);
+      await vi.advanceTimersByTimeAsync(2_900);
+      expect(settled).not.toHaveBeenCalled(); // last progress at 2.0s, timeout due at 3.0s
+      await vi.advanceTimersByTimeAsync(200);
+      await pending;
+      expect(settled).toHaveBeenCalledWith(
+        expect.objectContaining({ message: expect.stringMatching(/timed out after 1000ms with no transfer progress/) }),
+      );
+      expect(probe.ended).toBe(1);
     } finally {
       vi.useRealTimers();
     }
