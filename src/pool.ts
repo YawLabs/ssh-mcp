@@ -7,16 +7,26 @@ interface PoolEntry {
   key: string;
   refCount: number;
   idleTimer: ReturnType<typeof setTimeout> | null;
-  dead: boolean;
+  /**
+   * False from registration until the first caller takes a ref. The dialing factory registers
+   * the entry with refCount 0 and its caller only bumps it after an `await` hop, so without this
+   * flag findEvictable() saw a brand-new connection as idle and a concurrent acquire for another
+   * key could end() it before its own dialer ever used it (wasted dial, possible redial loop).
+   */
+  claimed: boolean;
 }
 
 export interface PoolOptions {
-  /** Milliseconds before an idle connection is closed. Default: 60000 (60s) */
+  /**
+   * Milliseconds before an idle connection is closed. Default: 60000 (60s). Clamped to
+   * 2147483647 (the longest delay setTimeout honors); a negative or non-number value means the default.
+   */
   idleTtlMs?: number;
   /**
    * Maximum number of connections in the pool, counting dials still in flight.
    * Default: 100, overridable via the
-   * `SSH_MCP_MAX_POOL_SIZE` env var. When at capacity, the pool first tries to evict
+   * `SSH_MCP_MAX_POOL_SIZE` env var; a value that is not a positive integer means that default.
+   * When at capacity, the pool first tries to evict
    * an idle entry; if no idle entry can be evicted (every slot is in use or dialing),
    * `acquire()` rejects with a {@link PoolFullError} ("Connection pool is full") -- at once
    * by default, or once `waitForCapacityMs` (see {@link AcquireOptions}) passes without winning a slot.
@@ -79,8 +89,39 @@ export function isPoolFullError(err: unknown): err is PoolFullError {
   return typeof err === "object" && err !== null && (err as { code?: unknown }).code === POOL_FULL_ERROR_CODE;
 }
 
+/** `code` of the error `acquire()` throws once the pool has been drained. */
+const POOL_DRAINED_ERROR_CODE = "ERR_SSH_MCP_POOL_DRAINED";
+
+// A drain is a deliberate shutdown, not an SSH failure: this error is rethrown as-is, never run
+// through enhanceSshError, which would spawn the environment diagnostics (the very shutdown-path
+// cost acquireNow's early drained check avoids) and blame the SSH setup for it.
+class PoolDrainedError extends Error {
+  readonly code = POOL_DRAINED_ERROR_CODE;
+  constructor(message: string) {
+    super(message);
+    this.name = "PoolDrainedError";
+  }
+}
+
+function isPoolDrainedError(err: unknown): boolean {
+  return typeof err === "object" && err !== null && (err as { code?: unknown }).code === POOL_DRAINED_ERROR_CODE;
+}
+
 // setTimeout clamps anything above a signed 32-bit millisecond count to 1ms.
 const MAX_TIMER_MS = 2_147_483_647;
+const DEFAULT_IDLE_TTL_MS = 60_000;
+
+// Option values are validated the way the env var is: a library caller passing NaN used to get an
+// uncapped pool (`size >= NaN` is always false) and 0 a pool that refused every acquire.
+function validMaxPoolSize(value: number | undefined): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : defaultMaxPoolSize();
+}
+
+// Clamped like the capacity-wait timer: an idleTtlMs past MAX_TIMER_MS used to reach setTimeout
+// verbatim, which Node turns into 1ms, so every released connection closed at once.
+function validIdleTtlMs(value: number | undefined): number {
+  return typeof value === "number" && value >= 0 ? Math.min(value, MAX_TIMER_MS) : DEFAULT_IDLE_TTL_MS;
+}
 
 function defaultMaxPoolSize(): number {
   // Digits only, after a trim. Number.parseInt reads a prefix, so "10abc" was 10 and
@@ -126,8 +167,13 @@ function updateField(h: Hmac, tag: string, value: Buffer | string): void {
   h.update(bytes);
 }
 
-function authFingerprint(cc: ConnectConfig): string {
+// Also folds in the ProxyJump chain: the key names the RESOLVED hostname, and two aliases can
+// share one (`HostName 10.0.1.5` behind `ProxyJump bastion-prod` and behind `bastion-stage`,
+// overlapping RFC 1918 space). Without the route they shared one pooled connection, so a call
+// to the stage alias ran on the prod host.
+function poolKeyFingerprint(cc: ConnectConfig, proxyJump: string | undefined): string {
   const h = createHmac("sha256", AUTH_FINGERPRINT_SECRET);
+  if (proxyJump) updateField(h, "j", proxyJump);
   if (cc.privateKey) updateField(h, "k", cc.privateKey as Buffer | string);
   if (cc.password !== undefined) {
     updateField(h, "p", scryptSync(cc.password, AUTH_FINGERPRINT_SECRET, 32, { N: PASSWORD_SCRYPT_COST }));
@@ -183,8 +229,8 @@ export class ConnectionPool {
   private capacityWaiters = new Set<() => void>();
 
   constructor(options?: PoolOptions) {
-    this.idleTtlMs = options?.idleTtlMs ?? 60_000;
-    this.maxPoolSize = options?.maxPoolSize ?? defaultMaxPoolSize();
+    this.idleTtlMs = validIdleTtlMs(options?.idleTtlMs);
+    this.maxPoolSize = validMaxPoolSize(options?.maxPoolSize);
   }
 
   /**
@@ -219,10 +265,10 @@ export class ConnectionPool {
     // fan-out's workers reach here once per queued host after drain() wakes them, all in one
     // microtask chain -- paying a spawn per host there would stall the shutdown timer behind it.
     // The in-loop check below still covers a drain that lands during the dial.
-    if (this.drained) throw new Error("ConnectionPool was drained");
+    if (this.drained) throw new PoolDrainedError("ConnectionPool was drained");
     const resolved = resolveOrDiagnose(config);
     const cc = resolved.connectConfig;
-    const key = `${cc.username}@${cc.host}:${cc.port}#${authFingerprint(cc)}`;
+    const key = `${cc.username}@${cc.host}:${cc.port}#${poolKeyFingerprint(cc, resolved.proxyJump)}`;
 
     // Bound the dead-race retry loop. In practice the loop exits on the first
     // iteration; the retry only fires when a connection dies between the time
@@ -234,20 +280,14 @@ export class ConnectionPool {
     for (let attempt = 0; attempt < MAX_ACQUIRE_ATTEMPTS; attempt++) {
       // Drain wins over any in-flight or queued acquire — pool is one-way.
       if (this.drained) {
-        throw new Error("ConnectionPool was drained");
+        throw new PoolDrainedError("ConnectionPool was drained");
       }
-      // Fast path: live entry — bump refcount and return.
+      // Fast path: a mapped entry is live -- markDead removes an entry in the same call that
+      // sees it die -- so bump its refcount and return it.
       const existing = this.entries.get(key);
-      if (existing && !existing.dead) {
-        existing.refCount++;
-        if (existing.idleTimer) {
-          clearTimeout(existing.idleTimer);
-          existing.idleTimer = null;
-        }
+      if (existing) {
+        this.takeRef(existing);
         return existing.client;
-      }
-      if (existing?.dead) {
-        this.entries.delete(key);
       }
 
       // Slow path: share a single in-flight connect across concurrent callers.
@@ -294,13 +334,12 @@ export class ConnectionPool {
               } catch {
                 // already closed
               }
-              throw new Error("ConnectionPool was drained while connecting");
+              throw new PoolDrainedError("ConnectionPool was drained while connecting");
             }
             this._connectCount++;
-            const entry: PoolEntry = { client, key, refCount: 0, idleTimer: null, dead: false };
+            const entry: PoolEntry = { client, key, refCount: 0, idleTimer: null, claimed: false };
 
             const markDead = () => {
-              entry.dead = true;
               if (entry.idleTimer) {
                 clearTimeout(entry.idleTimer);
                 entry.idleTimer = null;
@@ -320,9 +359,8 @@ export class ConnectionPool {
           } finally {
             this.pending.delete(key);
             // A failed dial frees its slot outright. A successful one only moves it from
-            // `pending` to `entries`, so waking waiters there would free nothing -- and would
-            // send them into the window before this acquire takes its ref, where the new
-            // refCount-0 entry still looks evictable.
+            // `pending` to `entries` (unclaimed, so not evictable until its first ref), so
+            // waking waiters there would free nothing.
             if (!registered) this.notifyCapacity();
           }
         })();
@@ -336,6 +374,7 @@ export class ConnectionPool {
       try {
         client = await inflight.promise;
       } catch (err: unknown) {
+        if (isPoolDrainedError(err)) throw err;
         // Deliberately `inflight.resolved`, not this caller's `resolved`: see the
         // comment on `pending`. Every waiter on one coalesced dial reports the same
         // reason, because there was only ever one dial to have a reason.
@@ -347,15 +386,11 @@ export class ConnectionPool {
       // deletes the entry, and we end up here holding a dead client. In that
       // case fall through to the next loop iteration, which will dial again.
       const entry = this.entries.get(key);
-      if (!entry || entry.dead || entry.client !== client) {
+      if (!entry || entry.client !== client) {
         lastErr = new Error("connection died before acquire could take a ref");
         continue;
       }
-      entry.refCount++;
-      if (entry.idleTimer) {
-        clearTimeout(entry.idleTimer);
-        entry.idleTimer = null;
-      }
+      this.takeRef(entry);
       return client;
     }
     // Names the target, not `key`: the auth fingerprint is internal and stays out of
@@ -367,11 +402,20 @@ export class ConnectionPool {
     );
   }
 
+  private takeRef(entry: PoolEntry): void {
+    entry.refCount++;
+    entry.claimed = true;
+    if (entry.idleTimer) {
+      clearTimeout(entry.idleTimer);
+      entry.idleTimer = null;
+    }
+  }
+
   release(client: Client): void {
     for (const entry of this.entries.values()) {
       if (entry.client === client) {
         entry.refCount = Math.max(0, entry.refCount - 1);
-        if (entry.refCount === 0 && !entry.dead) {
+        if (entry.refCount === 0) {
           // A second release of an already-idle entry lands here with the first timer
           // still armed. Re-arming without this clear orphans it: the orphan fires on
           // its own deadline and end()s + deletes whatever entry then holds entry.key
@@ -500,10 +544,11 @@ export class ConnectionPool {
 
   // The eviction rule, in one place: the first entry (insertion order) no caller holds. Both
   // acquireNow()'s eviction and hasCapacity() read it, so waitForCapacity's re-check can never
-  // disagree with what an acquire would actually evict.
+  // disagree with what an acquire would actually evict. An unclaimed entry -- just registered,
+  // its dialer's ref not yet taken -- is in use, not idle (see PoolEntry.claimed).
   private findEvictable(): PoolEntry | undefined {
     for (const e of this.entries.values()) {
-      if (e.refCount === 0) return e;
+      if (e.refCount === 0 && e.claimed) return e;
     }
     return undefined;
   }

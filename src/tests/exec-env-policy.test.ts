@@ -93,6 +93,8 @@ describe("ssh_exec env-var prefixing (gap 1)", () => {
     // No policy configured -- gap 1 is about quoting, not gating.
     vi.stubEnv("SSH_MCP_COMMAND_WHITELIST", "");
     vi.stubEnv("SSH_MCP_COMMAND_BLACKLIST", "");
+    // An opt-out exported in the developer's shell would otherwise leak in (see policy.test.ts).
+    vi.stubEnv("SSH_MCP_COMMAND_ALLOW_SHELL_SYNTAX", "");
   });
   afterEach(() => {
     vi.unstubAllEnvs();
@@ -170,6 +172,8 @@ describe("ssh_exec policy enforced against the env-PREFIXED command (gap 2)", ()
     execSpy.mockClear();
     vi.stubEnv("SSH_MCP_COMMAND_WHITELIST", "");
     vi.stubEnv("SSH_MCP_COMMAND_BLACKLIST", "");
+    // An opt-out exported in the developer's shell would otherwise leak in (see policy.test.ts).
+    vi.stubEnv("SSH_MCP_COMMAND_ALLOW_SHELL_SYNTAX", "");
   });
   afterEach(() => {
     vi.unstubAllEnvs();

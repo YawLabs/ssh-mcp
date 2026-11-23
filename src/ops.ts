@@ -363,7 +363,11 @@ export async function serviceStatus(client: Client, serviceName: string, timeout
   const result = await exec(client, `LC_ALL=C systemctl status -- ${shellQuote(serviceName)} 2>&1`, timeoutMs);
   const raw = result.stdout;
 
-  const activeMatch = raw.match(/Active:\s+(\S+)\s+\(([^)]+)\)/);
+  // `since` is captured from the Active line itself. Matching it anywhere in the output let a
+  // journal line ("idle since 12:00; retrying") stand in for a unit whose Active line has none.
+  // The `since` group may follow further text on that line: a restarting unit prints a second
+  // parenthesised state, "Active: activating (auto-restart) (Result: exit-code) since ...;".
+  const activeMatch = raw.match(/Active:[ \t]+(\S+)[ \t]+\(([^)\n]+)\)(?:[^\n]*?[ \t]since[ \t]+([^;\n]+?);)?/);
   // systemctl puts the description on the UNINDENTED header line, e.g.
   // "* nginx.service - A high performance web server" (optionally led by a status
   // bullet). Match an optional bullet/leading non-word run, the unit token, " - ",
@@ -372,21 +376,23 @@ export async function serviceStatus(client: Client, serviceName: string, timeout
   // leaving description permanently undefined.
   const descMatch = raw.match(/^[^\w\n]*\S+\s+-\s+(.+)$/m);
   const pidMatch = raw.match(/Main PID:\s+(\d+)/);
-  const sinceMatch = raw.match(/since\s+(.+?);/);
 
   // No `Active:` line + non-zero exit means systemctl could not answer (unit missing,
   // systemd not running, permission denied). That's an error case agents need to
   // distinguish from "service exists but is stopped" -- the latter still has a parseable
   // `Active: inactive (dead)` line and a zero or one exit code depending on systemd version.
   const unknown = !activeMatch && result.code !== 0;
+  // With no parseable Active line, the exit code is the only answer: `systemctl status`
+  // exits 0 only for an active unit. `active` and `status` both come from it, so the
+  // fallback can no longer report status "active" beside active:false.
   const fallbackStatus = result.code === 0 ? "active" : "inactive";
 
   return {
     name: serviceName,
-    active: activeMatch?.[1] === "active",
+    active: activeMatch ? activeMatch[1] === "active" : fallbackStatus === "active",
     status: activeMatch ? `${activeMatch[1]} (${activeMatch[2]})` : fallbackStatus,
     description: descMatch?.[1]?.trim(),
-    since: sinceMatch?.[1]?.trim(),
+    since: activeMatch?.[3]?.trim(),
     pid: pidMatch ? Number.parseInt(pidMatch[1], 10) : undefined,
     raw,
     unknown,

@@ -1,4 +1,8 @@
 FROM alpine:3.21
+# AllowTcpForwarding: Alpine's packaged sshd_config ships an uncommented
+# `AllowTcpForwarding no`, so the bastion would refuse the direct-tcpip channel
+# the ProxyJump case opens. The grep fails the build if the sed ever stops
+# matching, rather than leaving forwarding silently off.
 RUN apk add --no-cache openssh-server bash && \
     ssh-keygen -A && \
     mkdir -p /root/.ssh && \
@@ -7,6 +11,8 @@ RUN apk add --no-cache openssh-server bash && \
     sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config && \
     sed -i 's/#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
     echo "PubkeyAuthentication yes" >> /etc/ssh/sshd_config && \
+    sed -i 's/^#*AllowTcpForwarding.*/AllowTcpForwarding yes/' /etc/ssh/sshd_config && \
+    grep -q "^AllowTcpForwarding yes" /etc/ssh/sshd_config && \
     mkdir -p /var/log && echo "test log line 1\ntest log line 2\ntest log line 3" > /var/log/test.log && \
     mkdir -p /tmp/testdir && touch /tmp/testdir/file1.txt /tmp/testdir/file2.log /tmp/testdir/file3.txt
 EXPOSE 22

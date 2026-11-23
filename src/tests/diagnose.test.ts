@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
+  bracketedIpv6Inner,
   checkKnownHosts,
-  checkSshAgent,
-  checkSshConfig,
-  checkSshKeys,
   diagnose,
+  INVALID_SSH_HOST_SUGGESTION,
+  isInternationalHostname,
   isValidHostname,
+  isValidSshHost,
 } from "../diagnose.js";
 
 describe("isValidHostname", () => {
@@ -64,35 +65,104 @@ describe("isValidHostname", () => {
   });
 });
 
-describe("checkSshAgent", () => {
-  it("returns a diagnostic result", () => {
-    const result = checkSshAgent();
-    expect(result.status).toMatch(/^(ok|warning|error)$/);
-    expect(result.message).toBeTruthy();
+// The connection path's check (resolveConfig): isValidHostname plus BARE IPv6, which
+// ssh2 dials as given and `ssh -G` / parseJumpSpec hand back unbracketed.
+describe("isValidSshHost", () => {
+  it("accepts everything isValidHostname accepts", () => {
+    for (const host of ["example.com", "my_server", "192.168.1.1", "[::1]", "[2001:db8::1]", "a".repeat(253)]) {
+      expect(isValidSshHost(host), host).toBe(true);
+    }
+  });
+
+  it("also accepts a bare IPv6 literal, zone id included", () => {
+    for (const host of ["::1", "fe80::1", "2001:db8::1", "::ffff:192.0.2.1", "fe80::1%eth0"]) {
+      expect(isValidHostname(host), host).toBe(false); // the narrower check still refuses it
+      expect(isValidSshHost(host), host).toBe(true);
+    }
+  });
+
+  it("refuses option-shaped, port-glued and injection-shaped input", () => {
+    for (const host of [
+      "-oProxyCommand=x",
+      "-E",
+      "host:22", // one colon is never IPv6
+      ":::", // colons alone are not an address
+      "[::1]:22",
+      "[::1",
+      "user@host",
+      "host; reboot",
+      "host\nother",
+      "",
+      "a".repeat(254),
+    ]) {
+      expect(isValidSshHost(host), host).toBe(false);
+    }
+  });
+
+  it("refuses a non-string from an untyped caller instead of throwing", () => {
+    expect(isValidSshHost(undefined as unknown as string)).toBe(false);
+    expect(isValidSshHost(42 as unknown as string)).toBe(false);
+  });
+
+  it("its suggestion names every accepted shape, bare IPv6 and zone ids included", () => {
+    expect(INVALID_SSH_HOST_SUGGESTION).toContain("ssh_config alias");
+    expect(INVALID_SSH_HOST_SUGGESTION).toContain("bare (::1, fe80::1%eth0)");
+    expect(INVALID_SSH_HOST_SUGGESTION).toContain("bracketed ([::1], [fe80::1%eth0])");
+    expect(INVALID_SSH_HOST_SUGGESTION).toContain("internationalized name such as bücher.de");
+    expect(INVALID_SSH_HOST_SUGGESTION).toContain("not starting with a hyphen");
+  });
+
+  // Every shape the suggestion advertises must pass the check it accompanies.
+  it("accepts a bracketed IPv6 literal with a zone id, which isValidHostname's bracket form refuses", () => {
+    for (const host of ["[fe80::1%eth0]", "[fe80::1%25]", "[::ffff:192.0.2.1]"]) {
+      expect(isValidHostname(host), host).toBe(false);
+      expect(isValidSshHost(host), host).toBe(true);
+      expect(bracketedIpv6Inner(host), host).toBe(host.slice(1, -1));
+    }
+    for (const host of ["[fe80::1%eth0]:22", "[host.example]", "[]", "[fe80::1%eth0", "fe80::1%eth0]"]) {
+      expect(isValidSshHost(host), host).toBe(false);
+      expect(bracketedIpv6Inner(host), host).toBeNull();
+    }
+  });
+
+  it("accepts an internationalized hostname, as OpenSSH and the old direct dial did", () => {
+    for (const host of ["bücher.de", "BÜCHER.de", "münchen.example", "例え.jp", "bü_x.de"]) {
+      expect(isValidHostname(host), host).toBe(false);
+      expect(isInternationalHostname(host), host).toBe(true);
+      expect(isValidSshHost(host), host).toBe(true);
+    }
+  });
+
+  it("refuses an internationalized host carrying anything isValidHostname would refuse", () => {
+    for (const host of [
+      "-bücher.de", // option-shaped; punycode would hide the '-' (xn---bcher-kva.de)
+      "­-bücher.de", // a soft hyphen IDNA maps to nothing, which would leave a leading '-'
+      "bücher.de:22", // port
+      "jeff@bücher.de", // login
+      "bü%41.de", // domainToASCII would percent-decode it
+      "bü cher.de", // ASCII space
+      "bü　cher.de", // ideographic space
+      "bü​cher.de", // zero-width space, which IDNA maps to nothing
+      "bü‮cher.de", // bidi override
+      "bü\ncher.de",
+      "bücher.de;reboot",
+      "ü".repeat(300), // over 253 once punycoded
+      "ｂü：ｃｈｅｒ．ｄｅ", // a full-width colon maps to ':'
+    ]) {
+      expect(isInternationalHostname(host), JSON.stringify(host)).toBe(false);
+      expect(isValidSshHost(host), JSON.stringify(host)).toBe(false);
+    }
+    // All-ASCII input is isValidHostname's job, not this one's.
+    expect(isInternationalHostname("example.com")).toBe(false);
   });
 });
 
-describe("checkSshKeys", () => {
-  it("returns a diagnostic result", () => {
-    const result = checkSshKeys();
-    expect(result.status).toMatch(/^(ok|warning|error)$/);
-    expect(result.message).toBeTruthy();
-  });
-});
+// Only pure cases live here -- each returns before any subprocess or filesystem
+// read, so none depends on the machine, its agent, its ~/.ssh or the network. The
+// checks that do shell out are covered with a faked subprocess and a faked ~/.ssh in
+// env-diagnose-coverage.test.ts.
 
 describe("checkKnownHosts", () => {
-  it("returns result for known host", () => {
-    const result = checkKnownHosts("github.com");
-    expect(result.status).toMatch(/^(ok|warning|error)$/);
-    expect(result.message).toBeTruthy();
-  });
-
-  it("returns warning for unknown host", () => {
-    const result = checkKnownHosts("definitely-not-a-real-host-12345.example.com");
-    expect(result.status).toBe("warning");
-    expect(result.message).toMatch(/not in known_hosts|known_hosts does not exist/);
-  });
-
   it("returns error for invalid hostname", () => {
     const result = checkKnownHosts("host; rm -rf /");
     expect(result.status).toBe("error");
@@ -100,38 +170,7 @@ describe("checkKnownHosts", () => {
   });
 });
 
-describe("checkSshConfig", () => {
-  it("returns result for any host", () => {
-    const result = checkSshConfig("example.com");
-    expect(result.status).toMatch(/^(ok|warning|error)$/);
-    expect(result.message).toBeTruthy();
-  });
-});
-
 describe("diagnose", () => {
-  it("returns a complete diagnostic report", () => {
-    const report = diagnose("example.com");
-    expect(report.overall).toMatch(/^(ok|warning|error)$/);
-    expect(report.checks.length).toBeGreaterThanOrEqual(4);
-    expect(Array.isArray(report.suggestions)).toBe(true);
-
-    for (const check of report.checks) {
-      expect(check.name).toBeTruthy();
-      expect(check.status).toMatch(/^(ok|warning|error)$/);
-      expect(check.message).toBeTruthy();
-    }
-  });
-
-  it("includes all check categories", () => {
-    const report = diagnose("example.com");
-    const names = report.checks.map((c) => c.name);
-    expect(names).toContain("SSH Agent");
-    expect(names).toContain("SSH Keys");
-    expect(names).toContain("SSH Config");
-    expect(names).toContain("Known Hosts");
-    expect(names).toContain("Connectivity");
-  });
-
   it("rejects invalid hostname early", () => {
     const report = diagnose("host; rm -rf /");
     expect(report.overall).toBe("error");

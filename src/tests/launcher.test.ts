@@ -31,11 +31,11 @@ import { afterAll, describe, expect, it } from "vitest";
 // which is how a test tells "served in the launcher's process" apart from
 // "handed off to a Node child that printed the same marker".
 //
-// `auto` ships running on Node (AUTO_PREFERS_OAM = false in the launcher), so
-// its oam-preferring behaviour is unreachable in the shipped file. The cases that
-// cover it run a copy with that one constant patched to true -- makeLayout's
-// `autoPrefersOam` -- so the day the switch is flipped back the behaviour is
-// already under test. "launcher: auto runs on Node" covers the shipped default.
+// `auto` ships preferring oam (AUTO_PREFERS_OAM = true in the launcher), so every
+// execution case here runs the UNPATCHED launcher; makeLayout patches only
+// OAM_MIN. "launcher: auto prefers oam" covers the shipped default end to end.
+// The flag-false branch is unreachable in the shipped file, so it is covered by
+// runtimePlan() alone, evaluated with the constant forced to false.
 //
 // Two pure decisions, runtimePlan() and pickNewest(), are ALSO evaluated straight
 // from their source text, because their input matrices are too wide to pay a
@@ -153,6 +153,24 @@ function poseNodeAsOam(text: string): string {
 /** What oam itself prints for `--version`, at the floor. */
 const OAM_AT_FLOOR = "oam 0.21.1\n";
 
+/**
+ * Preload: the launcher's FIRST spawn() targets a path that does not exist, so a
+ * chosen oam that passed its --version probe then fails to start (the binary
+ * deleted or replaced in between). Any later spawn -- a Node handoff -- is real.
+ */
+const FAIL_FIRST_SPAWN = [
+  'import childProcess from "node:child_process";',
+  'import { syncBuiltinESMExports } from "node:module";',
+  "const realSpawn = childProcess.spawn;",
+  "let failed = false;",
+  "childProcess.spawn = function (cmd, args, opts) {",
+  "  if (failed) return realSpawn.call(this, cmd, args, opts);",
+  "  failed = true;",
+  '  return realSpawn.call(this, cmd + ".does-not-exist", args, opts);',
+  "};",
+  "syncBuiltinESMExports();",
+].join("\n");
+
 function run(layout: string, opts: RunOpts = {}) {
   // Build the child env from scratch. A spread of process.env would carry the
   // real PATH (which has a working oam on a developer box) and, on Windows,
@@ -241,8 +259,19 @@ describe("launcher: in-process fallback", () => {
     rmSync(join(layout, "dist", "index.js"));
     const r = run(layout, { mode: "node" });
     expect(r.status).toBe(1);
-    expect(r.stderr).toMatch(/^ssh-mcp: fallback to Node failed \(.*\)$/m);
+    expect(r.stderr).toMatch(/^ssh-mcp: could not load the server \(.*\)$/m);
     expect(r.stderr).not.toMatch(/^\s+at /m);
+  });
+
+  it("reports a broken install on a supported oam host without calling it a Node fallback", () => {
+    // An oam host at the floor serves itself in-process: that is neither a
+    // fallback nor Node, and the diagnostic used to say "fallback to Node failed".
+    const layout = makeLayout();
+    rmSync(join(layout, "dist", "index.js"));
+    const r = run(layout, { mode: "auto", hostOam: "0.21.1" });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/^ssh-mcp: could not load the server \(.*\)$/m);
+    expect(r.stderr).not.toMatch(/fallback|Node/);
   });
 
   it("reads SSH_MCP_RUNTIME case-insensitively", () => {
@@ -256,7 +285,7 @@ describe("launcher: in-process fallback", () => {
     expect(r.status, JSON.stringify(r)).toBe(0);
     expect(stubPayload(r.stdout).pid).toBe(r.pid);
     // Read as `node`, OAM_BIN is ignored without comment; read as the shipped
-    // `auto`, the launcher would have said it was not used.
+    // `auto`, the launcher would have spawned it and the stub would not have run.
     expect(r.stderr).toBe("");
   });
 });
@@ -402,21 +431,11 @@ describe("launcher: spawning oam", () => {
   // exits non-zero; what matters is that the stub never ran, i.e. the spawn
   // path was taken.
   it("spawns a usable oam instead of running the server in-process (SSH_MCP_RUNTIME=oam)", () => {
-    // The shipped launcher: oam is opt-in, and opting in still gets oam.
+    // `auto` spawns it too; that row lives in "launcher: auto prefers oam" below.
     const r = run(makeLayout(), { mode: "oam", oamBin: process.execPath, oamBinAnswers: OAM_AT_FLOOR });
     expect(r.stdout).not.toContain(MARKER);
     expect(r.status).not.toBe(0);
     expect(r.stderr).not.toMatch(/^ssh-mcp: /m);
-  });
-
-  it("spawns a usable oam in auto mode once AUTO_PREFERS_OAM is true", () => {
-    const r = run(makeLayout(), {
-      mode: "auto",
-      oamBin: process.execPath,
-      oamBinAnswers: OAM_AT_FLOOR,
-    });
-    expect(r.stdout).not.toContain(MARKER);
-    expect(r.status).not.toBe(0);
   });
 });
 
@@ -449,8 +468,8 @@ const ATLEAST_DECL = /function atLeast\(v, min\) \{[\s\S]*?\n\}/;
 
 /**
  * runtimePlan as shipped, or -- given a boolean -- with AUTO_PREFERS_OAM forced
- * to it, which is how the oam-preferring `auto` matrix stays under test while
- * the switch is off.
+ * to it, which is how the branch the shipped value does not take (today the
+ * flag-false, Node-only `auto`) stays under test.
  */
 function loadRuntimePlan(autoPrefersOam?: boolean): RuntimePlan {
   const shipped = extract([AUTO_PREFERS_OAM_DECL]);
@@ -575,7 +594,7 @@ describe("launcher: runtimePlan() with AUTO_PREFERS_OAM = false", () => {
     }
   });
 
-  it("discovers as before on Node, where process.versions has no oam key", () => {
+  it("serves auto in-process and discovers for oam on Node, where process.versions has no oam key", () => {
     // An unreadable value must not count as "new enough" either: that would
     // skip discovery on a host that never proved it is a supported oam. On Node
     // (no oam key) the flag governs: `auto` serves in-process, `oam` discovers.
@@ -833,18 +852,6 @@ describe("launcher: an oam host below the floor never serves", () => {
       // the launcher mid-fallback and nothing served. The preload makes the
       // FIRST spawn target a path that does not exist; the Node fallback, the
       // second spawn, runs for real.
-      const failFirstSpawn = [
-        'import childProcess from "node:child_process";',
-        'import { syncBuiltinESMExports } from "node:module";',
-        "const realSpawn = childProcess.spawn;",
-        "let failed = false;",
-        "childProcess.spawn = function (cmd, args, opts) {",
-        "  if (failed) return realSpawn.call(this, cmd, args, opts);",
-        "  failed = true;",
-        '  return realSpawn.call(this, cmd + ".does-not-exist", args, opts);',
-        "};",
-        "syncBuiltinESMExports();",
-      ].join("\n");
       const layout = makeLayout();
       const r = run(layout, {
         mode: "auto",
@@ -852,7 +859,7 @@ describe("launcher: an oam host below the floor never serves", () => {
         oamBin: process.execPath,
         oamBinAnswers: OAM_AT_FLOOR,
         pathDirs: [nodeDir(layout)],
-        preload: failFirstSpawn,
+        preload: FAIL_FIRST_SPAWN,
       });
       expect(r.status, JSON.stringify(r)).toBe(0);
       expect(r.stderr).toMatch(/^ssh-mcp: failed to launch oam at .*; using Node instead\.$/m);
@@ -865,6 +872,81 @@ describe("launcher: an oam host below the floor never serves", () => {
       const payload = stubPayload(r.stdout);
       expect(payload.pid, "the Node fallback must still serve, in a child").not.toBe(r.pid);
       expect(payload.oam).toBeNull();
+    },
+    TIMEOUT_MS,
+  );
+});
+
+describe("launcher: a chosen runtime that fails to spawn", () => {
+  const TIMEOUT_MS = 45_000;
+
+  it(
+    "exits 1 under SSH_MCP_RUNTIME=oam rather than serving on Node",
+    () => {
+      // Node host, so `auto` would serve in-process from here. oam mode is a hard
+      // requirement: an oam that passed the probe but would not start is fatal.
+      const r = run(makeLayout(), {
+        mode: "oam",
+        oamBin: process.execPath,
+        oamBinAnswers: OAM_AT_FLOOR,
+        preload: FAIL_FIRST_SPAWN,
+      });
+      expect(r.status, JSON.stringify(r)).toBe(1);
+      expect(r.stderr).toMatch(/^ssh-mcp: failed to launch oam at .*\)$/m);
+      expect(r.stderr).not.toMatch(/using Node instead/);
+      expect(r.stdout, "nothing may be served").not.toContain(MARKER);
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "serves in-process on a Node host under auto",
+    () => {
+      const r = run(makeLayout(), {
+        mode: "auto",
+        oamBin: process.execPath,
+        oamBinAnswers: OAM_AT_FLOOR,
+        preload: FAIL_FIRST_SPAWN,
+      });
+      expect(r.status, JSON.stringify(r)).toBe(0);
+      expect(r.stderr).toMatch(/^ssh-mcp: failed to launch oam at .*; using Node instead\.$/m);
+      expect(stubPayload(r.stdout).pid, "the fallback serves in the launcher's own process").toBe(r.pid);
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "reports a broken install from that fallback with its own diagnostic, not a stack trace",
+    () => {
+      // The fallback's import() rejects, so the async onLaunchFailed handler
+      // rejects; launchChild must hand that to fallbackFailed.
+      const layout = makeLayout();
+      rmSync(join(layout, "dist", "index.js"));
+      const r = run(layout, {
+        mode: "auto",
+        oamBin: process.execPath,
+        oamBinAnswers: OAM_AT_FLOOR,
+        preload: FAIL_FIRST_SPAWN,
+      });
+      expect(r.status, JSON.stringify(r)).toBe(1);
+      expect(r.stderr).toMatch(/^ssh-mcp: could not load the server \(.*\)$/m);
+      expect(r.stderr).not.toMatch(/^\s+at /m);
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "names a `node` on PATH that cannot be executed and exits 1",
+    () => {
+      // findNodeOnPath only checks existence, so a DIRECTORY named node(.exe)
+      // is picked and then fails to spawn.
+      const layout = makeLayout();
+      const bogus = mkdtempSync(join(layout, "bogusnode-"));
+      mkdirSync(join(bogus, isWin ? "node.exe" : "node"));
+      const r = run(layout, { mode: "node", hostOam: "0.21.1", pathDirs: [bogus] });
+      expect(r.status, JSON.stringify(r)).toBe(1);
+      expect(r.stderr).toMatch(/^ssh-mcp: failed to launch Node at .*bogusnode-[^\\/]*[\\/]node(\.exe)? \(.*\)$/m);
+      expect(r.stdout).not.toContain(MARKER);
     },
     TIMEOUT_MS,
   );
@@ -887,24 +969,8 @@ describe("launcher: auto prefers oam (AUTO_PREFERS_OAM = true, as shipped)", () 
     });
   }
 
-  it(
-    "serves auto in-process on a supported oam host, without spawning a second oam",
-    () => {
-      const r = run(makeLayout(), {
-        mode: "auto",
-        hostOam: "0.21.1",
-        oamBin: process.execPath,
-        oamBinAnswers: OAM_AT_FLOOR,
-        args: ["extra"],
-      });
-      expect(r.status, JSON.stringify(r)).toBe(0);
-      const payload = stubPayload(r.stdout);
-      expect(payload.pid, "served in-process, not by a nested runtime").toBe(r.pid);
-      expect(payload.oam).toBe("0.21.1");
-      expect(payload.args).toEqual(["extra"]);
-    },
-    TIMEOUT_MS,
-  );
+  // `auto` on a supported oam host serving in-process is the auto row of
+  // "launcher: already hosted on oam" above.
 
   it(
     "falls to a newer oam from a below-floor host with no Node on PATH",
@@ -1097,8 +1163,11 @@ describe("launcher: signal handling (POSIX only)", () => {
 
   const OAM_SH = [
     "#!/bin/sh",
-    // The launcher probes `--version` first; answer at the floor so the gate passes.
-    'case "$1" in --version) echo "oam 0.20.2"; exit 0;; esac',
+    // The launcher probes `--version` first; answer at the floor so the gate
+    // passes. Built from OAM_AT_FLOOR, not a literal: the literal this used to
+    // carry went stale on a floor bump, so SSH_MCP_RUNTIME=oam exited 1 and both
+    // cases failed on POSIX without the child ever starting.
+    `case "$1" in --version) echo ${JSON.stringify(OAM_AT_FLOOR.trim())}; exit 0;; esac`,
     "shift", // drop the leading "run"
     'exec node "$OAM_CHILD"',
     "",
@@ -1168,6 +1237,22 @@ describe("launcher: signal handling (POSIX only)", () => {
     });
   }
 
+  // Runs everywhere, so the two POSIX cases below cannot rot unseen on the win32
+  // box that runs this suite: the fake oam's banner must clear the real floor.
+  it("has a fake oam that answers at or above the launcher's floor", () => {
+    const clears = new Function(
+      `${extract([
+        OAM_MIN_DECL,
+        /function parseVersion\(text\) \{[\s\S]*?\n\}/,
+        /function oamBanner\(text\) \{[\s\S]*?\n\}/,
+        ATLEAST_DECL,
+      ])}\nreturn (text) => atLeast(oamBanner(text), OAM_MIN);`,
+    )() as (text: string) => boolean;
+    const echoed = /echo "([^"]*)"/.exec(OAM_SH)?.[1];
+    expect(echoed, "the fake oam no longer echoes a quoted banner").toBeTruthy();
+    expect(clears(`${echoed}\n`), `fake oam answers ${JSON.stringify(echoed)}`).toBe(true);
+  });
+
   it.skipIf(!posix)("forwards the signal so the child shuts down gracefully", async () => {
     const r = await signalOnceAndWait(signalLayout(CHILD_GRACEFUL));
     expect(r.caught).toBe("SIGINT");
@@ -1185,6 +1270,74 @@ describe("launcher: signal handling (POSIX only)", () => {
     },
     15000,
   );
+});
+
+describe("launcher: errSync()", () => {
+  // It promises a write that a following process.exit cannot truncate, so it has
+  // to finish before it returns. It used to be async, starting with
+  // `await import("node:fs")`: an un-awaited call before an exit printed nothing.
+  it("writes before it returns, without a promise", () => {
+    const writes: string[] = [];
+    const fakeWriteSync = (_fd: number, buf: Buffer, off: number, len: number) => {
+      writes.push(buf.subarray(off, off + len).toString());
+      return len;
+    };
+    const errSync = new Function(
+      "writeSync",
+      `${extract([/function errSync\(message\) \{[\s\S]*?\n\}/])}\nreturn errSync;`,
+    )(fakeWriteSync) as (message: string) => unknown;
+    const result = errSync("ssh-mcp: note\n");
+    expect(result).toBeUndefined();
+    expect(writes.join("")).toBe("ssh-mcp: note\n");
+  });
+
+  function loadErrSync(writeSync: (fd: number, buf: Buffer, off: number, len: number) => number) {
+    return new Function("writeSync", `${extract([/function errSync\(message\) \{[\s\S]*?\n\}/])}\nreturn errSync;`)(
+      writeSync,
+    ) as (message: string) => unknown;
+  }
+
+  it("resumes after a short write instead of rewriting or dropping bytes", () => {
+    const writes: string[] = [];
+    const errSync = loadErrSync((_fd, buf, off, len) => {
+      const n = Math.min(3, len);
+      writes.push(buf.subarray(off, off + n).toString());
+      return n;
+    });
+    errSync("ssh-mcp: a longer diagnostic\n");
+    expect(writes.join("")).toBe("ssh-mcp: a longer diagnostic\n");
+    expect(writes.length).toBeGreaterThan(1);
+  });
+
+  it("retries after EAGAIN until the write goes through", () => {
+    const writes: string[] = [];
+    let eagains = 0;
+    const errSync = loadErrSync((_fd, buf, off, len) => {
+      if (eagains < 2) {
+        eagains++;
+        throw Object.assign(new Error("EAGAIN: resource temporarily unavailable"), { code: "EAGAIN" });
+      }
+      writes.push(buf.subarray(off, off + len).toString());
+      return len;
+    });
+    errSync("ssh-mcp: note\n");
+    expect(eagains).toBe(2);
+    expect(writes.join("")).toBe("ssh-mcp: note\n");
+  });
+
+  it("gives up quietly on any other write error", () => {
+    let calls = 0;
+    const errSync = loadErrSync(() => {
+      calls++;
+      throw Object.assign(new Error("EPIPE: broken pipe"), { code: "EPIPE" });
+    });
+    expect(() => errSync("ssh-mcp: note\n")).not.toThrow();
+    expect(calls, "no retry on a non-EAGAIN error").toBe(1);
+  });
+
+  it("is a plain function in the shipped source", () => {
+    expect(readFileSync(LAUNCHER_SRC, "utf8")).not.toMatch(/async function errSync/);
+  });
 });
 
 describe("launcher: source hygiene", () => {

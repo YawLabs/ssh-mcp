@@ -210,6 +210,23 @@ describe("enforcePolicy", () => {
       expect(() => enforcePolicy(command)).not.toThrow();
     });
 
+    it("pins the splitPatternList docstring's single-entry examples exactly as stated", () => {
+      // Refused even single-entry: pattern-like text follows the class comma.
+      for (const pattern of ["^[a-z,_]+$", "^[,a-z]+$"]) {
+        vi.stubEnv("SSH_MCP_COMMAND_WHITELIST", pattern);
+        expect(() => enforcePolicy("a"), pattern).toThrow(/MISCONFIGURED: SSH_MCP_COMMAND_WHITELIST/);
+      }
+      // Accepted: only `]` or punctuation after the comma, or the comma escaped.
+      for (const [pattern, command] of [
+        ["^[a-z_,]+$", "a_b,c"],
+        ["^[a-z,. -]+$", "a, b."],
+        ["^[a-z\\,_]+$", "a_b,c"],
+      ]) {
+        vi.stubEnv("SSH_MCP_COMMAND_WHITELIST", pattern);
+        expect(() => enforcePolicy(command), pattern).not.toThrow();
+      }
+    });
+
     it("refuses an unescaped [,] class as soon as a sibling entry follows, and says so", () => {
       // The `[,]` idiom is fine alone (row above), but in a LIST its comma is
       // indistinguishable from a delimiter, so it is refused -- the error names the class

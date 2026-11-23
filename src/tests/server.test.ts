@@ -97,12 +97,40 @@ describe("tool annotations", () => {
       for (const name of ["ssh_key_list", "ssh_config_lookup"]) {
         expect(byName.get(name)?.openWorldHint, name).toBe(false);
       }
-      for (const name of ["ssh_delete", "ssh_write_file"]) {
+      // ssh_upload overwrites a remote file exactly as ssh_write_file does, and ssh_download
+      // overwrites a local one; both used to carry no annotation at all.
+      for (const name of ["ssh_delete", "ssh_write_file", "ssh_upload", "ssh_download"]) {
         expect(byName.get(name)?.destructiveHint, name).toBe(true);
-        expect(byName.get(name)?.readOnlyHint, name).not.toBe(true);
+        expect(byName.get(name)?.readOnlyHint, name).toBe(false);
+        expect(byName.get(name)?.openWorldHint, name).toBe(true);
       }
+      // ssh_mkdir changes the remote but never overwrites: an existing leaf is an error
+      // without `recursive` and left untouched with it.
+      expect(byName.get("ssh_mkdir")).toMatchObject({
+        readOnlyHint: false,
+        destructiveHint: false,
+        openWorldHint: true,
+      });
       for (const name of ["ssh_exec", "ssh_multi_exec", "ssh_agent_ensure", "ssh_key_load", "ssh_known_hosts_fix"]) {
         expect(byName.get(name)?.readOnlyHint, name).not.toBe(true);
+      }
+    } finally {
+      await client.close();
+    }
+  });
+
+  // Deliberately unmarked (see the comment above READ_ONLY_LOCAL in tools.ts): clients
+  // use destructiveHint:false / openWorldHint:false to soften or skip confirmation, and
+  // any specific hint would understate an exec tool that can run `rm -rf`. Pin the
+  // absence of the whole annotations object, not just readOnlyHint.
+  it("leaves the exec tools and the local-state-changing tools unannotated", async () => {
+    const client = await connected();
+    try {
+      const { tools } = await client.listTools();
+      for (const name of ["ssh_exec", "ssh_multi_exec", "ssh_agent_ensure", "ssh_key_load", "ssh_known_hosts_fix"]) {
+        const tool = tools.find((t) => t.name === name);
+        expect(tool, `${name} is registered`).toBeDefined();
+        expect(tool?.annotations, name).toBeUndefined();
       }
     } finally {
       await client.close();

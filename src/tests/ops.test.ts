@@ -1,46 +1,13 @@
-import { EventEmitter } from "node:events";
 import { describe, expect, it } from "vitest";
 import { find, serviceStatus, shellQuote, tail } from "../ops.js";
+import { type FakeExecScript, fakeExecClient } from "./helpers/fake-exec-client.js";
 
-// Capture the command string passed to client.exec so tests can assert on it.
-function capturingClient(opts: { stdout?: string; stderr?: string; code?: number }): {
-  client: any;
-  lastCommand: () => string | undefined;
-} {
-  let last: string | undefined;
-  const client = {
-    exec: (command: string, cb: (err: Error | null, stream: any) => void) => {
-      last = command;
-      const stream: any = new EventEmitter();
-      stream.stderr = new EventEmitter();
-      cb(null, stream);
-      queueMicrotask(() => {
-        if (opts.stdout) stream.emit("data", Buffer.from(opts.stdout));
-        if (opts.stderr) stream.stderr.emit("data", Buffer.from(opts.stderr));
-        stream.emit("close", opts.code ?? 0);
-      });
-    },
-  };
-  return { client, lastCommand: () => last };
-}
+// Captures the command string passed to client.exec so tests can assert on it.
+const capturingClient = fakeExecClient;
 
-// Build a fake ssh2 Client whose exec() emits a configurable stdout/stderr/exit.
-// This lets us test ops.ts error-surfacing without a real SSH connection.
-function fakeClient(opts: { stdout?: string; stderr?: string; code?: number }): any {
-  return {
-    exec: (_command: string, cb: (err: Error | null, stream: any) => void) => {
-      const stream: any = new EventEmitter();
-      stream.stderr = new EventEmitter();
-      cb(null, stream);
-      // Emit data and close asynchronously so listeners attach first.
-      queueMicrotask(() => {
-        if (opts.stdout) stream.emit("data", Buffer.from(opts.stdout));
-        if (opts.stderr) stream.stderr.emit("data", Buffer.from(opts.stderr));
-        stream.emit("close", opts.code ?? 0);
-      });
-    },
-  };
-}
+// A fake ssh2 Client whose exec() emits a configurable stdout/stderr/exit. This lets us
+// test ops.ts error-surfacing without a real SSH connection.
+const fakeClient = (script: FakeExecScript) => fakeExecClient(script).client;
 
 describe("find input validation", () => {
   // These tests verify validation without needing a real SSH connection.
@@ -351,5 +318,199 @@ describe("argument flag-injection hardening", () => {
     const cap = capturingClient({ stdout: "", code: 0 });
     await find(cap.client, { path: "/tmp", newer: "(" });
     expect(cap.lastCommand()).toBe("find '/tmp' -newer './('");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// find size predicates reach the command string (moved from pool-ops-lifecycle.test.ts)
+// ---------------------------------------------------------------------------
+
+describe("find — size predicates reach the command string", () => {
+  it("emits `-size +N` for minsize (files BIGGER than N)", async () => {
+    // The disk-pressure call operators actually make. `+` and `-` are opposite
+    // predicates to find, and swapping them returns the exact complement of the
+    // intended set with no error anywhere -- nothing downstream can notice.
+    const cap = capturingClient({ stdout: "/var/log/huge.log\n/var/log/old.gz\n", code: 0 });
+    const results = await find(cap.client, { path: "/var/log", minsize: "100M" });
+
+    expect(cap.lastCommand()).toBe("find '/var/log' -size '+100M'");
+    expect(results).toEqual(["/var/log/huge.log", "/var/log/old.gz"]);
+  });
+
+  it("emits `-size -N` for maxsize (files SMALLER than N)", async () => {
+    const cap = capturingClient({ stdout: "", code: 0 });
+    await find(cap.client, { path: "/tmp", maxsize: "10M" });
+    expect(cap.lastCommand()).toBe("find '/tmp' -size '-10M'");
+  });
+
+  it("emits both bounds, minsize first, in fixed order with the other predicates", async () => {
+    const cap = capturingClient({ stdout: "", code: 0 });
+    await find(cap.client, {
+      path: "/srv",
+      maxdepth: 3,
+      type: "f",
+      name: "*.log",
+      minsize: "1M",
+      maxsize: "500M",
+      newer: "/etc/passwd",
+    });
+    expect(cap.lastCommand()).toBe(
+      "find '/srv' -maxdepth '3' -type 'f' -name '*.log' -size '+1M' -size '-500M' -newer '/etc/passwd'",
+    );
+  });
+
+  it("passes the unit-suffixed and bare-number forms through unchanged", async () => {
+    for (const [size, expected] of [
+      ["512c", "find '/data' -size '+512c'"],
+      ["1024", "find '/data' -size '+1024'"],
+      ["5G", "find '/data' -size '+5G'"],
+    ] as const) {
+      const cap = capturingClient({ stdout: "", code: 0 });
+      await find(cap.client, { path: "/data", minsize: size });
+      expect(cap.lastCommand()).toBe(expected);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// serviceStatus on crashed and masked units (moved from pool-ops-lifecycle.test.ts)
+// ---------------------------------------------------------------------------
+
+describe("serviceStatus — crashed and masked units", () => {
+  it("reports a FAILED unit as active=false with unknown=false", async () => {
+    // `unknown` means "systemctl could not answer at all". A crashed unit answered
+    // perfectly well -- it has a parseable `Active:` line -- it just answered
+    // "failed". Reporting it as unknown would send an operator hunting for a typo'd
+    // unit name instead of reading the exit status that is right there.
+    // The fixture omits `Main PID:`, the shape systemd prints when ExecStart never
+    // became the main process (status=203/EXEC).
+    const cap = capturingClient({
+      stdout: [
+        "* myapp.service - My Application",
+        "     Loaded: loaded (/etc/systemd/system/myapp.service; enabled; preset: enabled)",
+        "     Active: failed (Result: exit-code) since Wed 2025-06-04 08:12:03 UTC; 2min ago",
+        "    Process: 8123 ExecStart=/usr/local/bin/myapp --serve (code=exited, status=203/EXEC)",
+        "        CPU: 3ms",
+      ].join("\n"),
+      code: 3,
+    });
+
+    const status = await serviceStatus(cap.client, "myapp");
+
+    expect(cap.lastCommand()).toBe("LC_ALL=C systemctl status -- 'myapp' 2>&1");
+    expect(status.unknown).toBe(false); // systemctl DID answer
+    expect(status.active).toBe(false);
+    expect(status.status).toBe("failed (Result: exit-code)");
+    expect(status.description).toBe("My Application");
+    // `since` stops at the first `;`, so the trailing "2min ago" is not swept in.
+    expect(status.since).toBe("Wed 2025-06-04 08:12:03 UTC");
+    expect(status.pid).toBeUndefined(); // no `Main PID:` line in this shape
+    expect(status.name).toBe("myapp");
+    expect(status.raw).toContain("status=203/EXEC");
+  });
+
+  it("leaves description undefined for a MASKED unit whose header has no ' - '", async () => {
+    // A masked unit's header line is just the unit name -- no " - <description>".
+    // The description regex must not fall back to scraping the `Loaded: masked` line
+    // (which would report "masked (Reason: ...)" as the service's description).
+    const cap = capturingClient({
+      stdout: [
+        "* postfix.service",
+        "     Loaded: masked (Reason: Unit postfix.service is masked.)",
+        "     Active: inactive (dead)",
+      ].join("\n"),
+      code: 3,
+    });
+
+    const status = await serviceStatus(cap.client, "postfix");
+
+    expect(status.description).toBeUndefined();
+    expect(status.unknown).toBe(false); // the `Active:` line parsed
+    expect(status.active).toBe(false);
+    expect(status.status).toBe("inactive (dead)");
+    expect(status.since).toBeUndefined(); // no "since ...;" in a masked unit's output
+    expect(status.pid).toBeUndefined();
+    expect(status.raw).toContain("Loaded: masked");
+  });
+});
+
+describe("serviceStatus — parsing edge cases", () => {
+  it("anchors `since` to the Active line, not to a journal line that happens to contain one", async () => {
+    // A never-started unit's Active line carries no `since`, but `systemctl status` prints the
+    // journal tail below it. Matching `since ...;` anywhere returned the log line's text.
+    const cap = capturingClient({
+      stdout: [
+        "* worker.service - Queue worker",
+        "     Loaded: loaded (/etc/systemd/system/worker.service; disabled; preset: enabled)",
+        "     Active: inactive (dead)",
+        "",
+        "Jun 04 08:12:03 host worker[812]: idle since 12:00; retrying",
+      ].join("\n"),
+      code: 3,
+    });
+    const status = await serviceStatus(cap.client, "worker");
+    expect(status.status).toBe("inactive (dead)");
+    expect(status.since).toBeUndefined();
+  });
+
+  it("still reads `since` from the Active line when journal lines follow", async () => {
+    const cap = capturingClient({
+      stdout: [
+        "* nginx.service - A high performance web server",
+        "     Active: active (running) since Mon 2025-01-01 12:00:00 UTC; 1h ago",
+        "   Main PID: 1234 (nginx)",
+        "",
+        "Jan 01 12:00:00 host app[1]: up since boot; ok",
+      ].join("\n"),
+      code: 0,
+    });
+    const status = await serviceStatus(cap.client, "nginx");
+    expect(status.since).toBe("Mon 2025-01-01 12:00:00 UTC");
+  });
+
+  it("reads `since` past a second parenthesised state on the Active line (auto-restart)", async () => {
+    // A crash-looping unit prints two parenthesised groups before `since`. Anchoring `since`
+    // directly after the first group lost it for exactly the unit an operator is debugging.
+    const cap = capturingClient({
+      stdout: [
+        "* myapp.service - My Application",
+        "     Active: activating (auto-restart) (Result: exit-code) since Wed 2025-06-04 08:12:03 UTC; 3s ago",
+        "",
+        "Jun 04 08:12:00 host myapp[1]: idle since 12:00; retrying",
+      ].join("\n"),
+      code: 3,
+    });
+    const status = await serviceStatus(cap.client, "myapp");
+    expect(status.status).toBe("activating (auto-restart)");
+    expect(status.since).toBe("Wed 2025-06-04 08:12:03 UTC");
+  });
+
+  it("leaves `since` unset when the Active line has no terminating `;` (never reads into the next line)", async () => {
+    // systemd can print `since X` with no `; ago` suffix. The `since` group is bounded to the
+    // Active line, so it must not run across the newline to the next line's first `;`.
+    const cap = capturingClient({
+      stdout: [
+        "* nginx.service - A high performance web server",
+        "     Active: active (running) since Mon 2025-01-01 12:00:00 UTC",
+        "   Main PID: 42; extra",
+      ].join("\n"),
+      code: 0,
+    });
+    const status = await serviceStatus(cap.client, "nginx");
+    expect(status.status).toBe("active (running)");
+    expect(status.since).toBeUndefined();
+    expect(status.pid).toBe(42);
+  });
+
+  it("derives `active` and `status` from the same exit-code fallback when no Active line parses", async () => {
+    // Exit 0 with no `Active:` line (a non-systemd shim, a cut-off output, a format change)
+    // used to report status "active" beside active:false. `systemctl status` exits 0 only
+    // for an active unit, so both fields now say so.
+    const ok = await serviceStatus(capturingClient({ stdout: "nginx is running\n", code: 0 }).client, "nginx");
+    expect(ok).toMatchObject({ active: true, status: "active", unknown: false });
+
+    // The non-zero side is unchanged: no Active line + non-zero exit is `unknown`.
+    const missing = await serviceStatus(capturingClient({ stdout: "no such unit\n", code: 4 }).client, "nope");
+    expect(missing).toMatchObject({ active: false, status: "inactive", unknown: true });
   });
 });

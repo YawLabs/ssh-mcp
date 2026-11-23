@@ -1,6 +1,9 @@
+import { spawnSync } from "node:child_process";
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 
 // The release gate's verdict rules (scripts/check-compliance.mjs). The grader run
 // itself happens in release.sh; what is pinned here is that nothing passes silently:
@@ -65,5 +68,38 @@ describe("compliance gate: evaluateReport", () => {
     );
     expect(v.warnings).toContain("grader warning: Spec version auto-detected");
     expect(v.lines).toContain("failed: security-x -- boom");
+  });
+});
+
+describe("compliance gate runs from a linked checkout", () => {
+  // Node realpaths the main module's URL but not argv[1]. The gate's guard was a
+  // plain resolve() compare, so through a junction or symlink it skipped main()
+  // and exited 0 having graded nothing -- and release.sh gates on that exit code.
+  // The fixture is a copy of scripts/ with no node_modules beside it, so a gate
+  // that runs at all must refuse with "not installed"; a skipped one exits 0.
+  const dirs: string[] = [];
+  afterAll(() => {
+    for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  });
+
+  it("still runs, and fails closed, when invoked through a junction / symlink to scripts/", () => {
+    const root = mkdtempSync(join(tmpdir(), "ssh-mcp-compliance-root-"));
+    dirs.push(root);
+    mkdirSync(join(root, "scripts"));
+    for (const name of ["check-compliance.mjs", "is-main-module.mjs"]) {
+      copyFileSync(join(repoRoot, "scripts", name), join(root, "scripts", name));
+    }
+    const linkParent = mkdtempSync(join(tmpdir(), "ssh-mcp-compliance-link-"));
+    dirs.push(linkParent);
+    const linked = join(linkParent, "scripts");
+    // "junction" needs no privilege on Windows; the type is ignored elsewhere.
+    symlinkSync(join(root, "scripts"), linked, "junction");
+    const r = spawnSync(process.execPath, [join(linked, "check-compliance.mjs")], {
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+    const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+    expect(r.status, out).toBe(1);
+    expect(out).toMatch(/mcp-compliance is not installed/);
   });
 });

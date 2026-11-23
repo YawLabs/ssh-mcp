@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ---------------------------------------------------------------------------
@@ -565,6 +565,17 @@ describe("resolveConfig identity-file walk", () => {
     rmSync(idEcdsa);
   });
 
+  it("does NOT expand ~name in an ssh_config identityfile (another user's home)", () => {
+    // `~alice/key` used to become <our home>/alice/key -- a path nobody named.
+    mkdirSync(join(FAKE_HOME, "alice"), { recursive: true });
+    writeFileSync(join(FAKE_HOME, "alice", "key"), readFileSync(fixtures.ed25519Plain));
+    stubIdentityFiles(["~alice/key"]);
+    setEnvironment({ platform: "linux", authSock: FAKE_SOCK });
+
+    expect(resolveConfig({ host: HOST }).connectConfig.privateKey).toBeUndefined();
+    rmSync(join(FAKE_HOME, "alice"), { recursive: true });
+  });
+
   it("leaves privateKey unset when no identity file exists at all", () => {
     stubIdentityFiles([join(KEYS, "nope_1"), join(KEYS, "nope_2")]);
     setEnvironment({ platform: "linux", authSock: FAKE_SOCK });
@@ -572,5 +583,36 @@ describe("resolveConfig identity-file walk", () => {
     const { connectConfig } = resolveConfig({ host: HOST });
     expect(connectConfig.privateKey).toBeUndefined();
     expect(connectConfig.agent).toBe(FAKE_SOCK);
+  });
+});
+
+// Folded in from the old resolve-config.test.ts, which mocked only node:fs and so ran
+// the developer's real `ssh -G`. Here runArgs is scripted and homedir() is FAKE_HOME.
+describe("resolveConfig tilde expansion in an explicit privateKeyPath", () => {
+  it("expands ~/ against the home directory", () => {
+    const keyPath = join(FAKE_HOME, ".ssh", "explicit_key");
+    writeFileSync(keyPath, readFileSync(fixtures.ed25519Plain));
+    const { connectConfig } = resolveConfig({ host: HOST, privateKeyPath: "~/.ssh/explicit_key" });
+    expect(connectConfig.privateKey).toEqual(readFileSync(keyPath));
+    rmSync(keyPath);
+  });
+
+  it("leaves an absolute path unchanged", () => {
+    const { connectConfig } = resolveConfig({ host: HOST, privateKeyPath: fixtures.rsaPlain });
+    expect(connectConfig.privateKey).toEqual(readFileSync(fixtures.rsaPlain));
+  });
+
+  it.each(["~alice/.ssh/id_ed25519", "~backup.key"])("reads %s as written, not under our home", (spelling) => {
+    // Both would have resolved to <home>/alice/... or <home>/backup.key before.
+    let err: NodeJS.ErrnoException | undefined;
+    try {
+      resolveConfig({ host: HOST, privateKeyPath: spelling });
+    } catch (e) {
+      err = e as NodeJS.ErrnoException;
+    }
+    expect(err?.code).toBe("ENOENT");
+    // fs may report the cwd-resolved form; either way it is the caller's own path.
+    expect(resolve(err?.path ?? "")).toBe(resolve(spelling));
+    expect(err?.path).not.toContain(FAKE_HOME);
   });
 });

@@ -185,9 +185,12 @@ function hasLooseQuantifier(src: string): boolean {
  * by shell punctuation: `^rm[abc,>],^df` and `^rm[,>|],^df` both compile to a class that never
  * denies `rm`, and only the "another entry follows" rule catches them. The cost is that the
  * documented `[,]` idiom is refused in a MULTI-entry list (`^foo[,]bar$,^df$`), where its
- * comma could equally be a delimiter; a single-entry value like `^[a-z,_]+$` is unaffected,
- * and `\,` (`[a\,b]`) is accepted in a list. A class that never closes needs no check: it
- * fails to compile.
+ * comma could equally be a delimiter. The content heuristic applies even to a SINGLE-entry
+ * value: an unescaped letter, digit, `_`, `,`, `[` or `^` after a class comma refuses the
+ * whole policy, so `^[a-z,_]+$` and `^[,a-z]+$` are refused while `^[a-z_,]+$` and
+ * `^[a-z,. -]+$` (only `]` or punctuation after the comma) are accepted. Write the comma as `\,` (`^[a-z\,_]+$`,
+ * `[a\,b]`) and the class is accepted anywhere, single-entry or in a list. A class that
+ * never closes needs no check: it fails to compile.
  */
 function splitPatternList(raw: string): { entries: string[]; ambiguousClasses: string[] } {
   const entries: string[] = [];

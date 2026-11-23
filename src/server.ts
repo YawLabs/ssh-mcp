@@ -8,18 +8,28 @@ import { registerTools } from "./tools.js";
 // Read version from package.json at runtime so we never lie to MCP clients about
 // what they're talking to. package.json is always present in published npm packages
 // (the files allow-list does not affect it) and at the repo root in dev.
-// A single-file binary build inlines it (esbuild `define: { __VERSION__ }`);
-// the runtime package.json read would crash such a binary (no package.json
-// beside the exe). Falls back to reading package.json for the normal ESM/tsup build.
-declare const __VERSION__: string;
-export const version =
-  typeof __VERSION__ !== "undefined"
-    ? __VERSION__
-    : (
-        JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf8")) as {
-          version: string;
-        }
-      ).version;
+//
+// The package.json read must never throw at import time: this module is imported
+// before src/index.ts answers --version, so a throw here would crash `ssh-mcp
+// --version` with a stack trace instead of an answer. A missing or unreadable
+// package.json yields UNKNOWN_VERSION and a one-line stderr warning naming the
+// path, so the failure is visible rather than silent.
+export const UNKNOWN_VERSION = "0.0.0-unknown";
+
+export function readPackageVersion(packageJsonPath: string): string {
+  try {
+    const parsed = JSON.parse(readFileSync(packageJsonPath, "utf8")) as { version?: unknown };
+    if (typeof parsed.version === "string" && parsed.version) return parsed.version;
+    console.error(`ssh-mcp: ${packageJsonPath} has no version string; reporting ${UNKNOWN_VERSION}`);
+  } catch (err: unknown) {
+    console.error(
+      `ssh-mcp: could not read the version from ${packageJsonPath} (${err instanceof Error ? err.message : String(err)}); reporting ${UNKNOWN_VERSION}`,
+    );
+  }
+  return UNKNOWN_VERSION;
+}
+
+export const version = readPackageVersion(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"));
 
 /**
  * Routing guidance sent once, at initialize. Yaw MCP shows it when this server is
@@ -82,6 +92,7 @@ export { ConnectionPool, isPoolFullError, POOL_FULL_ERROR_CODE, PoolFullError } 
 // HostKeyRejection / HostKeyRejectionReason are named by the public ResolvedConfig,
 // so a consumer cannot fully type that value without them.
 export type {
+  DiagnosticsContext,
   ExecResult,
   FileRange,
   FileStats,
@@ -89,8 +100,10 @@ export type {
   HostKeyRejectionReason,
   ResolvedConfig,
   SSHConfig,
+  SshFailureKind,
 } from "./ssh.js";
 export {
+  classifySshFailure,
   connect,
   connectRaw,
   connectWithProxy,
@@ -98,6 +111,9 @@ export {
   downloadFile,
   exec,
   formatDiagnostics,
+  INVALID_HOST_ERROR_CODE,
+  InvalidHostError,
+  isInvalidHostError,
   listDir,
   makeDir,
   readFile,

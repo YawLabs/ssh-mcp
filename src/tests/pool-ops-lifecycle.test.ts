@@ -1,8 +1,11 @@
+import { spawn, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { fakeExecClient } from "./helpers/fake-exec-client.js";
 
 // Mock ONLY connectWithProxy. resolveConfig, exec, hostVerifier, etc. keep their real
 // implementations, so both the pool's lifecycle logic and multiExec's use of the real
@@ -18,8 +21,9 @@ vi.mock("../ssh.js", async (importOriginal) => {
   };
 });
 
-import { find, type MultiExecHost, multiExec, serviceStatus } from "../ops.js";
+import { type MultiExecHost, multiExec } from "../ops.js";
 import { ConnectionPool, PoolFullError } from "../pool.js";
+import { readPackageVersion, UNKNOWN_VERSION } from "../server.js";
 import { connectWithProxy, exec, resolveConfig } from "../ssh.js";
 
 const mockedConnect = vi.mocked(connectWithProxy);
@@ -42,22 +46,11 @@ interface HostScript {
 
 /**
  * ssh2-Client-like object whose exec() emits scripted stdout/stderr and exit code.
- * Drives the REAL exec() from ssh.ts (same shape as ops.test.ts's fakeClient), so a
+ * Drives the REAL exec() from ssh.ts (the shared fake-exec-client helper), so a
  * "success" result in these tests is a genuine ExecResult, not a hand-built literal.
  */
 function scriptedClient(script: HostScript): unknown {
-  return {
-    exec: (_command: string, cb: (err: Error | null, stream: unknown) => void) => {
-      const stream = new EventEmitter() as EventEmitter & { stderr: EventEmitter };
-      stream.stderr = new EventEmitter();
-      cb(null, stream);
-      queueMicrotask(() => {
-        if (script.stdout) stream.emit("data", Buffer.from(script.stdout));
-        if (script.stderr) stream.stderr.emit("data", Buffer.from(script.stderr));
-        stream.emit("close", script.code ?? 0);
-      });
-    },
-  };
+  return fakeExecClient({ stdout: script.stdout, stderr: script.stderr, code: script.code }).client;
 }
 
 /**
@@ -626,25 +619,21 @@ describe("multiExec — waits for pool capacity held by OTHER callers", () => {
       else for (let i = 0; i < (opts.dialTicks ?? 0); i++) await Promise.resolve();
       if (opts.failDials?.has(host)) throw new Error("connect ETIMEDOUT");
       const client = makeQuietClient() as EventEmitter & { endCalls: number; end: () => void; exec: unknown };
-      client.exec = (_command: string, cb: (err: Error | null, stream: unknown) => void) => {
-        const stream = new EventEmitter() as EventEmitter & { stderr: EventEmitter };
-        stream.stderr = new EventEmitter();
-        cb(null, stream);
-        if (opts.hangs?.has(host)) return;
-        queueMicrotask(() => {
-          stream.emit("data", Buffer.from(`out:${host}\n`));
-          stream.emit("close", 0);
-        });
-      };
+      client.exec = (
+        fakeExecClient({ stdout: `out:${host}\n`, hang: opts.hangs?.has(host) }).client as {
+          exec: unknown;
+        }
+      ).exec;
       return client as never;
     });
   }
 
   const poolFullCount = (results: { error?: string }[]) =>
     results.filter((r) => /^Connection pool is full \(/.test(r.error ?? "")).length;
-  // Distinct hosts, not a call count: with instant dials a woken retry can evict another host's
-  // just-registered entry before that host takes its ref, so a host may be dialed more than once.
-  const dialedHosts = () => new Set(mockedConnect.mock.calls.map(([resolved]) => String(resolved.connectConfig.host)));
+  // Every dial, in order. Exactly one per host: a just-registered entry is not evictable until
+  // its dialer takes a ref (PoolEntry.claimed), so even with instant dials a woken retry can no
+  // longer end() another host's fresh connection and force it to be dialed again.
+  const dialedHosts = () => mockedConnect.mock.calls.map(([resolved]) => String(resolved.connectConfig.host));
 
   it("is never starved by its OWN hosts running to the command timeout while a slot is held elsewhere", async () => {
     // The parked worker's budget is stamped when a sibling's fn starts, BEFORE exec() arms its
@@ -681,7 +670,7 @@ describe("multiExec — waits for pool capacity held by OTHER callers", () => {
       );
       expect(results.map((r) => r.stdout)).toEqual(hosts.map((h) => (hangs.has(h.host) ? "" : `out:${h.host}\n`)));
       expect(poolFullCount(results)).toBe(0);
-      expect(dialedHosts()).toEqual(new Set(["held-outside.test", ...hosts.map((h) => h.host)])); // every host dialed
+      expect(dialedHosts().sort()).toEqual(["held-outside.test", ...hosts.map((h) => h.host)].sort()); // every host, once
       // The queued hosts ran the moment the hanging ones gave their slots back.
       expect((settledAt ?? Number.NaN) - start).toBe(T);
       pool.release(held);
@@ -718,7 +707,7 @@ describe("multiExec — waits for pool capacity held by OTHER callers", () => {
       expect(results.map((r) => r.error)).toEqual(hosts.map(() => undefined));
       expect(results.map((r) => r.stdout)).toEqual(hosts.map((h) => `out:${h.host}\n`));
       expect(poolFullCount(results)).toBe(0);
-      expect(dialedHosts()).toEqual(new Set(["held-outside.test", ...hosts.map((h) => h.host)]));
+      expect(dialedHosts().sort()).toEqual(["held-outside.test", ...hosts.map((h) => h.host)].sort());
       expect((settledAt ?? Number.NaN) - start).toBe(SLOW_DIAL);
       pool.release(held);
     } finally {
@@ -1191,9 +1180,9 @@ describe("ConnectionPool — eviction with held and idle entries mixed", () => {
 
   it("evicts exactly ONE idle entry — the first in insertion order — and skips over the held one", async () => {
     // Order: idle, held, idle. The first idle is the only casualty: the held entry is
-    // skipped by the refCount guard and the SECOND idle survives because the loop
-    // breaks after one eviction. Dropping that break would close a second warm
-    // connection nobody asked to close.
+    // skipped by the refCount guard and the SECOND idle survives because findEvictable()
+    // returns only the first refCount-0 entry and one acquire evicts at most one. Evicting
+    // more would close a second warm connection nobody asked to close.
     const pool = new ConnectionPool({ idleTtlMs: TTL, maxPoolSize: 3 });
     try {
       const idleFirst = (await pool.acquire({ host: "idle-first.example.com" })) as unknown as { endCalls: number };
@@ -1210,7 +1199,7 @@ describe("ConnectionPool — eviction with held and idle entries mixed", () => {
 
       expect(idleFirst.endCalls).toBe(1); // first refCount-0 entry in iteration order
       expect(held.endCalls).toBe(0);
-      expect(idleLast.endCalls).toBe(0); // the break stopped the loop
+      expect(idleLast.endCalls).toBe(0); // one eviction per acquire, the first idle only
       expect(pool.size).toBe(3);
       expect(pool.stats).toEqual({ active: 2, idle: 1 });
       expect(vi.getTimerCount()).toBe(1); // only idleLast's timer remains armed
@@ -1354,152 +1343,6 @@ describe("ConnectionPool — markDead handler registration", () => {
 });
 
 // ---------------------------------------------------------------------------
-// GAP 8 — find size predicates reach the command string
-// ---------------------------------------------------------------------------
-
-/**
- * Records the command string handed to client.exec so the assembled `find` line can be
- * asserted verbatim. Same shape as scriptedClient above, plus the capture.
- */
-function commandCapturingClient(script: { stdout?: string; stderr?: string; code?: number }): {
-  client: never;
-  lastCommand: () => string | undefined;
-} {
-  let last: string | undefined;
-  const client = {
-    exec: (command: string, cb: (err: Error | null, stream: unknown) => void) => {
-      last = command;
-      const stream = new EventEmitter() as EventEmitter & { stderr: EventEmitter };
-      stream.stderr = new EventEmitter();
-      cb(null, stream);
-      queueMicrotask(() => {
-        if (script.stdout) stream.emit("data", Buffer.from(script.stdout));
-        if (script.stderr) stream.stderr.emit("data", Buffer.from(script.stderr));
-        stream.emit("close", script.code ?? 0);
-      });
-    },
-  };
-  return { client: client as never, lastCommand: () => last };
-}
-
-describe("find — size predicates reach the command string", () => {
-  beforeEach(() => {
-    vi.useRealTimers();
-  });
-
-  it("emits `-size +N` for minsize (files BIGGER than N)", async () => {
-    // The disk-pressure call operators actually make. `+` and `-` are opposite
-    // predicates to find, and swapping them returns the exact complement of the
-    // intended set with no error anywhere -- nothing downstream can notice.
-    const cap = commandCapturingClient({ stdout: "/var/log/huge.log\n/var/log/old.gz\n", code: 0 });
-    const results = await find(cap.client, { path: "/var/log", minsize: "100M" });
-
-    expect(cap.lastCommand()).toBe("find '/var/log' -size '+100M'");
-    expect(results).toEqual(["/var/log/huge.log", "/var/log/old.gz"]);
-  });
-
-  it("emits `-size -N` for maxsize (files SMALLER than N)", async () => {
-    const cap = commandCapturingClient({ stdout: "", code: 0 });
-    await find(cap.client, { path: "/tmp", maxsize: "10M" });
-    expect(cap.lastCommand()).toBe("find '/tmp' -size '-10M'");
-  });
-
-  it("emits both bounds, minsize first, in fixed order with the other predicates", async () => {
-    const cap = commandCapturingClient({ stdout: "", code: 0 });
-    await find(cap.client, {
-      path: "/srv",
-      maxdepth: 3,
-      type: "f",
-      name: "*.log",
-      minsize: "1M",
-      maxsize: "500M",
-      newer: "/etc/passwd",
-    });
-    expect(cap.lastCommand()).toBe(
-      "find '/srv' -maxdepth '3' -type 'f' -name '*.log' -size '+1M' -size '-500M' -newer '/etc/passwd'",
-    );
-  });
-
-  it("passes the unit-suffixed and bare-number forms through unchanged", async () => {
-    for (const [size, expected] of [
-      ["512c", "find '/data' -size '+512c'"],
-      ["1024", "find '/data' -size '+1024'"],
-      ["5G", "find '/data' -size '+5G'"],
-    ] as const) {
-      const cap = commandCapturingClient({ stdout: "", code: 0 });
-      await find(cap.client, { path: "/data", minsize: size });
-      expect(cap.lastCommand()).toBe(expected);
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// GAP 9 — serviceStatus on crashed and masked units
-// ---------------------------------------------------------------------------
-
-describe("serviceStatus — crashed and masked units", () => {
-  beforeEach(() => {
-    vi.useRealTimers();
-  });
-
-  it("reports a FAILED unit as active=false with unknown=false", async () => {
-    // `unknown` means "systemctl could not answer at all". A crashed unit answered
-    // perfectly well -- it has a parseable `Active:` line -- it just answered
-    // "failed". Reporting it as unknown would send an operator hunting for a typo'd
-    // unit name instead of reading the exit status that is right there.
-    // The fixture omits `Main PID:`, the shape systemd prints when ExecStart never
-    // became the main process (status=203/EXEC).
-    const cap = commandCapturingClient({
-      stdout: [
-        "* myapp.service - My Application",
-        "     Loaded: loaded (/etc/systemd/system/myapp.service; enabled; preset: enabled)",
-        "     Active: failed (Result: exit-code) since Wed 2025-06-04 08:12:03 UTC; 2min ago",
-        "    Process: 8123 ExecStart=/usr/local/bin/myapp --serve (code=exited, status=203/EXEC)",
-        "        CPU: 3ms",
-      ].join("\n"),
-      code: 3,
-    });
-
-    const status = await serviceStatus(cap.client, "myapp");
-
-    expect(cap.lastCommand()).toBe("LC_ALL=C systemctl status -- 'myapp' 2>&1");
-    expect(status.unknown).toBe(false); // systemctl DID answer
-    expect(status.active).toBe(false);
-    expect(status.status).toBe("failed (Result: exit-code)");
-    expect(status.description).toBe("My Application");
-    // `since` stops at the first `;`, so the trailing "2min ago" is not swept in.
-    expect(status.since).toBe("Wed 2025-06-04 08:12:03 UTC");
-    expect(status.pid).toBeUndefined(); // no `Main PID:` line in this shape
-    expect(status.name).toBe("myapp");
-    expect(status.raw).toContain("status=203/EXEC");
-  });
-
-  it("leaves description undefined for a MASKED unit whose header has no ' - '", async () => {
-    // A masked unit's header line is just the unit name -- no " - <description>".
-    // The description regex must not fall back to scraping the `Loaded: masked` line
-    // (which would report "masked (Reason: ...)" as the service's description).
-    const cap = commandCapturingClient({
-      stdout: [
-        "* postfix.service",
-        "     Loaded: masked (Reason: Unit postfix.service is masked.)",
-        "     Active: inactive (dead)",
-      ].join("\n"),
-      code: 3,
-    });
-
-    const status = await serviceStatus(cap.client, "postfix");
-
-    expect(status.description).toBeUndefined();
-    expect(status.unknown).toBe(false); // the `Active:` line parsed
-    expect(status.active).toBe(false);
-    expect(status.status).toBe("inactive (dead)");
-    expect(status.since).toBeUndefined(); // no "since ...;" in a masked unit's output
-    expect(status.pid).toBeUndefined();
-    expect(status.raw).toContain("Loaded: masked");
-  });
-});
-
-// ---------------------------------------------------------------------------
 // The acquire() retry loop -- the pool's resilience mechanism, and the last
 // uncovered region v8 reported in pool.ts. Every branch here fires only when a
 // connection dies in the narrow window between connectWithProxy resolving and
@@ -1602,43 +1445,28 @@ describe("ConnectionPool — the dead-race retry loop", () => {
       pool.drain();
     }
   });
-
-  it("evicts a dead entry off the fast path instead of handing out a closed client", async () => {
-    // Second acquire finds the entry still in the map but flagged dead. It must be
-    // deleted and redialed -- returning it would hand the caller a closed socket that
-    // fails on first use with an unrelated "Not connected".
-    const first = makeQuietClient();
-    const second = makeQuietClient();
-    let call = 0;
-    mockedConnect.mockImplementation(async () => (++call === 1 ? first : second) as never);
-
-    const pool = new ConnectionPool();
-    try {
-      const a = await pool.acquire({ host: "reaped.test" });
-      pool.release(a);
-      first.emit("close"); // the server hung up while the entry sat idle
-
-      const b = await pool.acquire({ host: "reaped.test" });
-
-      expect(b).not.toBe(a);
-      expect(mockedConnect).toHaveBeenCalledTimes(2);
-      pool.release(b);
-    } finally {
-      pool.drain();
-    }
-  });
 });
 
 // Two distinct on-disk keys. resolveConfig reads privateKeyPath verbatim, so the
 // FILE CONTENT is what reaches the fingerprint -- the paths must differ in body,
 // not just in name.
-const KEY_DIR = mkdtempSync(join(tmpdir(), "pool-keys-"));
-const KEY_A = join(KEY_DIR, "a");
-const KEY_B = join(KEY_DIR, "b");
-writeFileSync(KEY_A, "-----BEGIN OPENSSH PRIVATE KEY-----aaaa-----END OPENSSH PRIVATE KEY-----");
-writeFileSync(KEY_B, "-----BEGIN OPENSSH PRIVATE KEY-----bbbb-----END OPENSSH PRIVATE KEY-----");
+// Created per run in beforeAll and removed in afterAll, so neither an unfiltered run nor one
+// filtered to other tests leaves a pool-keys-* directory behind in the OS temp dir.
+let KEY_DIR = "";
+let KEY_A = "";
+let KEY_B = "";
 
 describe("ConnectionPool — the auth fingerprint covers key material too", () => {
+  beforeAll(() => {
+    KEY_DIR = mkdtempSync(join(tmpdir(), "pool-keys-"));
+    KEY_A = join(KEY_DIR, "a");
+    KEY_B = join(KEY_DIR, "b");
+    writeFileSync(KEY_A, "-----BEGIN OPENSSH PRIVATE KEY-----aaaa-----END OPENSSH PRIVATE KEY-----");
+    writeFileSync(KEY_B, "-----BEGIN OPENSSH PRIVATE KEY-----bbbb-----END OPENSSH PRIVATE KEY-----");
+  });
+  afterAll(() => {
+    rmSync(KEY_DIR, { recursive: true, force: true });
+  });
   beforeEach(() => {
     mockedConnect.mockReset();
     mockedConnect.mockImplementation(async () => makeQuietClient() as never);
@@ -1675,5 +1503,273 @@ describe("ConnectionPool — the auth fingerprint covers key material too", () =
     } finally {
       pool.drain();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A just-registered entry belongs to its dialer, not to the eviction rule
+// ---------------------------------------------------------------------------
+
+describe("ConnectionPool — a freshly dialed entry is not evictable before its dialer takes a ref", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+    mockedConnect.mockReset();
+  });
+
+  it("refuses a rival acquire at the cap instead of end()ing the connection its dialer is about to use", async () => {
+    // The factory registers the entry with refCount 0 and the dialer bumps it only after an
+    // `await` hop. An acquire for ANOTHER host landing in that window used to see the new entry
+    // as idle, evict and end() it, and send the dialer round its retry loop on a healthy host.
+    // The window is reached the way makeSelfClosingClient reaches it: a microtask queued from
+    // the pool's own listener registration runs after entries.set, before the dialer resumes.
+    const pool = new ConnectionPool({ maxPoolSize: 1 });
+    const fresh = makeQuietClient();
+    let rival: Promise<unknown> | undefined;
+    const originalOn = fresh.on.bind(fresh);
+    fresh.on = (event: string | symbol, listener: (...a: unknown[]) => void) => {
+      const r = originalOn(event as string, listener);
+      if (event === "close") {
+        queueMicrotask(() => {
+          rival = pool.acquire({ host: "rival.test" }).catch((e: unknown) => e);
+        });
+      }
+      return r;
+    };
+    mockedConnect.mockImplementation(
+      async (resolved) => (String(resolved.connectConfig.host) === "fresh.test" ? fresh : makeQuietClient()) as never,
+    );
+    try {
+      const got = await pool.acquire({ host: "fresh.test" });
+      expect(got).toBe(fresh as never);
+      expect(fresh.endCalls).toBe(0);
+      expect(rival).toBeDefined();
+      expect(await rival).toBeInstanceOf(PoolFullError);
+      expect(mockedConnect.mock.calls.map(([r]) => String(r.connectConfig.host))).toEqual(["fresh.test"]);
+      expect(pool.stats).toEqual({ active: 1, idle: 0 });
+
+      // Once claimed and released it is an ordinary idle entry again: the rival now evicts it.
+      pool.release(got);
+      const next = await pool.acquire({ host: "rival.test" });
+      expect(fresh.endCalls).toBe(1);
+      pool.release(next);
+    } finally {
+      pool.drain();
+    }
+  });
+});
+
+describe("ConnectionPool — idleTtlMs option validation", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+    mockedConnect.mockReset();
+    mockedConnect.mockImplementation(async () => makeQuietClient() as never);
+  });
+
+  /** The delay release() arms the idle timer with, for a pool built with `idleTtlMs`. */
+  async function armedIdleDelay(idleTtlMs: number): Promise<unknown> {
+    const pool = new ConnectionPool({ idleTtlMs });
+    const spy = vi.spyOn(globalThis, "setTimeout");
+    try {
+      const c = await pool.acquire({ host: "ttl-option.test" });
+      spy.mockClear();
+      pool.release(c);
+      return spy.mock.calls.at(-1)?.[1];
+    } finally {
+      spy.mockRestore();
+      pool.drain();
+    }
+  }
+
+  it("clamps an idleTtlMs past setTimeout's limit instead of letting Node turn it into 1ms", async () => {
+    // Above 2^31-1 setTimeout fires after 1ms, so every released connection closed at once.
+    expect(await armedIdleDelay(2 ** 31)).toBe(2_147_483_647);
+    expect(await armedIdleDelay(Number.POSITIVE_INFINITY)).toBe(2_147_483_647);
+  });
+
+  it.each([Number.NaN, -1])("falls back to the 60s default for idleTtlMs %s", async (value) => {
+    expect(await armedIdleDelay(value)).toBe(60_000);
+  });
+
+  it("keeps a valid idleTtlMs, 0 included", async () => {
+    expect(await armedIdleDelay(5_000)).toBe(5_000);
+    expect(await armedIdleDelay(0)).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Process entry: stdin end drains the pool (src/index.ts), and the version read
+// cannot crash the import (src/server.ts)
+// ---------------------------------------------------------------------------
+
+describe("src/index.ts: stdin end takes the shutdown path", () => {
+  // Same harness shape as cli-lifecycle.test.ts: run a COPY of the real src/index.ts with its
+  // sibling modules stubbed and the real SDK stdio transport. The pool stub holds a ref'd
+  // interval, standing in for pooled ssh2 sockets (ref'd; only their idle timer is unref'd),
+  // which drain() clears. Without the stdin listeners the process waited for the event loop
+  // to empty after the host closed stdin, which that interval -- like a pooled socket -- prevents.
+  const dirs: string[] = [];
+  afterAll(() => {
+    for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  });
+
+  it("drains a pool that still holds live connections and exits 0 when the host closes stdin", async () => {
+    const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+    const sdkStdio = (import.meta as unknown as { resolve(s: string): string }).resolve(
+      "@modelcontextprotocol/sdk/server/stdio.js",
+    );
+
+    const dir = mkdtempSync(join(tmpdir(), "ssh-mcp-eof-"));
+    dirs.push(dir);
+    let src = readFileSync(join(repoRoot, "src", "index.ts"), "utf8");
+    for (const [from, to] of [
+      ['"@modelcontextprotocol/sdk/server/stdio.js"', JSON.stringify(sdkStdio)],
+      ['"./env.js"', '"./env.mjs"'],
+      ['"./pool.js"', '"./pool.mjs"'],
+      ['"./server.js"', '"./server.mjs"'],
+    ] as const) {
+      expect(src, `import ${from} not found in src/index.ts`).toContain(from);
+      src = src.replace(from, to);
+    }
+    const mark = join(dir, "mark");
+    writeFileSync(join(dir, "index.mjs"), src);
+    writeFileSync(mark, "");
+    writeFileSync(
+      join(dir, "env.mjs"),
+      'import { appendFileSync } from "node:fs";\nexport function killStartedAgent() { appendFileSync(process.env.MARK, "kill\\n"); }\n',
+    );
+    writeFileSync(
+      join(dir, "pool.mjs"),
+      [
+        'import { appendFileSync } from "node:fs";',
+        "export class ConnectionPool {",
+        "  constructor() { this.sockets = setInterval(() => {}, 1000); }",
+        '  drain() { clearInterval(this.sockets); appendFileSync(process.env.MARK, "drain\\n"); }',
+        "}",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(
+      join(dir, "server.mjs"),
+      [
+        'import { appendFileSync } from "node:fs";',
+        'export const version = "0.0.0-stub";',
+        "export function createServer() {",
+        "  let transport;",
+        "  return {",
+        '    async connect(t) { transport = t; await t.start(); appendFileSync(process.env.MARK, "ready\\n"); },',
+        '    async close() { appendFileSync(process.env.MARK, "close\\n"); await transport?.close(); },',
+        "  };",
+        "}",
+        "",
+      ].join("\n"),
+    );
+    const steps = () => readFileSync(mark, "utf8").split("\n").filter(Boolean);
+
+    const child = spawn(process.execPath, [join(dir, "index.mjs")], {
+      env: { ...process.env, MARK: mark },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    try {
+      const exited = new Promise<number | null>((res) => child.on("exit", (code) => res(code)));
+      const deadline = Date.now() + 10_000;
+      while (!steps().includes("ready") && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+      expect(steps()).toEqual(["ready"]);
+
+      child.stdin.end();
+      // Generous against a loaded box, far short of forever: without the fix this never exits.
+      const code = await Promise.race([
+        exited,
+        new Promise<string>((r) => setTimeout(() => r("still running"), 8_000)),
+      ]);
+      expect(code).toBe(0);
+      // shutdown() ran (server.close, then drain + agent reap), then the exit backstop re-ran
+      // its idempotent half.
+      expect(steps()).toEqual(["ready", "close", "drain", "kill", "drain", "kill"]);
+    } finally {
+      child.kill();
+    }
+  });
+});
+
+describe("src/server.ts: readPackageVersion never throws", () => {
+  const dirs: string[] = [];
+  afterAll(() => {
+    for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  });
+
+  it("reads the version, and reports UNKNOWN_VERSION with a stderr line for a missing or versionless package.json", async () => {
+    // server.ts runs this at import time, before src/index.ts answers --version, so a throw
+    // would crash `ssh-mcp --version` instead of printing.
+    const dir = mkdtempSync(join(tmpdir(), "ssh-mcp-pkg-"));
+    dirs.push(dir);
+    const good = join(dir, "good.json");
+    const bare = join(dir, "bare.json");
+    writeFileSync(good, JSON.stringify({ version: "1.2.3" }));
+    writeFileSync(bare, JSON.stringify({ name: "x" }));
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(readPackageVersion(good)).toBe("1.2.3");
+      expect(errSpy).not.toHaveBeenCalled();
+
+      expect(readPackageVersion(join(dir, "missing.json"))).toBe(UNKNOWN_VERSION);
+      expect(readPackageVersion(bare)).toBe(UNKNOWN_VERSION);
+      expect(errSpy).toHaveBeenCalledTimes(2);
+      expect(String(errSpy.mock.calls[0][0])).toContain("missing.json");
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it.each([
+    ["corrupt.json", "{not json"],
+    ["empty-version.json", JSON.stringify({ version: "" })],
+    ["numeric-version.json", JSON.stringify({ version: 1 })],
+  ])("reports UNKNOWN_VERSION with one stderr line naming %s", (name, body) => {
+    // A truncated package.json from a partial install, or a version that is empty or not a
+    // string: none of these may reach MCP clients as the server version.
+    const dir = mkdtempSync(join(tmpdir(), "ssh-mcp-pkg-"));
+    dirs.push(dir);
+    const file = join(dir, name);
+    writeFileSync(file, body);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(readPackageVersion(file)).toBe(UNKNOWN_VERSION);
+      expect(errSpy).toHaveBeenCalledTimes(1);
+      expect(String(errSpy.mock.calls[0][0])).toContain(file);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it("a built dist/index.js with no package.json beside it still answers --version", async () => {
+    // server.ts reads ../package.json at IMPORT time, before src/index.ts answers --version. A
+    // throw there (an inline JSON.parse(readFileSync(...)), say) would crash `ssh-mcp --version`
+    // with a stack trace. Bundle the real entry the way tsup does
+    // (dependencies external) into a dir with no package.json and run it. The dir sits under
+    // the repo's node_modules so the external imports still resolve; ../package.json from its
+    // dist/ is the dir itself, which has none.
+    const { build } = await import("esbuild");
+    const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+    const cacheDir = join(repoRoot, "node_modules", ".cache");
+    mkdirSync(cacheDir, { recursive: true });
+    const dir = mkdtempSync(join(cacheDir, "ssh-mcp-nopkg-"));
+    dirs.push(dir);
+    const outfile = join(dir, "dist", "index.js");
+    await build({
+      entryPoints: [join(repoRoot, "src", "index.ts")],
+      outfile,
+      bundle: true,
+      format: "esm",
+      platform: "node",
+      target: "node18",
+      packages: "external",
+      logLevel: "silent",
+    });
+    const r = spawnSync(process.execPath, [outfile, "--version"], { encoding: "utf8", timeout: 15_000 });
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stdout).toBe(`${UNKNOWN_VERSION}\n`);
+    const errLines = r.stderr.split("\n").filter(Boolean);
+    expect(errLines).toHaveLength(1);
+    expect(errLines[0]).toContain(join(dir, "package.json"));
   });
 });

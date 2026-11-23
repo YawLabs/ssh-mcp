@@ -1,6 +1,6 @@
 # @yawlabs/ssh-mcp
 
-[![Add to Yaw MCP](https://yaw.sh/yaw-mcp-button.svg)](https://yaw.sh/mcp/install?name=SSH&command=npx&args=-y%2C%40yawlabs%2Fssh-mcp&description=Run%20commands%20on%20remote%20hosts%2C%20transfer%20files%2C%20manage%20SSH%20tunnels%20and%20keys&source=https%3A%2F%2Fgithub.com%2FYawLabs%2Fssh-mcp)
+[![Add to Yaw MCP](https://yaw.sh/yaw-mcp-button.svg)](https://yaw.sh/mcp/install?name=SSH&command=npx&args=-y%2C%40yawlabs%2Fssh-mcp&description=Run%20remote%20commands%2C%20transfer%20files%20over%20SFTP%2C%20manage%20ssh-agent%20keys%20and%20known_hosts%2C%20and%20diagnose%20SSH%20failures&source=https%3A%2F%2Fgithub.com%2FYawLabs%2Fssh-mcp)
 
 One click adds this to your local Yaw MCP config so it's available in every Yaw Terminal session. Tested with Yaw MCP 1.1.13 or newer. Or install manually below.
 
@@ -87,13 +87,13 @@ Tools that fix your local SSH setup so everything else — git, deploys, tunnels
 
 | Tool | Description |
 |------|-------------|
-| `ssh_exec` | Execute a command on a remote host. Returns up to three content blocks, status first: `[exit code: N]` (plus `[signal: NAME]` with `code: -1` when the channel closed signal-only, and a flag when a stream hit the 10 MB cap), then `[stderr]`, then `[stdout]`. Status leads so a proxy that cuts long results — Yaw MCP keeps about 100 KB by default — never drops the exit code. Optional `env` param sets per-call environment variables (POSIX-safe prefix, works regardless of sshd's `AcceptEnv`). Subject to [command policy](#command-policy) if configured. |
-| `ssh_read_file` | Read a file from a remote host via SFTP (whole file up to 10 MB). Optional `offset` and `length` (bytes) read one page and return a `[bytes A-B of SIZE; next offset: N]` status block before the text — use them for a large file, or behind a proxy that caps results. |
+| `ssh_exec` | Execute a command on a remote host. Returns up to three content blocks, status first: `[exit code: N]` (plus `[signal: NAME]` with `code: -1` when the channel closed signal-only, and a flag when a stream hit the 10 MB cap), then `[stderr]`, then `[stdout]`. Status leads so a proxy that cuts long results — Yaw MCP keeps about 100 KB by default — never drops the exit code. A non-zero exit or a signal is reported as a normal result, not a tool error (`isError` is not set): read the `[exit code: N]` block. Optional `env` param sets per-call environment variables (POSIX-safe prefix, works regardless of sshd's `AcceptEnv`). Subject to [command policy](#command-policy) if configured. |
+| `ssh_read_file` | Read a file from a remote host via SFTP (whole file up to 10 MB). Optional `offset` and `length` (bytes) read one page and return a `[bytes A-B of SIZE; next offset: N]` status block before the text — use them for a large file, or behind a proxy that caps results. A file that reports size 0 (/proc, a device, a FIFO) pages as `of unknown size`. |
 | `ssh_write_file` | Write content to a file on a remote host via SFTP. |
 | `ssh_upload` | Upload a local file to a remote host via SFTP. |
 | `ssh_download` | Download a file from a remote host to local filesystem. |
 | `ssh_ls` | List files in a directory on a remote host. |
-| `ssh_stat` | Get metadata for a file or directory (size, mode in octal, uid/gid, mtime/atime, isFile/isDirectory/isSymbolicLink). Use instead of parsing `ls -la`. |
+| `ssh_stat` | Get metadata for a file or directory (size, mode in octal, uid/gid, mtime/atime, path type (file / directory / symlink -> target kind)). Use instead of parsing `ls -la`. |
 | `ssh_mkdir` | Create a directory via SFTP. Set `recursive: true` for `mkdir -p` behavior. Unlike the other SFTP tools, the path may be relative — it resolves against the SFTP working directory (normally the remote user's home). `~` is not expanded; SFTP has no shell. |
 | `ssh_delete` | Delete a file or empty directory via SFTP. Auto-dispatches unlink vs rmdir based on the path's *own* type (`lstat`), so a symlink is always unlinked — never followed — including a dangling one or one pointing at a directory. Recursive directory delete is intentionally NOT supported -- use `ssh_exec rm -rf` if you need it. |
 
@@ -103,7 +103,7 @@ Tools that wrap common patterns agents build with ssh_exec — faster and less e
 
 | Tool | Description |
 |------|-------------|
-| `ssh_multi_exec` | Run a command on multiple hosts in parallel. Returns results per host. Optional `env` param sets per-call environment variables (same POSIX-safe prefix as `ssh_exec`, applied once and sent to every host). Subject to [command policy](#command-policy) if configured (policy is checked once, against the env-prefixed command, before fan-out). |
+| `ssh_multi_exec` | Run a command on multiple hosts in parallel. Returns results per host, and flags the whole call `isError` when any host errored or exited non-zero (unlike `ssh_exec`). Optional `env` param sets per-call environment variables (same POSIX-safe prefix as `ssh_exec`, applied once and sent to every host). Subject to [command policy](#command-policy) if configured (policy is checked once, against the env-prefixed command, before fan-out). |
 | `ssh_find` | Search for files remotely with structured parameters (`name`, `type`, `size`, `depth`, `newer` — match files modified more recently than a reference path). |
 | `ssh_tail` | Read the last N lines of a file, optionally filtered by a grep pattern. |
 | `ssh_service_status` | Check systemd service status (active, PID, uptime, description). Flags `isError` only when the unit could not be found / queried, not when an existing unit is intentionally stopped. |
@@ -111,6 +111,18 @@ Tools that wrap common patterns agents build with ssh_exec — faster and less e
 ### Auto-diagnostics
 
 When any remote operation fails, ssh-mcp automatically runs diagnostics and includes the results in the error response. Your agent doesn't need to call `ssh_diagnose` separately — it gets told what's wrong and how to fix it right in the error message.
+
+The diagnostics are matched to the kind of failure, so the real cause is not buried under checks that cannot explain it:
+
+| Failure | What the error carries |
+|---------|------------------------|
+| Network (refused, DNS, unreachable, timed out, a ProxyJump hop that cannot reach the target) | The host and port actually dialed, the `~/.ssh/config` alias it came from, and any ProxyJump. No agent, key or known_hosts checks. |
+| Host key rejected | Why the key was rejected (mismatch, missing algorithm, or strict mode with no entry) and the exact fix command. |
+| Authentication | The agent check, but only when that agent was offered on this connection (so a dead `SSH_AUTH_SOCK` is named as the reason no agent key was tried), the key check for the default offer, and which user, agent and key file were offered. An explicit `password` or `privateKeyPath` offers no agent, so neither check is shown. |
+| Any of the above on a ProxyJump hop, before the target was reached | A `Jump host` line naming the hop, then the row above for THAT hop: its dial target, or the agent and key it offered (a bastion offers the default agent and key even when the target was given a `password`). |
+| Anything else | Every check: agent, keys, ssh config, known_hosts. |
+
+An invalid `host` is the exception: it is refused up front with a one-line `Invalid SSH host "..."` error and no diagnostics, since nothing was looked up or dialed (see [Authentication](#authentication)). In the library, `resolveConfig()`, `connect()` and `ConnectionPool.acquire()` throw it as an `InvalidHostError` (`code: "ERR_SSH_MCP_INVALID_HOST"`, `isInvalidHostError()`).
 
 ### Connection pooling
 
@@ -129,6 +141,8 @@ The library's `acquire()` / `withConnection()` do not wait by default: they reje
 
 All connections respect your `~/.ssh/config`. Host aliases, custom ports, usernames, identity files, and ProxyJump settings are used automatically. If you have `Host myserver` configured in your SSH config, just pass `host: "myserver"` — ssh-mcp resolves everything.
 
+**Edits to `~/.ssh/config` need a server restart.** The config resolved for each host (via `ssh -G`) is memoized for the life of the server process, so a running server keeps using what it resolved first; `ssh_config_lookup` is not cached and shows the new values straight away. A lookup that failed (no SSH client, a timed-out `ssh -G`, an option your `ssh` rejects) is cached for only 30 seconds and then retried.
+
 **ProxyJump / bastion hosts** are supported automatically. If your SSH config has `ProxyJump bastion` for a host, ssh-mcp connects through the bastion transparently. Chained proxies work too.
 
 ### Host key verification
@@ -139,11 +153,13 @@ All remote operations verify the server's host key against `~/.ssh/known_hosts`:
 - **Known host, key changed** — reject (MITM protection). The rejection message distinguishes a genuine key mismatch from "the server offered a key type your `known_hosts` entry doesn't cover", so a missing ed25519 line doesn't read as an attack.
 - **Unknown host** — accept, unless strict mode is on (`SSH_MCP_STRICT_HOSTKEYS=1`).
 
+**On a port other than 22, only `[host]:port` entries can reject a key.** ssh-mcp also consults the bare-host entry, as OpenSSH does, but only to ACCEPT a key that matches it: a bare entry describes whatever answers on port 22, often a different sshd. So a second sshd on `host:2222` with no `[host]:2222` line is an unknown host (accepted, or refused in strict mode), not a key mismatch. To pin it, add a port-qualified entry (`ssh-keyscan -p 2222 host`, or `ssh_known_hosts_fix` with the port). Once `[host]:port` entries exist, the host-key algorithm preference is built from them alone, so the server is asked for a key type they can accept.
+
 **That last branch is trust-always, not TOFU.** Real trust-on-first-use pins the key it saw the first time and rejects a change afterwards. The connection path never writes to `known_hosts` — no tool adds an entry as a side effect of connecting — so connecting pins nothing: *every* connection to a host absent from `known_hosts` is a "first" use and is accepted, including one where an attacker swapped the key since your last call. Only hosts put into `known_hosts` out of band get mismatch protection — by you, by `ssh-keyscan`, or by `ssh_known_hosts_fix`, the one tool here that does write the file. Call it explicitly to add an entry so future changes are caught.
 
 For stricter environments, set `SSH_MCP_STRICT_HOSTKEYS=1` (or `true`, case-insensitive) to reject unknown hosts. Add them explicitly with `ssh_known_hosts_fix` first. The older name `SSH_MCP_STRICT_HOST_KEY` still works and accepts the same values, but prefer the new one: credential scanners such as Yaw MCP's doctor treat any name with a `_KEY` segment as a secret, and flag the old name as a plaintext credential.
 
-The diagnostic tools (`ssh_test`, `ssh_diagnose`) use `StrictHostKeyChecking=no` for their probe commands. Those probes only run `echo SSH_OK` — no credentials or data pass through — so the relaxed setting is safe for connectivity testing. Real operations always go through the `hostVerifier`.
+The diagnostic tools (`ssh_test`, `ssh_diagnose`) probe with the system `ssh` client, which accepts an unknown host and refuses a changed key, so a changed key shows up there too. Those probes **never write `known_hosts`**: a newly seen key goes to the null device, not to your file, so running a diagnostic pins nothing and cannot satisfy strict mode on your behalf. They only run `echo SSH_OK` — no passwords or data pass through, though an unknown host does see the public keys the client offers. Real operations always go through the `hostVerifier`.
 
 ### Command policy
 
@@ -230,7 +246,7 @@ On Windows, ssh-mcp uses the OpenSSH Authentication Agent's `\\.\pipe\openssh-ss
 
 On the [oam](https://oamjs.org) runtime, the launcher serves only on oam 0.21.1 or newer. Agent auth needs a `net` that can dial a named pipe or a Unix socket (that is how ssh2 reaches the agent), which older oam releases could not do. On oam 0.20.2 (Windows) the MCP handshake, `ssh_config_lookup`, `ssh_key_list` and `ssh_agent_ensure` were verified through the launcher, and ssh2's own agent client was verified dialing a named pipe and completing an identities request (against a stand-in agent on a pipe). An agent-only `ssh_exec` end to end has so far been verified on Node only. Started from Node, the launcher prefers oam (`auto`); to rule the runtime out when agent auth fails there, set `SSH_MCP_RUNTIME=node`. Started by oam with no Node on `PATH`, it can still serve on oam: see [Runtime selection](#runtime-selection). ed25519 and ECDSA keys and ed25519-only servers used to be broken on oam 0.20.2; that is fixed as of 0.21.1 — see [oam key support](#oam-key-support).
 
-`ssh_agent_ensure` and `ssh_diagnose` probe that pipe and tell you if the service is down. Remote operations do *not*: they assume the pipe and let the connection fail on its own if the agent isn't there. That is why a stopped agent service shows up as an auth failure rather than an "agent not running" error until you run the diagnostic tools.
+`ssh_agent_ensure` and `ssh_diagnose` probe that pipe and tell you if the service is down. Remote operations do *not*: they assume the pipe and let the connection fail on its own if the agent isn't there. That is why a stopped agent service shows up as an auth failure (ssh2's `Failed to connect to agent`) rather than an "agent not running" error; that failure's [auto-diagnostics](#auto-diagnostics) carry the agent check.
 
 ## Authentication
 
@@ -238,7 +254,7 @@ All remote operations accept connection parameters:
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `host` | SSH hostname or IP (required) | — |
+| `host` | SSH hostname, `~/.ssh/config` alias, or IP (required). An IPv6 literal may be bare (`::1`, `fe80::1%eth0`) or bracketed (`[::1]`, `[fe80::1%eth0]`), and is dialed bare. An internationalized name such as `bücher.de` is accepted and dialed as given, but skips the `~/.ssh/config` and known_hosts lookups (as it always has), so it is trusted on every connection even with a known_hosts entry and refused in strict mode: give it in punycode (`xn--bcher-kva.de`) for those. A host that starts with `-`, carries a port (`host:22`), a login (`user@host`) or shell syntax is refused before any `ssh -G` lookup, DNS query or connection. | — |
 | `port` | SSH port | From SSH config or `22` |
 | `username` | SSH username | From SSH config or current user |
 | `privateKeyPath` | Path to SSH private key | Auto-detect |
@@ -250,11 +266,11 @@ All remote operations accept connection parameters:
 2. **Explicit `password`** — used alone, same as above.
 3. **Neither given** — both of the following are configured on the same connection:
    - **ssh-agent** — `SSH_AUTH_SOCK`, or on Windows the `\\.\pipe\openssh-ssh-agent` named pipe. The Windows pipe is assumed unconditionally; ssh-mcp does not check that the OpenSSH Authentication Agent service is actually running.
-   - **One on-disk key** — the first *readable* path in `ssh -G <host>`'s `identityfile` list. OpenSSH emits that list for **every** host, including one with no `IdentityFile` line (it defaults to `~/.ssh/id_rsa`, `id_ecdsa`, `id_ecdsa_sk`, `id_ed25519`, `id_ed25519_sk`), so this is the normal path — not a path reserved for hosts you configured an identity for. ssh-mcp's own built-in list (`~/.ssh/id_ed25519`, `id_rsa`, `id_ecdsa`) is a fallback used only when `ssh -G` cannot run at all, e.g. no SSH client installed.
+   - **One on-disk key** — the first *usable* path in `ssh -G <host>`'s `identityfile` list: it exists, is a private key, and is not encrypted when an agent is configured. OpenSSH emits that list for **every** host, including one with no `IdentityFile` line (it defaults to `~/.ssh/id_rsa`, `id_ecdsa`, `id_ecdsa_sk`, `id_ed25519`, `id_ed25519_sk`), so this is the normal path — not a path reserved for hosts you configured an identity for. ssh-mcp's own built-in list (`~/.ssh/id_ed25519`, `id_rsa`, `id_ecdsa`) is a fallback used only when `ssh -G` cannot run at all, e.g. no SSH client installed.
 
 Two things worth knowing about step 3:
 
-- **Only one on-disk key is ever offered** — the first candidate that exists. ssh-mcp does not walk the whole identity list the way `ssh` does, so if the first readable key is the wrong one, authentication rests on the agent's keys. Pass `privateKeyPath` to force a specific key.
+- **Only one on-disk key is ever offered** — the first usable candidate (exists, is a private key, and is not encrypted when an agent is configured). A candidate that is not a private key at all — an empty file, a stray text file, or the classic `IdentityFile ~/.ssh/id_ed25519.pub` typo — is always skipped and the scan moves on. ssh-mcp does not offer every identity the way `ssh` does, so if the first usable key is the wrong one, authentication rests on the agent's keys. Pass `privateKeyPath` to force a specific key.
 - **When an agent is configured, an *encrypted* on-disk key is skipped** and the scan moves to the next candidate. The underlying ssh2 library parses `privateKey` eagerly and errors with "no passphrase given" on an encrypted key, which would break the common setup of an encrypted key on disk with its decrypted copy loaded in the agent. With no agent configured, the first existing key is loaded regardless of encryption and ssh2 surfaces the passphrase error itself. Because the Windows pipe above is assumed unconditionally, the skip is always in force on Windows.
 
 ## Example workflows
@@ -356,18 +372,18 @@ The default prefers oam again as of **oam 0.21.1**, which closed the `node:crypt
 Two environment variables control the choice; set them in your MCP client's `env` block:
 
 - `SSH_MCP_RUNTIME` — which runtime to use. Case-insensitive, surrounding whitespace ignored; any value other than `oam` or `node` behaves as `auto`.
-  - `auto` (default) — prefer oam. On a Node host the launcher discovers the newest usable oam and spawns it, falling back to Node in-process when none is found. Started by oam at or above the floor it serves in-process, with no second oam. Started by oam below the floor it hands off to Node on `PATH` (or to a newer oam), or exits with status 1 when there is neither; see the list below.
+  - `auto` (default) — prefer oam. On a Node host the launcher discovers the newest usable oam and spawns it, falling back to Node in-process when none is found. Started by oam at or above the floor it serves in-process, with no second oam. Started by oam below the floor it hands off to the newest usable oam, else to Node on `PATH`, or exits with status 1 when there is neither; see the list below.
   - `oam` — require oam. Fails loudly: if no usable oam is found, the launcher prints what it found and why each one was passed over to stderr, and exits with status 1 instead of starting the server.
   - `node` — always Node. The launcher does not look for oam, and `OAM_BIN` is ignored.
-- `OAM_BIN` — with `SSH_MCP_RUNTIME=oam`, path to an oam binary to use in preference to discovery, when it is 0.21.1 or newer. If it does not exist, is older, will not run, or does not answer `--version` with oam's own `oam x.y.z` banner (another program's version, such as Node's `v22.x.y`, does not count), the launcher says so on stderr and carries on with discovery.
+- `OAM_BIN` — under `auto` or `oam` (whenever the launcher looks for oam), path to an oam binary to use in preference to discovery, when it is 0.21.1 or newer. If it does not exist, is older, will not run, or does not answer `--version` with oam's own `oam x.y.z` banner (another program's version, such as Node's `v22.x.y`, does not count), the launcher says so on stderr and carries on with discovery.
 
-Discovery (under `SSH_MCP_RUNTIME=oam`) looks in `$OAM_INSTALL_DIR` (when set — the oam installer's install target), then `%LOCALAPPDATA%\oam\bin` (Windows only), then `~/.oam/bin`, then every directory on `PATH`; asks every oam binary it finds for its version, counting only an answer that carries oam's own `oam x.y.z` banner; and uses the newest one at 0.21.1 or newer. On a tie the one found first wins, so an installed copy beats one on `PATH`. On Windows only `oam.exe` counts: an `oam.cmd`/`oam.bat` shim on `PATH` is never run, and is named on stderr when no usable oam is found.
+Discovery (under `auto` or `oam`, whenever the launcher looks for oam) looks in `$OAM_INSTALL_DIR` (when set — the oam installer's install target), then `%LOCALAPPDATA%\oam\bin` (Windows only), then `~/.oam/bin`, then every directory on `PATH`; asks every oam binary it finds for its version, counting only an answer that carries oam's own `oam x.y.z` banner; and uses the newest one at 0.21.1 or newer. On a tie the one found first wins, so an installed copy beats one on `PATH`. On Windows only `oam.exe` counts: an `oam.cmd`/`oam.bat` shim on `PATH` is never run, and is named on stderr when no usable oam is found.
 
 With `SSH_MCP_RUNTIME=oam` an unusable oam is an error: the launcher names on stderr each oam (and `OAM_BIN`) it passed over and why — older than 0.21.1, not runnable, or a shim — or the chosen oam that failed to start, and exits with status 1. It does not fall back to Node.
 
 When the launcher is itself started by oam (`oam run <path>/bin/ssh-mcp.mjs`, which is how Yaw MCP starts an `npx @yawlabs/ssh-mcp` entry when a recent oam is installed):
 
-- In `auto` mode an oam 0.21.1 or newer serves the server itself, in the same process, with no note about unusable key types -- the gap that used to earn one is closed. An oam below the floor never serves there: it hands off to Node on `PATH`, or to the newest usable oam it can find, or exits with status 1 when there is neither.
+- In `auto` mode an oam 0.21.1 or newer serves the server itself, in the same process, with no note about unusable key types -- the gap that used to earn one is closed. An oam below the floor never serves there: it hands off to the newest usable oam it can find, else to Node on `PATH`, or exits with status 1 when there is neither.
 - With `SSH_MCP_RUNTIME=oam` on oam 0.21.1 or newer, it runs the server on that oam, in the same process. Nothing is discovered or spawned, and `OAM_BIN` is not read: that oam is the one required. On an older oam it never runs the server there; it hands off to the newest usable oam it can find, or exits with status 1.
 - With `SSH_MCP_RUNTIME=node` it hands the server off to Node on `PATH`, whatever the oam version, and exits with status 1 when there is none.
 
