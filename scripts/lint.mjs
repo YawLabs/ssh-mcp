@@ -188,7 +188,9 @@ function emulatedX64Binary(version) {
     );
   }
 
-  console.error(`[lint] routing around the win32-arm64 biome build on this host; provisioning x64 ${version} under emulation`);
+  console.error(
+    `[lint] routing around the win32-arm64 biome build on this host; provisioning x64 ${version} under emulation`,
+  );
   const install = spawnSync(
     process.execPath,
     [npmCli, "i", "--no-save", "--force", "--prefix", prefix, `@biomejs/cli-win32-x64@${version}`],

@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Client } from "ssh2";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { INVALID_HOSTNAME_SUGGESTION } from "../diagnose.js";
 import type { AgentResult, ConfigLookupResult, KeyInfo, SshKeyListing } from "../env.js";
 import { ConnectionPool } from "../pool.js";
 import type { SSHConfig } from "../ssh.js";
@@ -152,7 +153,8 @@ describe("ssh_diagnose renders the DiagnosticReport", () => {
       {
         name: "Known Hosts",
         status: "warning" as const,
-        message: 'Host "web1.test" not in known_hosts. First connection will need verification.',
+        message:
+          'Host "web1.test" is not in known_hosts. ssh-mcp accepts an unpinned host\'s key unverified on every connection (it is never saved), or refuses it when SSH_MCP_STRICT_HOSTKEYS=1. To pin it: ssh-keyscan -H "web1.test" >> ~/.ssh/known_hosts',
       },
       {
         name: "Connectivity",
@@ -184,7 +186,7 @@ describe("ssh_diagnose renders the DiagnosticReport", () => {
         "  No ~/.ssh/config file (using defaults)",
         "",
         "[WARN] Known Hosts",
-        '  Host "web1.test" not in known_hosts. First connection will need verification.',
+        '  Host "web1.test" is not in known_hosts. ssh-mcp accepts an unpinned host\'s key unverified on every connection (it is never saved), or refuses it when SSH_MCP_STRICT_HOSTKEYS=1. To pin it: ssh-keyscan -H "web1.test" >> ~/.ssh/known_hosts',
         "",
         "[FAIL] Connectivity",
         "  Permission denied connecting to web1.test:22. Your key is not authorized on this host.",
@@ -267,7 +269,7 @@ describe("ssh_diagnose renders the DiagnosticReport", () => {
     diagnoseSpy.mockReturnValue({
       overall: "error",
       checks: [{ name: "Input Validation", status: "error", message: `Invalid hostname: "${host}"` }],
-      suggestions: ["Provide a valid hostname (alphanumeric, dots, hyphens, colons, brackets only)"],
+      suggestions: [INVALID_HOSTNAME_SUGGESTION],
     });
     const result = await run("ssh_diagnose", { host });
     expect(result.isError).toBe(true);
@@ -280,7 +282,7 @@ describe("ssh_diagnose renders the DiagnosticReport", () => {
         `  Invalid hostname: "${host}"`,
         "",
         "Suggested fixes:",
-        "  - Provide a valid hostname (alphanumeric, dots, hyphens, colons, brackets only)",
+        `  - ${INVALID_HOSTNAME_SUGGESTION}`,
       ].join("\n"),
     );
   });

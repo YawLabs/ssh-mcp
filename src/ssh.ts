@@ -11,13 +11,17 @@ import {
   type Stats,
 } from "ssh2";
 import {
+  agentStartSuggestion,
   checkKnownHosts,
   checkSshAgent,
   checkSshConfig,
   checkSshKeys,
   type DiagnosticResult,
+  isStrictHostKeyMode,
   isValidHostname,
+  keyscanCommand,
   runArgs,
+  WINDOWS_AGENT_PIPE,
 } from "./diagnose.js";
 import { parseSshConfigOutput } from "./ssh-config.js";
 
@@ -87,10 +91,13 @@ export interface ResolvedConfig {
 // `ssh -G <host>` is a synchronous subprocess spawn costing ~0.3-0.9s (worst on
 // Windows). resolveConfig() runs on EVERY pool acquire, including hits on an
 // already-warm pooled connection, so without this memo N concurrent acquires of
-// one host pay N spawns for an answer that cannot differ between them. Cached
-// for process lifetime: ssh_config is read at startup-ish cadence and a running
-// server is expected to be restarted after config edits.
-const sshConfigCache = new Map<string, SshConfigResult | null>();
+// one host pay N spawns for an answer that cannot differ between them. A
+// SUCCESSFUL answer is cached for process lifetime: ssh_config is read at
+// startup-ish cadence and a running server is expected to be restarted after
+// config edits. A FAILED probe is never cached -- one transient `ssh -G` failure
+// (runArgs' 10s timeout, a slow `Match exec`) would otherwise drop that host's
+// HostName / User / Port / IdentityFile / ProxyJump until restart.
+const sshConfigCache = new Map<string, SshConfigResult>();
 
 /** Test-only: drop memoized `ssh -G` results so a suite can vary ssh_config. */
 export function clearSshConfigCache(): void {
@@ -99,29 +106,47 @@ export function clearSshConfigCache(): void {
 
 function resolveFromSshConfig(host: string): SshConfigResult | null {
   const cached = sshConfigCache.get(host);
-  if (cached !== undefined) return cached;
+  if (cached) return cached;
   const result = resolveFromSshConfigUncached(host);
-  sshConfigCache.set(host, result);
+  if (result) sshConfigCache.set(host, result);
   return result;
 }
 
 function resolveFromSshConfigUncached(host: string): SshConfigResult | null {
-  try {
-    const { stdout, ok } = runArgs("ssh", ["-G", host]);
-    if (!ok) return null;
+  // Validate before spawning, and put `--` before the host as well: a host such as
+  // `-E/path` or `-oProxyCommand=x` must never reach ssh as an option. IPv6 is
+  // checked in its bracketed form, the only shape isValidHostname recognizes.
+  const bare = unbracketHost(host);
+  if (!isValidHostname(bare.includes(":") ? `[${bare}]` : bare)) return null;
+  // runArgs never throws (it folds every spawn failure into ok:false) and the
+  // parser is pure string work, so there is nothing here to catch.
+  const { stdout, ok } = runArgs("ssh", ["-G", "--", host]);
+  if (!ok) return null;
 
-    const { all, identityFiles } = parseSshConfigOutput(stdout);
+  const { all, identityFiles } = parseSshConfigOutput(stdout);
 
-    return {
-      hostname: all.hostname || host,
-      user: all.user || "",
-      port: all.port || "22",
-      identityFiles,
-      proxyJump: all.proxyjump && all.proxyjump !== "none" ? all.proxyjump : undefined,
-    };
-  } catch {
-    return null;
+  return {
+    hostname: all.hostname || host,
+    user: all.user || "",
+    port: all.port || "22",
+    identityFiles,
+    proxyJump: all.proxyjump && all.proxyjump !== "none" ? all.proxyjump : undefined,
+  };
+}
+
+/**
+ * Expand a leading `~` the way a shell does for the CURRENT user only: `~` alone,
+ * `~/...`, and on Windows `~\...`. Every other spelling is returned untouched --
+ * `~alice/.ssh/id` names another user's home (which we cannot resolve portably) and
+ * `~backup.key` is a relative file whose name starts with a tilde; joining either
+ * onto our own home produced an ENOENT for a path the caller never named.
+ */
+export function expandTilde(path: string, home: string = homedir()): string {
+  if (path === "~") return home;
+  if (path.startsWith("~/") || (process.platform === "win32" && path.startsWith("~\\"))) {
+    return join(home, path.slice(2));
   }
+  return path;
 }
 
 /**
@@ -164,36 +189,47 @@ export interface KnownHostEntry {
 
 // Looks up entries via `ssh-keygen -F` so hashed known_hosts lines (|1|...) resolve
 // transparently without us reimplementing HMAC.
+//
+// Returns the entries for EVERY spelling knownHostsTargets yields (for a non-22
+// port: `[host]:port` and the bare host). That union is right for algorithm
+// ORDERING; the accept/reject decision must not use it -- see buildHostVerifier.
 export function readKnownHostsEntries(host: string, port?: number): KnownHostEntry[] {
+  return knownHostsTargets(host, port).flatMap(readKnownHostsTarget);
+}
+
+/**
+ * Entries for ONE known_hosts target spelling (one `ssh-keygen -F` lookup). The
+ * target must come from knownHostsTargets, which is what validates it.
+ */
+function readKnownHostsTarget(target: string): KnownHostEntry[] {
   const entries: KnownHostEntry[] = [];
-  for (const target of knownHostsTargets(host, port)) {
-    const { stdout, ok } = runArgs("ssh-keygen", ["-F", target]);
-    if (!ok || !stdout.trim()) continue;
-    for (const line of stdout.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
-      // Format: <host-or-hash> <keytype> <base64> [comment]
-      const parts = trimmed.split(/\s+/);
-      // ...UNLESS the line carries a marker. `ssh-keygen -F` echoes matching lines
-      // VERBATIM, and a marker line has an extra LEADING field, so every index
-      // shifts by one: for "@cert-authority *.corp.example.com ssh-ed25519 AAAA..."
-      // parts[1] is the host PATTERN (stored below as if it were the key type) and
-      // parts[2] is the literal string "ssh-ed25519" -- which Buffer.from(_, "base64")
-      // happily decodes to 8 junk bytes rather than throwing, so the try/catch never
-      // fired and the junk landed in the comparison set. The visible symptom was a
-      // rejection message naming a host pattern where a key type belongs.
-      //
-      // Skipping them is a security fix as much as a parse one: a @cert-authority
-      // line holds a CA's key, not this host's, and a @revoked line records a key
-      // that must NEVER be accepted as valid.
-      if (parts[0].startsWith("@")) continue;
-      if (parts.length < 3) continue;
-      try {
-        entries.push({ type: parts[1], key: Buffer.from(parts[2], "base64") });
-      } catch {
-        // Skip malformed entry
-      }
-    }
+  const { stdout, ok } = runArgs("ssh-keygen", ["-F", target]);
+  if (!ok || !stdout.trim()) return entries;
+  for (const line of stdout.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    // Format: <host-or-hash> <keytype> <base64> [comment]
+    const parts = trimmed.split(/\s+/);
+    // ...UNLESS the line carries a marker. `ssh-keygen -F` echoes matching lines
+    // VERBATIM, and a marker line has an extra LEADING field, so every index
+    // shifts by one: for "@cert-authority *.corp.example.com ssh-ed25519 AAAA..."
+    // parts[1] is the host PATTERN (stored as if it were the key type) and parts[2]
+    // is the literal string "ssh-ed25519". The visible symptom was a rejection
+    // message naming a host pattern where a key type belongs.
+    //
+    // Skipping them is a security fix as much as a parse one: a @cert-authority
+    // line holds a CA's key, not this host's, and a @revoked line records a key
+    // that must NEVER be accepted as valid.
+    if (parts[0].startsWith("@")) continue;
+    if (parts.length < 3) continue;
+    // Node's base64 decoder never throws -- it drops characters it does not know --
+    // so a corrupt line still "decodes", to junk. A junk entry would make the host
+    // count as KNOWN and then reject every key it is offered. The blob carries its
+    // own algorithm name, so keep the entry only when that agrees with the type
+    // column; anything else is not a usable host key.
+    const key = Buffer.from(parts[2], "base64");
+    if (hostKeyBlobType(key) !== parts[1]) continue;
+    entries.push({ type: parts[1], key });
   }
   return entries;
 }
@@ -361,51 +397,49 @@ function cachedKnownHostTypes(hosts: ReadonlyArray<string>, port: number | undef
 // protection. Set SSH_MCP_STRICT_HOSTKEYS=1 to require an entry.
 //
 // Checks known_hosts under both the user-supplied host (e.g. a ssh_config alias) and
-// the resolved hostname, matching OpenSSH's CheckHostIP behavior.
-/**
- * Strict host-key mode: reject a host with no known_hosts entry instead of trusting it.
- *
- * Two names, one switch. SSH_MCP_STRICT_HOSTKEYS is the documented one.
- * SSH_MCP_STRICT_HOST_KEY is the original name and keeps working, but it is
- * credential-shaped -- `KEY` is a whole underscore segment -- so Yaw MCP's doctor
- * listed `SSH_MCP_STRICT_HOST_KEY=1` as a plaintext secret and suggested moving it
- * into the vault. `HOSTKEYS` is not a credential segment, so the new name is not
- * flagged. Either one turns strict mode on.
- *
- * Both are read the way Yaw MCP reads an opt-in: trimmed, case-insensitive `1` or
- * `true`. Only the exact string "1" used to count, so `=true` silently left strict
- * mode OFF -- the unsafe direction for a security switch.
- */
-export function isStrictHostKeyMode(env: NodeJS.ProcessEnv = process.env): boolean {
-  const on = (v: string | undefined) => {
-    const t = (v ?? "").trim().toLowerCase();
-    return t === "1" || t === "true";
-  };
-  return on(env.SSH_MCP_STRICT_HOSTKEYS) || on(env.SSH_MCP_STRICT_HOST_KEY);
-}
+// the resolved hostname, matching OpenSSH's CheckHostIP behavior. For a non-22 port
+// only the `[host]:port` entries can reject; a bare-host entry can only accept (see
+// the comment inside buildHostVerifier).
+// isStrictHostKeyMode lives in diagnose.ts so the ssh_test / ssh_diagnose probe
+// can honour it too (diagnose.ts cannot import this module); re-exported here.
+// keyscanCommand lives in diagnose.ts (one implementation for both modules) and
+// is re-exported here for callers that import it from ssh.js.
+export { isStrictHostKeyMode, keyscanCommand };
 
 function buildHostVerifier(
   hosts: ReadonlyArray<string>,
   port: number | undefined,
   rejection: { current: HostKeyRejection | null },
+  remediation: { host: string; port: number | undefined },
 ): (key: Buffer) => boolean {
   const strict = isStrictHostKeyMode();
-  const label = hosts.join(" / ");
-  // The host to paste into the ssh-keyscan / ssh-keygen -R remediation below. Both
-  // tools have the same bracket sensitivity documented for `-F` on knownHostsTargets:
-  // probed on OpenSSH 10.2p1, `ssh-keygen -R '[::1]'` prints "Host [::1] not found"
-  // and removes nothing, while `-R '::1'` works. `hosts` preserves the caller's
-  // spelling (resolveConfig dedupes on the bare form but keeps the original), so an
-  // IPv6 caller who passed `[::1]` would otherwise be handed a silent no-op to run.
-  const remediationHost = unbracketHost(hosts[0]);
+  const label = port && port !== 22 ? `${hosts.join(" / ")} (port ${port})` : hosts.join(" / ");
+  // Built from the RESOLVED hostname and port, not hosts[0] (the caller's alias,
+  // port-less): see keyscanCommand.
+  const keyscan = keyscanCommand(remediation.host, remediation.port);
+  // Per verifier host: [authoritative spelling, ...fallback spellings]. For port 22
+  // that is just the bare host; otherwise `[host]:port`, then the bare host.
+  const targets = hosts.map((h) => knownHostsTargets(h, port)).filter((t) => t.length > 0);
   return (key: Buffer) => {
     rejection.current = null;
-    const known = hosts.flatMap((h) => readKnownHostsEntries(h, port));
+    // OpenSSH semantics for a non-default port. The port-qualified `[host]:port`
+    // entries are AUTHORITATIVE: if any exist, they alone decide accept vs reject.
+    // A bare-host entry describes whatever answers on port 22 -- often a different
+    // sshd than the one on :2222 (a git server, a container) -- so it may ACCEPT a
+    // key it matches, but it is never grounds for a reject: merging the two sets
+    // used to turn an unknown second sshd into a hard "key-mismatch". With no
+    // authoritative entry and no fallback match, the host is UNKNOWN, exactly like
+    // a host absent from known_hosts (accepted, or rejected under strict mode).
+    const known: Array<KnownHostEntry & { target: string }> = targets.flatMap((t) =>
+      readKnownHostsTarget(t[0]).map((e) => ({ ...e, target: t[0] })),
+    );
     if (known.length === 0) {
+      const fallback = targets.flatMap((t) => t.slice(1).flatMap(readKnownHostsTarget));
+      if (fallback.some((e) => e.key.equals(key))) return true;
       if (strict) {
         rejection.current = {
           reason: "unknown-host-strict",
-          message: `no known_hosts entry for ${label}, and strict mode (SSH_MCP_STRICT_HOSTKEYS=1) requires one. Add it: ssh-keyscan -H "${remediationHost}" >> ~/.ssh/known_hosts`,
+          message: `no known_hosts entry for ${label}, and strict mode (SSH_MCP_STRICT_HOSTKEYS=1) requires one. Add it: ${keyscan}`,
         };
       }
       return !strict;
@@ -418,16 +452,23 @@ function buildHostVerifier(
     // server happened to offer costs far more than this branch does.
     const offered = hostKeyBlobType(key);
     const knownTypes = [...new Set(known.map((e) => e.type))];
-    rejection.current =
-      offered && !knownTypes.includes(offered)
-        ? {
-            reason: "algorithm-not-in-known-hosts",
-            message: `the server offered a ${offered} host key, but known_hosts has only ${knownTypes.join(", ")} for ${label}. This is NOT a key mismatch -- there is no ${offered} entry to compare it against. Refresh the entry: ssh-keyscan -H "${remediationHost}" >> ~/.ssh/known_hosts`,
-          }
-        : {
-            reason: "key-mismatch",
-            message: `the server's ${offered ?? "offered"} host key does NOT match the known_hosts entry of the same type for ${label}. This can mean a man-in-the-middle attack, or that the host was legitimately rekeyed. Verify the fingerprint out of band before removing the old entry with: ssh-keygen -R "${remediationHost}"`,
-          };
+    if (offered && !knownTypes.includes(offered)) {
+      rejection.current = {
+        reason: "algorithm-not-in-known-hosts",
+        message: `the server offered a ${offered} host key, but known_hosts has only ${knownTypes.join(", ")} for ${label}. This is NOT a key mismatch -- there is no ${offered} entry to compare it against. Refresh the entry: ${keyscan}`,
+      };
+      return false;
+    }
+    // The `-R` target is the exact spelling the conflicting entry was found under
+    // (`[host]:port` for a non-22 port; bare otherwise, IPv6 included). The caller's
+    // port-less spelling would remove the port-22 line and leave the stale one.
+    const sameType = known.filter((e) => e.type === offered);
+    const removeTargets = [...new Set((sameType.length > 0 ? sameType : known).map((e) => e.target))];
+    const removal = removeTargets.map((t) => `ssh-keygen -R "${t}"`).join(" and ");
+    rejection.current = {
+      reason: "key-mismatch",
+      message: `the server's ${offered ?? "offered"} host key does NOT match the known_hosts entry of the same type for ${label}. This can mean a man-in-the-middle attack, or that the host was legitimately rekeyed. Verify the fingerprint out of band before removing the old entry with: ${removal}`,
+    };
     return false;
   };
 }
@@ -508,18 +549,19 @@ export function resolveConfig(config: SSHConfig): ResolvedConfig {
     verifierHosts.push(candidate);
   }
   const hostKeyRejection: { current: HostKeyRejection | null } = { current: null };
+  const dialHost = sshConfig?.hostname || config.host;
   // Username fallback chain: explicit > ssh_config User > $USER/$USERNAME > "root".
   // The trailing "root" is a last-ditch default for env-stripped contexts (containers
   // without USER/USERNAME and without ssh installed for `ssh -G` to provide a user).
   // In those cases the SSH server's "Permission denied" is the source of truth -- we
   // don't try to second-guess it client-side.
   const connectConfig: ConnectConfig = {
-    host: sshConfig?.hostname || config.host,
+    host: dialHost,
     port,
     username: config.username || sshConfig?.user || process.env.USER || process.env.USERNAME || "root",
     keepaliveInterval: 15_000,
     keepaliveCountMax: 3,
-    hostVerifier: buildHostVerifier(verifierHosts, port, hostKeyRejection),
+    hostVerifier: buildHostVerifier(verifierHosts, port, hostKeyRejection, { host: dialHost, port }),
   };
 
   // Prefer the host-key algorithms we already have a known_hosts entry for, the way
@@ -571,17 +613,12 @@ export function resolveConfig(config: SSHConfig): ResolvedConfig {
   // on that branch; see the comment there.
   const home = homedir();
   if (config.privateKeyPath) {
-    const keyPath = config.privateKeyPath.startsWith("~")
-      ? join(home, config.privateKeyPath.slice(1))
-      : config.privateKeyPath;
-    connectConfig.privateKey = readFileSync(keyPath);
+    connectConfig.privateKey = readFileSync(expandTilde(config.privateKeyPath, home));
   } else if (config.password) {
     connectConfig.password = config.password;
   } else {
     const agentSock =
-      config.agent ||
-      process.env.SSH_AUTH_SOCK ||
-      (process.platform === "win32" ? "\\\\.\\pipe\\openssh-ssh-agent" : undefined);
+      config.agent || process.env.SSH_AUTH_SOCK || (process.platform === "win32" ? WINDOWS_AGENT_PIPE : undefined);
     if (agentSock) {
       connectConfig.agent = agentSock;
     }
@@ -617,7 +654,7 @@ export function resolveConfig(config: SSHConfig): ResolvedConfig {
     // that survive these two filters.
     const keyPaths =
       sshConfig && sshConfig.identityFiles.length > 0
-        ? sshConfig.identityFiles.map((p) => (p.startsWith("~") ? join(home, p.slice(1)) : p))
+        ? sshConfig.identityFiles.map((p) => expandTilde(p, home))
         : [join(home, ".ssh", "id_ed25519"), join(home, ".ssh", "id_rsa"), join(home, ".ssh", "id_ecdsa")];
 
     for (const keyPath of keyPaths) {
@@ -666,14 +703,20 @@ function cachedKeysCheck(): DiagnosticResult {
   return result;
 }
 
-export function formatDiagnostics(host: string): string {
+/**
+ * `dial` is the RESOLVED hostname and port when the caller has them (enhanceSshError
+ * passes the ResolvedConfig's). It only steers the ssh-keyscan suggestion, which must
+ * name what ssh-keyscan can actually reach -- see keyscanCommand.
+ */
+export function formatDiagnostics(host: string, dial?: { host: string; port?: number }): string {
   // Run fast local checks only — skip connectivity re-test to avoid adding seconds of delay
   try {
     const checks = [
       { name: "SSH Agent", ...cachedAgentCheck() },
       { name: "SSH Keys", ...cachedKeysCheck() },
       { name: "SSH Config", ...checkSshConfig(host) },
-      { name: "Known Hosts", ...checkKnownHosts(host) },
+      // known_hosts records the RESOLVED name and port, not the ssh_config alias.
+      { name: "Known Hosts", ...checkKnownHosts(dial?.host ?? host, dial?.port ?? 22) },
     ];
 
     const parts: string[] = [];
@@ -686,14 +729,16 @@ export function formatDiagnostics(host: string): string {
     }
 
     const agent = checks[0];
-    if (agent.status === "error") suggestions.push('Start ssh-agent: eval "$(ssh-agent -s)"');
+    if (agent.status === "error") suggestions.push(agentStartSuggestion());
     if (agent.status === "warning") suggestions.push("Load a key: ssh-add ~/.ssh/id_ed25519");
 
     const keys = checks[1];
     if (keys.status === "error") suggestions.push('Generate a key: ssh-keygen -t ed25519 -C "your@email.com"');
 
     const known = checks[3];
-    if (known.status === "warning") suggestions.push(`Add host key: ssh-keyscan -H "${host}" >> ~/.ssh/known_hosts`);
+    if (known.status === "warning") {
+      suggestions.push(`Add host key: ${keyscanCommand(dial?.host ?? host, dial?.port)}`);
+    }
 
     if (suggestions.length > 0) {
       parts.push(`Suggested fixes: ${suggestions.join(" | ")}`);
@@ -825,7 +870,20 @@ export function formatJumpHop(hop: JumpHop): string {
   return hop.username ? `${hop.username}@${withPort}` : withPort;
 }
 
-export async function connectWithProxy(resolved: ResolvedConfig): Promise<Client> {
+/** Hard cap on ProxyJump nesting, a backstop behind the visited-set loop check. */
+export const MAX_PROXY_JUMP_DEPTH = 8;
+
+/**
+ * `visited` is internal recursion state: the `host:port` of every hop already on
+ * this chain, target included. `ssh -G` catches a self-referential ProxyJump
+ * ("jumphost loop via bastion") but not a cycle of two or more hosts (`Host a`
+ * ProxyJump b / `Host b` ProxyJump a), which used to recurse until "Maximum call
+ * stack size exceeded" -- synchronously, before the first await.
+ */
+export async function connectWithProxy(
+  resolved: ResolvedConfig,
+  visited: ReadonlySet<string> = new Set(),
+): Promise<Client> {
   // This is the dial path -- the only place `connectConfig.algorithms` is ever read --
   // so materialize the host-key preference order now. Deliberately not done in
   // resolveConfig: see the comment on the thunk there.
@@ -835,6 +893,8 @@ export async function connectWithProxy(resolved: ResolvedConfig): Promise<Client
   if (hops.length === 0) {
     return connectRaw(resolved.connectConfig);
   }
+  const chain = new Set(visited);
+  chain.add(`${resolved.connectConfig.host}:${resolved.connectConfig.port ?? 22}`);
 
   // OpenSSH visits a ProxyJump list left to right, so the LAST hop is the one
   // adjacent to the target -- it is the client that opens the forwarded channel
@@ -851,9 +911,18 @@ export async function connectWithProxy(resolved: ResolvedConfig): Promise<Client
   if (hops.length > 1) {
     jumpResolved.proxyJump = hops.slice(0, -1).map(formatJumpHop).join(",");
   }
+  const jumpKey = `${jumpResolved.connectConfig.host}:${jumpResolved.connectConfig.port ?? 22}`;
+  if (chain.has(jumpKey)) {
+    throw new Error(`ProxyJump loop via ${jumpLabel}: it is already on this connection's jump chain`);
+  }
+  // `chain` holds the target PLUS every hop so far, so it is one larger than the hop
+  // count: `>` lets exactly MAX_PROXY_JUMP_DEPTH hops through and refuses the next.
+  if (chain.size > MAX_PROXY_JUMP_DEPTH) {
+    throw new Error(`ProxyJump chain via ${jumpLabel} exceeds ${MAX_PROXY_JUMP_DEPTH} hops`);
+  }
   let jumpClient: Client;
   try {
-    jumpClient = await connectWithProxy(jumpResolved); // recursive for chained proxies
+    jumpClient = await connectWithProxy(jumpResolved, chain); // recursive for chained proxies
   } catch (err: unknown) {
     // A host-key rejection on the BASTION lands in jumpResolved's own side channel,
     // which nobody upstream ever looks at: connect() and ConnectionPool.acquire hand
@@ -930,7 +999,11 @@ export function enhanceSshError(err: unknown, host: string, resolved?: ResolvedC
   const rejection = resolved?.hostKeyRejection?.current;
   if (rejection) extra.push(`Host key check failed -- ${rejection.message}`);
 
-  const diag = formatDiagnostics(host);
+  const dialHost = resolved?.connectConfig.host;
+  const diag = formatDiagnostics(
+    host,
+    dialHost ? { host: dialHost, port: resolved?.connectConfig.port as number | undefined } : undefined,
+  );
   if (diag) extra.push(`SSH Diagnostics:\n${diag}`);
 
   if (extra.length === 0) return err;
@@ -1013,53 +1086,34 @@ export function exec(
       settle(() => reject(new Error(`Command timed out after ${timeoutMs}ms`)));
     }, timeoutMs);
 
-    client.exec(command, (err, stream) => {
+    // ssh2's Client.exec THROWS synchronously ("Not connected") on a client whose
+    // socket died while the caller held it. Without this catch the promise still
+    // rejected (the executor throwing), but the timer above was never cleared and
+    // held the event loop for the full timeoutMs.
+    try {
+      client.exec(command, onExec);
+    } catch (err: unknown) {
+      settle(() => reject(err));
+    }
+
+    function onExec(err: Error | undefined, stream: ClientChannel): void {
       if (err) {
         settle(() => reject(err));
         return;
       }
       activeStream = stream;
 
-      const stdoutChunks: Buffer[] = [];
-      const stderrChunks: Buffer[] = [];
-      let stdoutBytes = 0;
-      let stderrBytes = 0;
-      let stdoutTruncated = false;
-      let stderrTruncated = false;
-
-      const appendStdout = (data: Buffer) => {
-        if (stdoutTruncated) return;
-        const remaining = maxBytes - stdoutBytes;
-        if (data.length <= remaining) {
-          stdoutChunks.push(data);
-          stdoutBytes += data.length;
-        } else {
-          if (remaining > 0) {
-            stdoutChunks.push(data.subarray(0, remaining));
-            stdoutBytes += remaining;
-          }
-          stdoutTruncated = true;
-        }
-      };
-      const appendStderr = (data: Buffer) => {
-        if (stderrTruncated) return;
-        const remaining = maxBytes - stderrBytes;
-        if (data.length <= remaining) {
-          stderrChunks.push(data);
-          stderrBytes += data.length;
-        } else {
-          if (remaining > 0) {
-            stderrChunks.push(data.subarray(0, remaining));
-            stderrBytes += remaining;
-          }
-          stderrTruncated = true;
-        }
-      };
+      const out = cappedCapture(maxBytes);
+      const errOut = cappedCapture(maxBytes);
+      const appendStdout = out.append;
+      const appendStderr = errOut.append;
 
       stream
         .on("close", (code: number | null, signal?: string) => {
-          let stdout = Buffer.concat(stdoutChunks).toString("utf8");
-          let stderr = Buffer.concat(stderrChunks).toString("utf8");
+          const stdoutTruncated = out.truncated();
+          const stderrTruncated = errOut.truncated();
+          let stdout = out.text();
+          let stderr = errOut.text();
           if (stdoutTruncated) stdout += `\n[output truncated at ${maxBytes} bytes]`;
           if (stderrTruncated) stderr += `\n[stderr truncated at ${maxBytes} bytes]`;
           // ssh2 emits close(code, signal). When the remote channel closes signal-only
@@ -1085,10 +1139,8 @@ export function exec(
       releaseCapture = () => {
         stream.removeListener("data", appendStdout);
         stream.stderr.removeListener("data", appendStderr);
-        stdoutChunks.length = 0;
-        stderrChunks.length = 0;
-        stdoutBytes = 0;
-        stderrBytes = 0;
+        out.clear();
+        errOut.clear();
       };
 
       // The timer can fire BEFORE client.exec() calls back, in which case
@@ -1099,8 +1151,40 @@ export function exec(
         releaseCapture();
         teardownStream(stream);
       }
-    });
+    }
   });
+}
+
+/**
+ * One output stream's capture, capped at `maxBytes`: data past the cap is dropped
+ * and `truncated()` turns true. stdout and stderr each get their own.
+ */
+function cappedCapture(maxBytes: number) {
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  let truncated = false;
+  return {
+    append(data: Buffer): void {
+      if (truncated) return;
+      const remaining = maxBytes - bytes;
+      if (data.length <= remaining) {
+        chunks.push(data);
+        bytes += data.length;
+        return;
+      }
+      if (remaining > 0) {
+        chunks.push(data.subarray(0, remaining));
+        bytes += remaining;
+      }
+      truncated = true;
+    },
+    text: (): string => Buffer.concat(chunks).toString("utf8"),
+    truncated: (): boolean => truncated,
+    clear(): void {
+      chunks.length = 0;
+      bytes = 0;
+    },
+  };
 }
 
 function getSftp(client: Client): Promise<SFTPWrapper> {
@@ -1112,31 +1196,142 @@ function getSftp(client: Client): Promise<SFTPWrapper> {
   });
 }
 
-export const DEFAULT_MAX_READ_BYTES = 10 * 1024 * 1024; // 10 MB
+/**
+ * Per-call deadline for the SFTP helpers. The connection has keepalives and nothing
+ * else: ssh2's readyTimeout bounds only the handshake, so a sftp subsystem that
+ * stalls while sshd keeps answering keepalives (a hung NFS mount, a FIFO) used to
+ * hold the call -- and its pool slot -- forever. Generous on purpose: this exists to
+ * end a hang, not to race a slow-but-working server.
+ */
+export const DEFAULT_SFTP_TIMEOUT_MS = 120_000;
+/** The same deadline for whole-file transfers (fastPut / fastGet), which legitimately run long. */
+export const DEFAULT_SFTP_TRANSFER_TIMEOUT_MS = 600_000;
 
-export async function readFile(client: Client, remotePath: string, maxBytes = DEFAULT_MAX_READ_BYTES): Promise<string> {
-  const sftp = await getSftp(client);
-  try {
-    const stats = await new Promise<{ size: number }>((resolve, reject) => {
-      sftp.stat(remotePath, (err, stats) => {
-        if (err) return reject(err);
-        resolve(stats);
-      });
+/**
+ * Open an SFTP session, run `fn` on it, and always end the session -- on success,
+ * on failure, and on timeout. When `timeoutMs` elapses first the session is ended
+ * (which aborts whatever is in flight on it) and the call rejects; a late result
+ * from `fn` is ignored.
+ */
+function withSftp<T>(
+  client: Client,
+  what: string,
+  timeoutMs: number,
+  fn: (sftp: SFTPWrapper) => Promise<T>,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    let sftp: SFTPWrapper | null = null;
+    let ended = false;
+    const end = () => {
+      if (!sftp || ended) return;
+      ended = true;
+      try {
+        sftp.end();
+      } catch {
+        // already closed
+      }
+    };
+    const finish = (complete: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      end();
+      complete();
+    };
+    const timer = setTimeout(
+      () => finish(() => reject(new Error(`SFTP ${what} timed out after ${timeoutMs}ms`))),
+      timeoutMs,
+    );
+    getSftp(client).then(
+      (s) => {
+        sftp = s;
+        // The deadline passed while the subsystem was still opening: close it now.
+        if (settled) return end();
+        fn(s).then(
+          (value) => finish(() => resolve(value)),
+          (err: unknown) => finish(() => reject(err)),
+        );
+      },
+      (err: unknown) => finish(() => reject(err)),
+    );
+  });
+}
+
+function sftpStat(sftp: SFTPWrapper, remotePath: string): Promise<Stats> {
+  return new Promise((resolve, reject) => {
+    sftp.stat(remotePath, (err, st) => (err ? reject(err) : resolve(st)));
+  });
+}
+
+function sftpOpenRead(sftp: SFTPWrapper, remotePath: string): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    sftp.open(remotePath, "r", (err, h) => (err ? reject(err) : resolve(h)));
+  });
+}
+
+/** One SFTP READ. Resolves 0 at end of file. */
+function sftpRead(
+  sftp: SFTPWrapper,
+  handle: Buffer,
+  buf: Buffer,
+  off: number,
+  len: number,
+  pos: number,
+): Promise<number> {
+  return new Promise((resolve, reject) => {
+    sftp.read(handle, buf, off, len, pos, (err, bytesRead) => {
+      if (err) return reject(err);
+      // ssh2 swallows an SFTP EOF status on read and calls back with no count.
+      resolve(bytesRead ?? 0);
     });
+  });
+}
+
+export const DEFAULT_MAX_READ_BYTES = 10 * 1024 * 1024; // 10 MB
+const READ_CHUNK_BYTES = 256 * 1024;
+
+const mb = (bytes: number, digits: number) => (bytes / 1024 / 1024).toFixed(digits);
+
+export async function readFile(
+  client: Client,
+  remotePath: string,
+  maxBytes = DEFAULT_MAX_READ_BYTES,
+  timeoutMs = DEFAULT_SFTP_TIMEOUT_MS,
+): Promise<string> {
+  return withSftp(client, `read of ${remotePath}`, timeoutMs, async (sftp) => {
+    const stats = await sftpStat(sftp, remotePath);
+    // Cheap early refusal for a file that SAYS it is too big -- no bytes move.
     if (stats.size > maxBytes) {
       throw new Error(
-        `File is ${(stats.size / 1024 / 1024).toFixed(1)} MB, exceeds ${(maxBytes / 1024 / 1024).toFixed(0)} MB limit. Read it a page at a time with ssh_read_file's offset and length arguments (byte offsets; the file is ${stats.size} bytes).`,
+        `File is ${mb(stats.size, 1)} MB, exceeds ${mb(maxBytes, 0)} MB limit. Read it a page at a time with ssh_read_file's offset and length arguments (byte offsets; the file is ${stats.size} bytes).`,
       );
     }
-    return await new Promise((resolve, reject) => {
-      sftp.readFile(remotePath, (err, data) => {
-        if (err) return reject(err);
-        resolve(data.toString("utf8"));
-      });
-    });
-  } finally {
-    sftp.end();
-  }
+    // ...but stat.size is not a bound. /dev/zero, /dev/urandom, a FIFO or a /proc
+    // file report size 0, and ssh2's own readFile reads a size-0 file until EOF with
+    // no limit, growing this process's memory without end. So read through our own
+    // loop and stop one byte past the cap: reaching it proves the file is too big.
+    const handle = await sftpOpenRead(sftp, remotePath);
+    try {
+      const chunks: Buffer[] = [];
+      let got = 0;
+      while (got <= maxBytes) {
+        const buf = Buffer.alloc(Math.min(READ_CHUNK_BYTES, maxBytes + 1 - got));
+        const n = await sftpRead(sftp, handle, buf, 0, buf.length, got);
+        if (n === 0) break;
+        chunks.push(n === buf.length ? buf : buf.subarray(0, n));
+        got += n;
+      }
+      if (got > maxBytes) {
+        throw new Error(
+          `File exceeds the ${mb(maxBytes, 0)} MB limit: more than ${maxBytes} bytes were read although it reported a size of ${stats.size} bytes (a special file such as a device or FIFO, or one still growing). Read it a page at a time with ssh_read_file's offset and length arguments.`,
+        );
+      }
+      return Buffer.concat(chunks, got).toString("utf8");
+    } finally {
+      sftp.close(handle, () => {});
+    }
+  });
 }
 
 /** One page of a remote file, plus where it sits in the whole. */
@@ -1165,44 +1360,30 @@ export async function readFileRange(
   offset: number,
   length: number,
   maxBytes = DEFAULT_MAX_READ_BYTES,
+  timeoutMs = DEFAULT_SFTP_TIMEOUT_MS,
 ): Promise<FileRange> {
   if (!Number.isSafeInteger(offset) || offset < 0)
     throw new Error(`offset must be a non-negative integer, got ${offset}`);
   if (!Number.isSafeInteger(length) || length <= 0) throw new Error(`length must be a positive integer, got ${length}`);
   if (length > maxBytes) {
     throw new Error(
-      `length ${length} exceeds the ${(maxBytes / 1024 / 1024).toFixed(0)} MB limit for one read. Use a smaller length and page with offset.`,
+      `length ${length} exceeds the ${mb(maxBytes, 0)} MB limit for one read. Use a smaller length and page with offset.`,
     );
   }
-  const sftp = await getSftp(client);
-  try {
-    const stats = await new Promise<{ size: number }>((resolve, reject) => {
-      sftp.stat(remotePath, (err, st) => {
-        if (err) return reject(err);
-        resolve(st);
-      });
-    });
-    const want = Math.max(0, Math.min(length, stats.size - offset));
+  return withSftp(client, `read of ${remotePath}`, timeoutMs, async (sftp) => {
+    const stats = await sftpStat(sftp, remotePath);
+    // A size of 0 is not "empty" for a /proc file or a device -- it is "unknown" --
+    // so do not clamp the page to it; the read loop below stops at EOF either way.
+    const want = stats.size === 0 ? length : Math.max(0, Math.min(length, stats.size - offset));
     if (want === 0) return { text: "", offset, bytesRead: 0, size: stats.size };
-    const handle = await new Promise<Buffer>((resolve, reject) => {
-      sftp.open(remotePath, "r", (err, h) => {
-        if (err) return reject(err);
-        resolve(h);
-      });
-    });
+    const handle = await sftpOpenRead(sftp, remotePath);
     try {
       const buf = Buffer.alloc(want);
       let got = 0;
       // A single SFTP READ may return fewer bytes than asked (servers cap a packet,
       // commonly at 32-256 KB), so loop until the page is full or the file ends.
       while (got < want) {
-        const n = await new Promise<number>((resolve, reject) => {
-          sftp.read(handle, buf, got, want - got, offset + got, (err, bytesRead) => {
-            if (err) return reject(err);
-            // ssh2 swallows an SFTP EOF status on read and calls back with no count.
-            resolve(bytesRead ?? 0);
-          });
-        });
+        const n = await sftpRead(sftp, handle, buf, got, want - got, offset + got);
         if (n === 0) break;
         got += n;
       }
@@ -1210,67 +1391,76 @@ export async function readFileRange(
     } finally {
       sftp.close(handle, () => {});
     }
-  } finally {
-    sftp.end();
-  }
+  });
 }
 
-export async function writeFile(client: Client, remotePath: string, content: string): Promise<void> {
-  const sftp = await getSftp(client);
-  try {
-    await new Promise<void>((resolve, reject) => {
-      sftp.writeFile(remotePath, content, (err) => {
-        if (err) return reject(err);
-        resolve();
-      });
-    });
-  } finally {
-    sftp.end();
-  }
+export async function writeFile(
+  client: Client,
+  remotePath: string,
+  content: string,
+  timeoutMs = DEFAULT_SFTP_TIMEOUT_MS,
+): Promise<void> {
+  return withSftp(
+    client,
+    `write of ${remotePath}`,
+    timeoutMs,
+    (sftp) =>
+      new Promise<void>((resolve, reject) => {
+        sftp.writeFile(remotePath, content, (err) => (err ? reject(err) : resolve()));
+      }),
+  );
 }
 
-export async function uploadFile(client: Client, localPath: string, remotePath: string): Promise<void> {
-  const resolvedLocal = localPath.startsWith("~") ? join(homedir(), localPath.slice(1)) : localPath;
-  const sftp = await getSftp(client);
-  try {
-    await new Promise<void>((resolve, reject) => {
-      sftp.fastPut(resolvedLocal, remotePath, (err) => {
-        if (err) return reject(err);
-        resolve();
-      });
-    });
-  } finally {
-    sftp.end();
-  }
+export async function uploadFile(
+  client: Client,
+  localPath: string,
+  remotePath: string,
+  timeoutMs = DEFAULT_SFTP_TRANSFER_TIMEOUT_MS,
+): Promise<void> {
+  const resolvedLocal = expandTilde(localPath);
+  return withSftp(
+    client,
+    `upload to ${remotePath}`,
+    timeoutMs,
+    (sftp) =>
+      new Promise<void>((resolve, reject) => {
+        sftp.fastPut(resolvedLocal, remotePath, (err) => (err ? reject(err) : resolve()));
+      }),
+  );
 }
 
-export async function downloadFile(client: Client, remotePath: string, localPath: string): Promise<void> {
-  const resolvedLocal = localPath.startsWith("~") ? join(homedir(), localPath.slice(1)) : localPath;
-  const sftp = await getSftp(client);
-  try {
-    await new Promise<void>((resolve, reject) => {
-      sftp.fastGet(remotePath, resolvedLocal, (err) => {
-        if (err) return reject(err);
-        resolve();
-      });
-    });
-  } finally {
-    sftp.end();
-  }
+export async function downloadFile(
+  client: Client,
+  remotePath: string,
+  localPath: string,
+  timeoutMs = DEFAULT_SFTP_TRANSFER_TIMEOUT_MS,
+): Promise<void> {
+  const resolvedLocal = expandTilde(localPath);
+  return withSftp(
+    client,
+    `download of ${remotePath}`,
+    timeoutMs,
+    (sftp) =>
+      new Promise<void>((resolve, reject) => {
+        sftp.fastGet(remotePath, resolvedLocal, (err) => (err ? reject(err) : resolve()));
+      }),
+  );
 }
 
-export async function listDir(client: Client, remotePath: string): Promise<string[]> {
-  const sftp = await getSftp(client);
-  try {
-    return await new Promise((resolve, reject) => {
-      sftp.readdir(remotePath, (err, list) => {
-        if (err) return reject(err);
-        resolve(list.map((item) => item.filename));
-      });
-    });
-  } finally {
-    sftp.end();
-  }
+export async function listDir(
+  client: Client,
+  remotePath: string,
+  timeoutMs = DEFAULT_SFTP_TIMEOUT_MS,
+): Promise<string[]> {
+  return withSftp(
+    client,
+    `listing of ${remotePath}`,
+    timeoutMs,
+    (sftp) =>
+      new Promise<string[]>((resolve, reject) => {
+        sftp.readdir(remotePath, (err, list) => (err ? reject(err) : resolve(list.map((item) => item.filename))));
+      }),
+  );
 }
 
 export interface FileStats {
@@ -1288,7 +1478,22 @@ export interface FileStats {
   isFile: boolean;
   isDirectory: boolean;
   isSymbolicLink: boolean;
+  /**
+   * Set only when isSymbolicLink is true. `false` means the link's target could not be
+   * resolved (dangling, or a loop): the metadata above is then the LINK's own, and
+   * isFile/isDirectory are both false. Absent for a non-symlink.
+   */
+  targetResolved?: boolean;
 }
+
+// SFTP status codes (draft-ietf-secsh-filexfer-02), as ssh2 sets them on `err.code`.
+// OpenSSH's sftp-server maps ENOENT to NO_SUCH_FILE and errnos it has no code for --
+// ELOOP among them -- to FAILURE.
+const SFTP_NO_SUCH_FILE = 2;
+const SFTP_FAILURE = 4;
+// The status-less error ssh2's SFTP cleanupRequests() hands every pending callback when
+// the channel goes away (node_modules/ssh2/lib/protocol/SFTP.js).
+const SSH2_SFTP_CHANNEL_LOST = "No response from server";
 
 /**
  * Two calls, deliberately, because one cannot answer both questions.
@@ -1303,52 +1508,69 @@ export interface FileStats {
  * SIZE and the rest come from `stat`, the TARGET's metadata, because "how big is
  * this" means the target -- a symlink's own size is the length of its path string,
  * which is never the answer anyone wants. When the target cannot be resolved (a
- * dangling link) we fall back to the link's own stats and still report it, rather
- * than failing the call the way `stat` alone did.
+ * dangling link, or a loop) we fall back to the link's own stats, mark the result
+ * `targetResolved: false` so the caller knows the metadata is the link's, and still
+ * report it rather than failing the call the way `stat` alone did. Only those two
+ * outcomes fall back: any other SFTP status on the target -- PERMISSION_DENIED above
+ * all -- and ssh2's status-less lost-channel error are rethrown, because "the target
+ * is unreadable" (or "never checked") is not "the target is missing" and used to
+ * render identically.
  *
  * For a non-symlink the two calls agree by definition, so nothing changes there.
  */
-export async function statFile(client: Client, remotePath: string): Promise<FileStats> {
-  const sftp = await getSftp(client);
+export function statFile(client: Client, remotePath: string, timeoutMs = DEFAULT_SFTP_TIMEOUT_MS): Promise<FileStats> {
+  return withSftp(client, `stat of ${remotePath}`, timeoutMs, (sftp) => statOn(sftp, remotePath));
+}
+
+async function statOn(sftp: SFTPWrapper, remotePath: string): Promise<FileStats> {
   const call = (fn: "lstat" | "stat") =>
     new Promise<Stats>((resolve, reject) => {
       sftp[fn](remotePath, (err, stats) => (err ? reject(err) : resolve(stats)));
     });
-  try {
-    // lstat first: it succeeds for anything that exists, link or not. If this fails
-    // the path is genuinely absent, which is the same rejection as before.
-    const link = await call("lstat");
-    const isSymbolicLink = link.isSymbolicLink();
-    // Only pay the second round-trip when it can differ.
-    let meta = link;
-    if (isSymbolicLink) {
-      try {
-        meta = await call("stat");
-      } catch {
-        // Dangling symlink -- keep the link's own stats and report it as a symlink
-        // rather than rejecting, which is strictly more useful to an operator.
-      }
+  // lstat first: it succeeds for anything that exists, link or not. If this fails
+  // the path is genuinely absent, which is the same rejection as before.
+  const link = await call("lstat");
+  const isSymbolicLink = link.isSymbolicLink();
+  // Only pay the second round-trip when it can differ.
+  let meta = link;
+  let targetResolved: boolean | undefined;
+  if (isSymbolicLink) {
+    try {
+      meta = await call("stat");
+      targetResolved = true;
+    } catch (err) {
+      // Dangling (NO_SUCH_FILE) or looping (FAILURE) symlink -- keep the link's own
+      // stats and report it as an unresolved symlink rather than rejecting. Any other
+      // SFTP status (PERMISSION_DENIED above all) is a real failure and propagates. A
+      // lost connection carries NO status: ssh2 fails every pending request with a bare
+      // "No response from server" when the channel closes, so that one is matched by
+      // message and rethrown too -- rendering it as "dangling" would report a missing
+      // target that was never checked. Any other status-less error keeps the fallback.
+      const code = (err as { code?: unknown }).code;
+      if (typeof code === "number" && code !== SFTP_NO_SUCH_FILE && code !== SFTP_FAILURE) throw err;
+      if (code === undefined && err instanceof Error && err.message === SSH2_SFTP_CHANNEL_LOST) throw err;
+      targetResolved = false;
     }
-    // ssh2 exposes the type checks as methods, not boolean fields -- materialize them
-    // up front so the result is a plain JSON-safe object the MCP layer can serialize.
-    return {
-      size: meta.size,
-      mode: meta.mode,
-      modeOctal: (meta.mode & 0o7777).toString(8).padStart(4, "0"),
-      uid: meta.uid,
-      gid: meta.gid,
-      mtime: meta.mtime,
-      atime: meta.atime,
-      // isFile / isDirectory describe the TARGET (they pair with the metadata above);
-      // isSymbolicLink describes the PATH. A symlink to a directory is therefore both
-      // a directory and a symlink, and the caller decides which matters.
-      isFile: meta.isFile(),
-      isDirectory: meta.isDirectory(),
-      isSymbolicLink,
-    };
-  } finally {
-    sftp.end();
   }
+  // ssh2 exposes the type checks as methods, not boolean fields -- materialize them
+  // up front so the result is a plain JSON-safe object the MCP layer can serialize.
+  return {
+    size: meta.size,
+    mode: meta.mode,
+    modeOctal: (meta.mode & 0o7777).toString(8).padStart(4, "0"),
+    uid: meta.uid,
+    gid: meta.gid,
+    mtime: meta.mtime,
+    atime: meta.atime,
+    // isFile / isDirectory describe the TARGET (they pair with the metadata above);
+    // isSymbolicLink describes the PATH. A symlink to a directory is therefore both
+    // a directory and a symlink, and the caller decides which matters.
+    isFile: meta.isFile(),
+    isDirectory: meta.isDirectory(),
+    isSymbolicLink,
+    // Only on a symlink, so a plain path's result shape is unchanged.
+    ...(targetResolved === undefined ? {} : { targetResolved }),
+  };
 }
 
 // Single-shot path removal. Stats first to dispatch to unlink (files / symlinks) vs rmdir
@@ -1366,9 +1588,12 @@ export async function statFile(client: Client, remotePath: string): Promise<File
 // Recursive delete is intentionally NOT supported here. Agents that want it should call
 // `ssh_exec rm -rf <path>` explicitly so the destructive intent is visible in the tool
 // trace, not hidden behind a flag on a "delete" tool.
-export async function deleteFile(client: Client, remotePath: string): Promise<void> {
-  const sftp = await getSftp(client);
-  try {
+export async function deleteFile(
+  client: Client,
+  remotePath: string,
+  timeoutMs = DEFAULT_SFTP_TIMEOUT_MS,
+): Promise<void> {
+  return withSftp(client, `delete of ${remotePath}`, timeoutMs, async (sftp) => {
     const stats = await new Promise<{ isDirectory: () => boolean }>((resolve, reject) => {
       sftp.lstat(remotePath, (err, stats) => {
         if (err) return reject(err);
@@ -1383,52 +1608,60 @@ export async function deleteFile(client: Client, remotePath: string): Promise<vo
         sftp.unlink(remotePath, done);
       }
     });
-  } finally {
-    sftp.end();
-  }
+  });
 }
 
 // Create a directory via SFTP. With recursive=true, walks the path and creates each
-// missing segment in order -- SFTP has no native `mkdir -p` equivalent. Existing
-// intermediate dirs are tolerated; existing leaf is still an error (matches mkdir -p
-// semantics for the deepest segment).
-export async function makeDir(client: Client, remotePath: string, recursive = false): Promise<void> {
-  const sftp = await getSftp(client);
-  try {
-    const mkOne = (path: string) =>
-      new Promise<void>((resolve, reject) => {
-        sftp.mkdir(path, (err) => (err ? reject(err) : resolve()));
-      });
+// missing segment in order -- SFTP has no native `mkdir -p` equivalent -- with
+// `mkdir -p` semantics: a segment that already exists AS A DIRECTORY (the leaf
+// included) is fine, so the call is idempotent. Any other failure is surfaced with
+// its own error. Non-recursive mode is plain `mkdir`: an existing path errors.
+export async function makeDir(
+  client: Client,
+  remotePath: string,
+  recursive = false,
+  timeoutMs = DEFAULT_SFTP_TIMEOUT_MS,
+): Promise<void> {
+  return withSftp(client, `mkdir of ${remotePath}`, timeoutMs, (sftp) => makeDirOn(sftp, remotePath, recursive));
+}
 
-    if (!recursive) {
-      await mkOne(remotePath);
-      return;
-    }
+async function makeDirOn(sftp: SFTPWrapper, remotePath: string, recursive: boolean): Promise<void> {
+  const mkOne = (path: string) =>
+    new Promise<void>((resolve, reject) => {
+      sftp.mkdir(path, (err) => (err ? reject(err) : resolve()));
+    });
+  // `stat`, not `lstat`: like `mkdir -p`, a symlink to a directory (e.g. a /home
+  // that links to /usr/home) counts as an existing directory to walk through.
+  const isDirectory = (path: string) =>
+    new Promise<boolean>((resolve) => {
+      sftp.stat(path, (err, st) => resolve(!err && st.isDirectory()));
+    });
 
-    // Normalize and walk segments. POSIX absolute paths start with /, agents may also pass
-    // home-relative paths -- we don't expand ~ here; ssh_exec'd shell handles that.
-    //
-    // The seed carries the absolute/relative distinction on its own: "" grows to "/a",
-    // "/a/b"; "." grows to "./a", "./a/b". The per-iteration append is therefore the same
-    // expression either way (it used to be a ternary with two byte-identical branches).
-    const parts = remotePath.split("/").filter(Boolean);
-    let cur = remotePath.startsWith("/") ? "" : ".";
-    for (let i = 0; i < parts.length; i++) {
-      cur = `${cur}/${parts[i]}`;
-      const isLeaf = i === parts.length - 1;
-      try {
-        await mkOne(cur);
-      } catch (e: unknown) {
-        // SFTP returns a generic "Failure" string when a dir already exists. Tolerate it
-        // for intermediate segments; surface it for the leaf so `mkdir -p` on an existing
-        // leaf still errors (matches POSIX `mkdir -p` -- which doesn't error -- only if
-        // the leaf is also a dir; on file collision it does. We can't distinguish cheaply
-        // without re-stating, so we err on the side of surfacing it).
-        if (isLeaf) throw e;
-        // Intermediate segment -- swallow and continue.
-      }
+  if (!recursive) {
+    await mkOne(remotePath);
+    return;
+  }
+
+  // Normalize and walk segments. POSIX absolute paths start with /, agents may also pass
+  // home-relative paths -- we don't expand ~ here; ssh_exec'd shell handles that.
+  //
+  // The seed carries the absolute/relative distinction on its own: "" grows to "/a",
+  // "/a/b"; "." grows to "./a", "./a/b". The per-iteration append is therefore the same
+  // expression either way (it used to be a ternary with two byte-identical branches).
+  const parts = remotePath.split("/").filter(Boolean);
+  let cur = remotePath.startsWith("/") ? "" : ".";
+  for (const part of parts) {
+    cur = `${cur}/${part}`;
+    try {
+      await mkOne(cur);
+    } catch (e: unknown) {
+      // SFTP answers an existing directory with the same generic "Failure" it uses
+      // for much else, so the error alone cannot tell "already there" from a real
+      // problem. Ask: a directory already at this path is exactly what we wanted.
+      // Anything else -- a FILE in the way, or a permission denial on a segment
+      // that does not exist -- rethrows THIS segment's error, rather than being
+      // swallowed and resurfacing as a misleading "No such file" on the leaf.
+      if (!(await isDirectory(cur))) throw e;
     }
-  } finally {
-    sftp.end();
   }
 }

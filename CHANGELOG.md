@@ -15,6 +15,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **`ssh_test` and `ssh_diagnose` no longer write `known_hosts`.** Their probe ran `ssh` with `StrictHostKeyChecking=no` and the default files, so OpenSSH "Permanently added" an unknown host's key: one diagnostic against an unverified (possibly intercepted) host pinned that key, after which the connection path trusted it -- and it silently satisfied `SSH_MCP_STRICT_HOSTKEYS`. The probe now uses `StrictHostKeyChecking=accept-new` with the null device first in `UserKnownHostsFile`, so a new key is accepted but never stored. `ssh_known_hosts_fix` is again the only tool that writes the file.
+- **A changed host key is now reported by `ssh_test` / `ssh_diagnose`.** The old `StrictHostKeyChecking=no` tolerated a mismatching key and went on to authenticate, so a changed key read as `Permission denied` or even as reachable; the probe now fails with "Host key verification failed".
+- **`ssh_known_hosts_fix` scans before it removes.** It used to delete the old key first, so a failed scan (host briefly unreachable, a DNS blip, no `ssh-keyscan`) returned an error with the entry already gone -- and a host that had mismatch protection silently lost it. `known_hosts` is now left unchanged unless a replacement key is in hand.
+- **The pool key now includes the ProxyJump chain.** Two aliases that resolve to the same host and user through different bastions could share one pooled connection, so a call meant for one jump path ran over the other.
+- **ProxyJump loops are detected.** A cycle through two or more hosts (`Host a` jumping via `b`, `b` via `a`) is refused with "ProxyJump loop via ..." instead of recursing; a hard nesting cap backs the check.
+
+### Changed
+- **On a port other than 22, only `[host]:port` known_hosts entries can reject a key.** The bare-host entry is still consulted, as OpenSSH does, but only to accept a key that matches it: a second sshd on `host:2222` with no `[host]:2222` line used to be rejected as a key mismatch because of the port-22 entry; it is now an unknown host (accepted, or refused under strict mode). Pin it with a port-qualified entry.
+- **SFTP operations have a per-operation timeout.** ssh2's `readyTimeout` bounds only the handshake, so a subsystem that never answered hung the tool call; most operations now give up after 120 s, and `ssh_upload` / `ssh_download` after 600 s, with "SFTP <operation> timed out".
+- **`ssh_read_file`'s 10 MB cap is enforced while reading,** not after, so a file that grows or reports size 0 stops one byte past the cap instead of being read whole.
+- **`npm run test:integration` exits with the suite's status** (it reported `docker compose down`'s, so a failing suite exited 0) and runs under npm's default Windows shell. `npm run lint` now covers `bin/` and `scripts/` too.
+
+### Fixed
+- **A stale `SSH_AUTH_SOCK` on Windows no longer hides the OpenSSH agent pipe.** A leftover Unix-style socket path made the agent probe report "not running" without ever trying `\\.\pipe\openssh-ssh-agent`; the pipe is now tried whenever the `SSH_AUTH_SOCK` path does not yield a reachable agent.
+- **`ssh -G` failures are no longer cached.** One transient failure (the 10 s timeout, a slow `Match exec`) used to drop that host's `HostName`, `User`, `Port`, `IdentityFile` and `ProxyJump` until restart. Successful lookups are still memoized for the life of the process, so edits to `~/.ssh/config` need a server restart (README, SSH config support).
+- **The release gate no longer passes silently from a linked checkout.** `scripts/check-compliance.mjs` skipped its check and exited 0 when run through a junction or symlink; all release scripts now share one main-module guard.
+- The launcher's stderr diagnostic for a server that fails to load reads `could not load the server (...)` instead of `fallback to Node failed (...)`, which was also printed when an oam host was serving itself.
+
 ## [0.19.0] — 2026-11-21
 
 ### Security

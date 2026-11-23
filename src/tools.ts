@@ -99,12 +99,22 @@ const SFTP_POOL_WAIT_NOTE = ` If the connection pool is full (SSH_MCP_MAX_POOL_S
 //
 // READ_ONLY_LOCAL: reads local state only, never the network.
 // READ_ONLY_REMOTE: reads (or, for ssh_diagnose, probes) a remote host, changes nothing.
-// DESTRUCTIVE_REMOTE: can overwrite or remove remote data.
+// DESTRUCTIVE_REMOTE: can overwrite or remove remote data (ssh_write_file, ssh_upload,
+//   ssh_delete).
+// DESTRUCTIVE_LOCAL: talks to a remote host and can overwrite a LOCAL file (ssh_download).
+//   Same hint values as DESTRUCTIVE_REMOTE -- the MCP hints cannot say which side is
+//   overwritten -- kept as its own name so the taxonomy says what the tool does.
+// ADDITIVE_REMOTE: changes the remote but only adds to it, never overwrites or removes
+//   (ssh_mkdir: an existing leaf is an error without `recursive` and left untouched with
+//   it -- never replaced).
 // ssh_agent_ensure, ssh_key_load and ssh_known_hosts_fix change local state, and the
-// exec tools run arbitrary commands, so none of them is marked read-only.
+// exec tools run arbitrary commands, so they are deliberately left unmarked: any
+// specific hint would understate what they can do.
 const READ_ONLY_LOCAL = { readOnlyHint: true, openWorldHint: false } as const;
 const READ_ONLY_REMOTE = { readOnlyHint: true, openWorldHint: true } as const;
 const DESTRUCTIVE_REMOTE = { readOnlyHint: false, destructiveHint: true, openWorldHint: true } as const;
+const DESTRUCTIVE_LOCAL = { readOnlyHint: false, destructiveHint: true, openWorldHint: true } as const;
+const ADDITIVE_REMOTE = { readOnlyHint: false, destructiveHint: false, openWorldHint: true } as const;
 
 // Standard note appended to every tool description that command policy does NOT cover.
 // See the SCOPE LIMIT block in src/policy.ts -- a blacklist is not whole-server coverage,
@@ -164,7 +174,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_exec",
-    "Execute a command on a remote host via SSH. The command is interpreted by the remote login shell — pipes, redirects, globs, and other shell metacharacters work as expected. Returns up to three content blocks in this order: the status (`[exit code: N]`, plus the signal and any truncation), then `[stderr]`, then `[stdout]`. Status comes first so a proxy that cuts long results (Yaw MCP keeps about 100 KB) never drops the exit code; for big output, filter or page on the remote (head, tail, grep). Use `env` to set environment variables for this call without modifying the command string. Subject to SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST if configured (policy is checked against the env-prefixed command). While a whitelist is active, shell control syntax and leading variable assignments are refused unless the server sets SSH_MCP_COMMAND_ALLOW_SHELL_SYNTAX=1. Policy is a best-effort guard rail, not a security boundary.",
+    "Execute a command on a remote host via SSH. The command is interpreted by the remote login shell — pipes, redirects, globs, and other shell metacharacters work as expected. Returns up to three content blocks in this order: the status (`[exit code: N]`, plus the signal and any truncation), then `[stderr]`, then `[stdout]`. Status comes first so a proxy that cuts long results (Yaw MCP keeps about 100 KB) never drops the exit code; for big output, filter or page on the remote (head, tail, grep). A non-zero exit code or a signal kill is NOT flagged isError: the command ran and its status is in the first block, so read the exit code; isError means the call itself failed (connection, policy refusal, timeout). The multi-host tool differs and flags its whole result isError when any host exits non-zero. Use `env` to set environment variables for this call without modifying the command string. Subject to SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST if configured (policy is checked against the env-prefixed command). While a whitelist is active, shell control syntax and leading variable assignments are refused unless the server sets SSH_MCP_COMMAND_ALLOW_SHELL_SYNTAX=1. Policy is a best-effort guard rail, not a security boundary.",
     {
       ...connectionParams,
       command: z
@@ -288,6 +298,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       localPath: z.string().describe("Path to the local file to upload"),
       remotePath: AbsoluteRemotePathSchema.describe("Absolute path on the remote host. Must start with /."),
     },
+    DESTRUCTIVE_REMOTE,
     async ({ localPath, remotePath, ...conn }) => {
       return connectionPool.withConnection(
         conn,
@@ -308,6 +319,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       remotePath: AbsoluteRemotePathSchema.describe("Absolute path to the remote file. Must start with /."),
       localPath: z.string().describe("Local path to save the downloaded file"),
     },
+    DESTRUCTIVE_LOCAL,
     async ({ remotePath, localPath, ...conn }) => {
       return connectionPool.withConnection(
         conn,
@@ -349,7 +361,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_stat",
-    `Get metadata for a file or directory on a remote host via SFTP. Returns size, permissions (octal), uid/gid, mtime/atime, and the path type. Symlinks are reported as \`symlink -> <target kind>\`: the type describes the link itself while size/mode/mtime describe its TARGET, and a dangling symlink is reported rather than erroring. Use this instead of parsing \`ls -la\` output.${SFTP_POOL_WAIT_NOTE}`,
+    `Get metadata for a file or directory on a remote host via SFTP. Returns size, permissions (octal), uid/gid, mtime/atime, and the path type. Symlinks are reported as \`symlink -> <target kind>\`: the type describes the link itself while size/mode/mtime describe its TARGET. A symlink whose target cannot be resolved (dangling, or a loop) is reported as \`symlink -> (dangling)\` rather than erroring, and its size/mode/owner/times are then the link's own; a target that exists but cannot be read (permission denied) is an error. Use this instead of parsing \`ls -la\` output.${SFTP_POOL_WAIT_NOTE}`,
     {
       ...connectionParams,
       path: AbsoluteRemotePathSchema.describe("Absolute path to the remote file or directory. Must start with /."),
@@ -366,9 +378,22 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
           // directory" rather than picking one and hiding the other. Checking
           // isDirectory first (as this did) made the symlink half permanently
           // invisible, which is why the flag read as dead.
-          const targetKind = stats.isDirectory ? "directory" : stats.isFile ? "file" : "other";
+          // An unresolved target gets its own label: otherwise a dangling link fell through
+          // to "other" and read exactly like a link to a socket or device, while the size
+          // printed below was the link's own rather than the target's.
+          const dangling = stats.isSymbolicLink && stats.targetResolved === false;
+          const targetKind = dangling
+            ? "(dangling)"
+            : stats.isDirectory
+              ? "directory"
+              : stats.isFile
+                ? "file"
+                : "other";
           const kind = stats.isSymbolicLink ? `symlink -> ${targetKind}` : targetKind;
           lines.push(`${path}: ${kind}`);
+          if (dangling) {
+            lines.push("  Note: the target could not be resolved; the metadata below is the link's own");
+          }
           lines.push(`  Size: ${stats.size} bytes`);
           lines.push(`  Mode: ${stats.modeOctal}`);
           lines.push(`  Owner: uid=${stats.uid} gid=${stats.gid}`);
@@ -396,6 +421,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
         .optional()
         .describe("Create parent directories as needed (default: false). Like `mkdir -p`."),
     },
+    ADDITIVE_REMOTE,
     async ({ path, recursive, ...conn }) => {
       return connectionPool.withConnection(
         conn,
@@ -625,8 +651,8 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       // .min(1), not a bare optional string: the handler defaults with `host || "github.com"`,
       // so an explicitly-empty host would silently probe github.com and report on a host the
       // caller never named -- and, because "" never reaches checkGitSsh, it would skip the
-      // isValidHostname check every other host-taking tool routes its input through. Omitting
-      // the field is the way to ask for the default; "" is rejected at the schema boundary.
+      // isValidHostname check checkGitSsh applies to the host it is given. Omitting the field
+      // is the way to ask for the default; "" is rejected at the schema boundary.
       host: z
         .string()
         .min(1, "host must not be empty. Omit it to use the default (github.com).")
@@ -652,7 +678,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
 
   server.tool(
     "ssh_multi_exec",
-    "Execute a command on multiple remote hosts in parallel. Runs at most SSH_MCP_MAX_POOL_SIZE hosts at once (default 100) and works through a longer list as slots free up. `timeout` is per host: it bounds each host's command, not the whole call. Each parallel slot works through its share of the list one host at a time, so with the pool to itself a call can take up to about ceil(hosts / SSH_MCP_MAX_POOL_SIZE) x (`timeout` + connect time). The connection pool is shared with every other tool; when it is full this call waits for slots instead of failing, and gives up only when none of its own hosts holds a slot and a full `timeout` has passed with none of them starting or finishing. The hosts waiting at that point (up to one per parallel slot) and every host still queued then report `Connection pool is full`; the queued ones are never attempted. Rerun those hosts once the other calls finish, or raise SSH_MCP_MAX_POOL_SIZE. Returns results per host. Use this instead of running the same command against each host one call at a time — it's faster and shows results side by side. Use `env` to set environment variables for this call without modifying the command string. Subject to SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST if configured (policy is checked once, against the env-prefixed command, before fan-out). While a whitelist is active, shell control syntax and leading variable assignments are refused unless the server sets SSH_MCP_COMMAND_ALLOW_SHELL_SYNTAX=1. Policy is a best-effort guard rail, not a security boundary.",
+    "Execute a command on multiple remote hosts in parallel. Runs at most SSH_MCP_MAX_POOL_SIZE hosts at once (default 100) and works through a longer list as slots free up. `timeout` is per host: it bounds each host's command, not the whole call. Each parallel slot works through its share of the list one host at a time, so with the pool to itself a call can take up to about ceil(hosts / SSH_MCP_MAX_POOL_SIZE) x (`timeout` + connect time). The connection pool is shared with every other tool; when it is full this call waits for slots instead of failing, and gives up only when none of its own hosts holds a slot and a full `timeout` has passed with none of them starting or finishing. The hosts waiting at that point (up to one per parallel slot) and every host still queued then report `Connection pool is full`; the queued ones are never attempted. Rerun those hosts once the other calls finish, or raise SSH_MCP_MAX_POOL_SIZE. Returns a summary first (one status line per host: exit code, signal, or ERROR), then each host's output, so a proxy that cuts long results keeps every host's status. The whole result is flagged isError when ANY host failed to run the command or exited non-zero -- unlike the single-host exec tool, which reports a non-zero exit only in its status block and does not set isError. Use this instead of running the same command against each host one call at a time — it's faster and shows results side by side. Use `env` to set environment variables for this call without modifying the command string. Subject to SSH_MCP_COMMAND_WHITELIST / SSH_MCP_COMMAND_BLACKLIST if configured (policy is checked once, against the env-prefixed command, before fan-out). While a whitelist is active, shell control syntax and leading variable assignments are refused unless the server sets SSH_MCP_COMMAND_ALLOW_SHELL_SYNTAX=1. Policy is a best-effort guard rail, not a security boundary.",
     {
       // .min(1): `hosts: []` used to return an empty success block indistinguishable from a
       // no-op -- the same boundary rejection ssh_git_check applies to its empty host.
@@ -680,7 +706,22 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
       const hostConfigs = hosts.map((host) => ({ host, port, username, privateKeyPath, password }));
       const results = await multiExec(connectionPool, hostConfigs, finalCommand, timeout || DEFAULT_TIMEOUT_MS);
 
-      const lines: string[] = [];
+      // Summary FIRST, for the reason ssh_exec puts its status first: a proxy in front of this
+      // server (Yaw MCP keeps about 100 KB) cuts whatever comes last, and with the status at
+      // the end of each host's block one chatty early host cut the exit code -- and the whole
+      // result -- of every host after it. One short line per host keeps every status inside
+      // the cap. Only the first line of an error goes here: a connection failure carries a
+      // multi-line diagnostics report, which stays in that host's block below.
+      const failed = results.filter((r) => r.error || r.code !== 0).length;
+      const lines: string[] = [`[summary: ${results.length} host(s), ${failed} failed]`];
+      for (const r of results) {
+        if (r.error) {
+          lines.push(`${r.host}: ERROR ${r.error.split("\n", 1)[0]}`);
+        } else {
+          lines.push(`${r.host}: exit ${r.code}${r.signal ? `, signal ${r.signal}` : ""}`);
+        }
+      }
+      lines.push("");
       for (const r of results) {
         lines.push(`--- ${r.host} ---`);
         if (r.error) {
@@ -695,8 +736,7 @@ export function registerTools(server: McpServer, pool?: ConnectionPool) {
         }
         lines.push("");
       }
-      const hasErrors = results.some((r) => r.error || r.code !== 0);
-      return { content: [{ type: "text", text: lines.join("\n") }], isError: hasErrors };
+      return { content: [{ type: "text", text: lines.join("\n") }], isError: failed > 0 };
     },
   );
 

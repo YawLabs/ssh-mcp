@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 
 // Resolve via import.meta.url so this works regardless of process.cwd(). The
@@ -110,5 +110,99 @@ describe("release.sh MCP Registry calls", () => {
   // environment must not stand in for that.
   it("sets the time limit up itself, whatever the environment carries", () => {
     expect(releaseSh).toMatch(/^MCP_TIMEOUT_READY=""$/m);
+  });
+});
+
+describe("release.sh pre-flight", () => {
+  const releaseSh = readFileSync(resolve(repoRoot, "release.sh"), "utf-8");
+  const preflightEnd = releaseSh.indexOf('step 1 "');
+
+  // The header promised a clean tree up to date with origin/main, and nothing
+  // checked it: step 3 stages only the bump files, so uncommitted source was
+  // built and published while the tag pointed at a commit without it.
+  it("refuses a dirty tree (a resume may leave only the bump files dirty) and a main behind origin, before step 1", () => {
+    const dirty = releaseSh.indexOf("DIRTY_TREE=$(git status --porcelain)");
+    expect(dirty, "no whole-tree git status check").toBeGreaterThan(-1);
+    expect(dirty).toBeLessThan(preflightEnd);
+    expect(releaseSh.indexOf('if [ -n "$DIRTY_TREE" ]; then')).toBeLessThan(preflightEnd);
+    // The resume branch excludes exactly step 3's BUMP_FILES -- nothing else, so
+    // a resume cannot publish uncommitted source either.
+    const resume = /DIRTY_TREE=\$\(git status --porcelain -- \. (.*)\)$/m.exec(releaseSh);
+    expect(resume, "no resume-mode status check").not.toBeNull();
+    const excluded = [...(resume?.[1] ?? "").matchAll(/':\(exclude\)([^']+)'/g)].map((m) => m[1]).sort();
+    expect(excluded).toEqual(["CHANGELOG.md", "package-lock.json", "package.json", "server.json"]);
+    const bumpFiles = [...releaseSh.matchAll(/BUMP_FILES="(?:\$BUMP_FILES )?([^"]+)"/g)]
+      .flatMap((m) => m[1].split(" "))
+      .sort();
+    expect(excluded).toEqual(bumpFiles);
+    const behind = releaseSh.indexOf("git merge-base --is-ancestor origin/main HEAD");
+    expect(behind, "no origin/main comparison").toBeGreaterThan(-1);
+    expect(behind).toBeLessThan(preflightEnd);
+    expect(releaseSh.indexOf("git fetch --quiet origin main")).toBeLessThan(behind);
+  });
+
+  // jq is first used to sync server.json AFTER package.json is bumped, so a
+  // missing jq has to be caught before anything is touched.
+  it("checks for jq before step 1 and before its first use", () => {
+    const check = releaseSh.indexOf("command -v jq");
+    expect(check, "no jq pre-flight").toBeGreaterThan(-1);
+    expect(check).toBeLessThan(preflightEnd);
+    const firstUse = releaseSh.search(/^\s*[^#\n]*\$\(jq |^\s*jq /m);
+    expect(firstUse).toBeGreaterThan(check);
+  });
+});
+
+describe("npm run test:integration", () => {
+  type Run = (cmd: string, args: string[], env?: Record<string, string>) => number;
+  const load = async () =>
+    (await import(pathToFileURL(resolve(repoRoot, "scripts", "test-integration.mjs")).href)) as {
+      runIntegration: (run: Run) => number;
+    };
+
+  /** A fake runner: the status each step returns, and the order the steps ran. */
+  function fake(statuses: { up?: number; suite?: number; down?: number }) {
+    const calls: { step: string; env?: Record<string, string> }[] = [];
+    const run: Run = (cmd, args, env) => {
+      const step = cmd === "docker" ? (args.includes("up") ? "up" : "down") : "suite";
+      calls.push({ step, env });
+      return statuses[step as "up" | "suite" | "down"] ?? 0;
+    };
+    return { run, calls };
+  }
+
+  // The inline script was `up && SSH_MCP_INTEGRATION=1 vitest ...; down`: its
+  // status was down's, so a failing suite exited 0.
+  it("exits with the suite's status, not docker compose down's", async () => {
+    const { runIntegration } = await load();
+    const { run, calls } = fake({ suite: 1, down: 0 });
+    expect(runIntegration(run)).toBe(1);
+    expect(calls.map((c) => c.step)).toEqual(["up", "suite", "down"]);
+    expect(calls[1].env).toEqual({ SSH_MCP_INTEGRATION: "1" });
+  });
+
+  it("passes when the suite passes even if down fails, and tears down after a failed up", async () => {
+    const { runIntegration } = await load();
+    expect(runIntegration(fake({ suite: 0, down: 3 }).run)).toBe(0);
+    const failedUp = fake({ up: 2 });
+    expect(runIntegration(failedUp.run)).toBe(2);
+    expect(failedUp.calls.map((c) => c.step)).toEqual(["up", "down"]);
+  });
+
+  it("is what package.json runs, with no shell-only syntax", () => {
+    const pkg = readJson("package.json") as { scripts: Record<string, string> };
+    expect(pkg.scripts["test:integration"]).toBe("node scripts/test-integration.mjs");
+  });
+});
+
+describe("npm run lint coverage", () => {
+  // bin/ssh-mcp.mjs is the one shipped file outside dist/, and tsc covers none of
+  // bin/ or scripts/, so a lint gate over src/ alone left them unchecked.
+  it("lints and formats bin/ and scripts/ as well as src/", () => {
+    const pkg = readJson("package.json") as { scripts: Record<string, string> };
+    for (const name of ["lint", "lint:fix"]) {
+      for (const dir of ["src/", "bin/", "scripts/"]) {
+        expect(pkg.scripts[name].split(" "), `${name} misses ${dir}`).toContain(dir);
+      }
+    }
   });
 });

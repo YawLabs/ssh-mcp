@@ -29,6 +29,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isMainModule } from "./is-main-module.mjs";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const MIN_GRADE = "A";
@@ -115,6 +116,9 @@ function main() {
   console.log(`mcp-compliance: grade ${report.grade}, at or above ${MIN_GRADE}.`);
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
+// Only run when invoked directly, so evaluateReport stays importable. Through
+// a junction or symlink a plain resolve() compare skipped main() and exited 0
+// having graded nothing, which release.sh read as a pass; see is-main-module.mjs.
+if (isMainModule(process.argv[1], import.meta.url)) {
   main();
 }

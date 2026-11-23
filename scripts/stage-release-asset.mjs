@@ -1,4 +1,12 @@
 #!/usr/bin/env node
+// INERT IN THIS REPO. Nothing calls this script: no package.json script, no
+// release.sh step, and no CI (this repo has no .github/workflows; Actions is
+// disabled). The binary build it stages (scripts/build-binary.mjs, writing
+// bin/<platform>-<arch>/<binName>) is gone, so its input is never produced.
+// It is kept, not deleted, because bin/win32-arm64/ssh-mcp.exe exists and binary
+// releases may return; wiring it back in means restoring a binary build step and
+// calling it from release.sh. Until then, running it by hand does nothing useful.
+//
 // Stage the host-built binary as a named release asset + sha256 sidecar.
 //
 // A binary build emits bin/<platform>-<arch>/<binName>(.exe) (host-native, so
@@ -10,24 +18,24 @@
 // Pure stdlib; writes only to dist-release/. Run after the binary build:
 //   node scripts/stage-release-asset.mjs
 
-import { createHash } from 'node:crypto';
-import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { createHash } from "node:crypto";
+import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const repoRoot = resolve(__dirname, '..');
-const isWin = process.platform === 'win32';
-const ext = isWin ? '.exe' : '';
+const repoRoot = resolve(__dirname, "..");
+const isWin = process.platform === "win32";
+const ext = isWin ? ".exe" : "";
 
-const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf-8'));
+const pkg = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf-8"));
 // Binary name = first `bin` command -- keeps this generic across servers.
-const binName = Object.keys(pkg.bin ?? {})[0] ?? pkg.name.split('/').pop();
+const binName = Object.keys(pkg.bin ?? {})[0] ?? pkg.name.split("/").pop();
 const platformArch = `${process.platform}-${process.arch}`;
-const builtExe = join(repoRoot, 'bin', platformArch, `${binName}${ext}`);
+const builtExe = join(repoRoot, "bin", platformArch, `${binName}${ext}`);
 const assetName = `${binName}-${platformArch}${ext}`;
 
-const outDir = join(repoRoot, 'dist-release');
+const outDir = join(repoRoot, "dist-release");
 const outAsset = join(outDir, assetName);
 const outSha = `${outAsset}.sha256`;
 
@@ -38,7 +46,7 @@ copyFileSync(builtExe, outAsset);
 // asset is runnable for the CI smoke test and after download.
 if (!isWin) chmodSync(outAsset, 0o755);
 
-const hex = createHash('sha256').update(readFileSync(outAsset)).digest('hex');
+const hex = createHash("sha256").update(readFileSync(outAsset)).digest("hex");
 // sha256sum format so `sha256sum -c` and Scoop's hash.url sidecar both parse it.
 writeFileSync(outSha, `${hex}  ${assetName}\n`);
 
@@ -46,5 +54,5 @@ console.log(`asset:  ${outAsset}`);
 console.log(`sha256: ${hex}`);
 // Surfaced as a step output in CI (GITHUB_OUTPUT) for downstream jobs.
 if (process.env.GITHUB_OUTPUT) {
-  writeFileSync(process.env.GITHUB_OUTPUT, `asset=${assetName}\nsha256=${hex}\n`, { flag: 'a' });
+  writeFileSync(process.env.GITHUB_OUTPUT, `asset=${assetName}\nsha256=${hex}\n`, { flag: "a" });
 }

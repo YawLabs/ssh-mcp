@@ -16,6 +16,8 @@ services:
   # handed to ssh2 as `sock` and a real sshd accepted it.
   bastion:
     build: .
+    # A fixed hostname, so a command run there can tell which hop answered.
+    hostname: bastion
     ports:
       - "2223:22"
     volumes:
@@ -23,6 +25,7 @@ services:
 
   target:
     build: .
+    hostname: target
     # No `ports:` -- unreachable from the host on purpose. See above.
     volumes:
       - ./test_key.pub:/root/.ssh/authorized_keys:ro

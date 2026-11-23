@@ -99,14 +99,14 @@
  * oam 0.18.0, so anyone taking it below that has to answer for both:
  *
  *   1. An explicit child `env` that DELETES a variable. probeAgent
- *      (src/env.ts:85-90) runs `ssh-add -l` with SSH_AUTH_SOCK removed, so
+ *      (src/env.ts) runs `ssh-add -l` with SSH_AUTH_SOCK removed, so
  *      Windows ssh-add falls back to the OpenSSH named pipe instead of a stale
  *      Unix-style socket. Up to 0.17.x oam laid an explicit `env` OVER its
  *      startup environment, so the deleted SSH_AUTH_SOCK came back and ssh-add
  *      probed the wrong agent. 0.18.0 makes an explicit `env` replace it, as
  *      Node does (oam CHANGELOG 0.18.0, B4).
  *   2. `net.connect` to a Windows named pipe or a Unix socket path.
- *      resolveConfig (src/ssh.ts:581-584) hands ssh2 SSH_AUTH_SOCK, or on Windows
+ *      resolveConfig's `agentSock` default (src/ssh.ts) hands ssh2 SSH_AUTH_SOCK, or on Windows
  *      `\\.\pipe\openssh-ssh-agent`, and ssh2 dials it with
  *      `new Socket().connect(path)` for every agent-backed connection. Up to
  *      0.17.x oam could not dial either (oam CHANGELOG 0.18.0, F1).
@@ -114,7 +114,7 @@
  * What moving to 0.19.1 changed here: oam used to start EVERY child with
  * CREATE_NO_WINDOW and ignore `windowsHide`; 0.19.1 honours `windowsHide` as
  * Node does, so by default a child shares the console (oam CHANGELOG 0.19.1).
- * runArgs (src/diagnose.ts) and runArgsWithEnv (src/env.ts) therefore pass
+ * runArgs (src/diagnose.ts, which also serves env.ts's env-override calls) therefore passes
  * `windowsHide: true` themselves, or every ssh / ssh-add / ssh-keygen probe could
  * flash a console window on Windows.
  *
@@ -171,23 +171,24 @@
  * paths, so those were reachable bugs rather than theoretical ones.
  *
  * SELECTION
- *   SSH_MCP_RUNTIME=auto   Node (default): in THIS process on Node, handed off
- *                          to Node on PATH when THIS process is oam. Only with
- *                          no Node on PATH does an oam host serve: itself at
- *                          the floor, a newer discovered oam below it.
- *                          (With AUTO_PREFERS_OAM = true: newest usable oam,
- *                          else Node.)
+ *   SSH_MCP_RUNTIME=auto   the default: newest usable oam, else Node. An oam
+ *                          host at the floor serves in-process; one below it
+ *                          hands off to the newest usable oam, else Node on
+ *                          PATH, else exits with an error.
+ *                          (With AUTO_PREFERS_OAM = false, `auto` plans exactly
+ *                          as `node` does.)
  *   SSH_MCP_RUNTIME=oam    newest usable oam, else exit with an error
  *                          (already running on oam at the floor satisfies it)
  *   SSH_MCP_RUNTIME=node   Node: in THIS process on Node, handed off to Node
  *                          on PATH when THIS process is oam
  *   OAM_BIN=/path/to/oam   use this oam when it is usable, before discovery;
- *                          read only when oam is being looked for
+ *                          read only when oam is being looked for (`auto` or
+ *                          `oam` on a Node host or a below-floor oam host)
  * The value is trimmed and case-insensitive; anything else behaves like `auto`.
  */
 
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync, writeSync } from "node:fs";
 import { constants, homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -304,9 +305,13 @@ function discoverOamPaths() {
  * there rather than blocking the write. Loop over the remaining bytes, and if
  * stderr turns out to be unusable give up quietly -- failing to print a
  * diagnostic is not worth crashing a stdio server over.
+ *
+ * Genuinely synchronous: writeSync is imported statically. It used to be an async
+ * function that began with `await import("node:fs")`, so a caller that did not
+ * await it before process.exit would print nothing -- the failure this exists to
+ * prevent.
  */
-async function errSync(message) {
-  const { writeSync } = await import("node:fs");
+function errSync(message) {
   const buf = Buffer.from(message);
   let off = 0;
   for (let attempts = 0; off < buf.length && attempts < 1000; attempts++) {
@@ -536,14 +541,17 @@ async function runInProcess() {
   await import(SERVER_URL.href);
 }
 
-// ONE reporter for every failed in-process fallback, so the sync-throw path and
-// the 'error'-event path in launchChild cannot drift apart. runInProcess() is a
+// ONE reporter for every failed in-process serve -- the Node fallback, the plain
+// Node in-process plan, and an oam host at the floor serving itself -- and for a
+// launch-failure handler that rejects, so the sync-throw path and the
+// 'error'-event path in launchChild cannot drift apart. The message names neither
+// "fallback" nor "Node", because an oam host serving itself is neither. runInProcess() is a
 // bare import() that rejects when dist/index.js is missing or throws at load,
 // and at ESM top level an unhandled rejection is an uncaught exception -- it
 // kills the process and replaces this launcher's diagnostic with a raw stack
 // trace, which is the exact failure this handling exists to prevent.
 const fallbackFailed = (e) => {
-  process.stderr.write(`ssh-mcp: fallback to Node failed (${e?.message ?? e})\n`);
+  process.stderr.write(`ssh-mcp: could not load the server (${e?.message ?? e})\n`);
   process.exitCode = 1;
 };
 
@@ -736,9 +744,11 @@ async function launchChild(cmd, args, onLaunchFailed) {
 }
 
 /**
- * Hand the server to Node on PATH. Only reachable when THIS process is oam under
- * SSH_MCP_RUNTIME=node -- a supported one asked for Node, or one below the floor
- * (which never serves). `reason`, when given, is noted on stderr.
+ * Hand the server to Node on PATH. Only reachable when THIS process is oam: under
+ * SSH_MCP_RUNTIME=node (a supported oam asked for Node, or one below the floor,
+ * which never serves), or from fallBackToNode when a below-floor oam host under
+ * `auto` found no usable oam to spawn, or the chosen one would not start.
+ * `reason`, when given, is noted on stderr.
  */
 async function handOffToNode(reason) {
   const node = findNodeOnPath();
@@ -748,14 +758,14 @@ async function handOffToNode(reason) {
     const remedy = reason
       ? `Run \`oam self-update\` to get oam ${OAM_MIN.join(".")} or newer, or launch this command with node.\n`
       : "Put Node on PATH, or unset SSH_MCP_RUNTIME to serve on this oam.\n";
-    await errSync(
+    errSync(
       `ssh-mcp: ${reason || `SSH_MCP_RUNTIME=node on oam ${process.versions.oam}`}, and no Node was found on PATH to run the server instead.\n${remedy}`,
     );
     process.exit(1);
   }
-  if (reason) await errSync(`ssh-mcp: ${reason}; running on ${node} instead.\n`);
+  if (reason) errSync(`ssh-mcp: ${reason}; running on ${node} instead.\n`);
   await launchChild(node, [SERVER_ENTRY, ...process.argv.slice(2)], async (err) => {
-    await errSync(`ssh-mcp: failed to launch Node at ${node} (${err?.message ?? err})\n`);
+    errSync(`ssh-mcp: failed to launch Node at ${node} (${err?.message ?? err})\n`);
     process.exit(1);
   });
 }
@@ -773,9 +783,10 @@ async function fallBackToNode(hostOam, why) {
   await handOffToNode(`this process is oam ${hostOam}, older than ${OAM_MIN.join(".")}, and ${why}`);
 }
 
-// Trimmed as well as lowercased: with `auto` meaning Node, a padded "oam " read
-// untrimmed would fall to `auto` and silently run on Node (it used to land on oam
-// only because `auto` preferred it). Same parse as SSH_MCP_STRICT_HOSTKEYS.
+// Trimmed as well as lowercased: a padded "oam " or "node " read untrimmed would
+// fall to `auto` -- for "oam " that silently serves on Node when no usable oam is
+// found instead of exiting 1, and for "node " it spawns an oam the caller ruled
+// out. Same parse as SSH_MCP_STRICT_HOSTKEYS.
 const mode = (process.env.SSH_MCP_RUNTIME ?? "auto").trim().toLowerCase();
 const hostOam = process.versions.oam;
 const plan = runtimePlan({ mode, hostOam });
@@ -785,16 +796,15 @@ async function discoverAndServe() {
   const { chosen, overrideNote, skipped, passedOver, overrideMissing } = chooseOam();
 
   if (chosen) {
-    if (overrideNote)
-      await errSync(`ssh-mcp: ${overrideNote}; using ${chosen.path} (oam ${chosen.version.join(".")}).\n`);
+    if (overrideNote) errSync(`ssh-mcp: ${overrideNote}; using ${chosen.path} (oam ${chosen.version.join(".")}).\n`);
     // `--` separates oam's own flags from the script's argv, so `ssh-mcp
     // --version` and any host-supplied flags survive the hop unchanged.
     await launchChild(chosen.path, ["run", SERVER_ENTRY, "--", ...process.argv.slice(2)], async (err) => {
       if (mode === "oam") {
-        await errSync(`ssh-mcp: failed to launch oam at ${chosen.path} (${err?.message ?? err})\n`);
+        errSync(`ssh-mcp: failed to launch oam at ${chosen.path} (${err?.message ?? err})\n`);
         process.exit(1);
       }
-      await errSync(`ssh-mcp: failed to launch oam at ${chosen.path} (${err?.message ?? err}); using Node instead.\n`);
+      errSync(`ssh-mcp: failed to launch oam at ${chosen.path} (${err?.message ?? err}); using Node instead.\n`);
       await fallBackToNode(hostOam, "the newer oam would not start");
     });
   } else {
@@ -810,7 +820,7 @@ async function discoverAndServe() {
     ];
     if (mode === "oam") {
       // Explicitly demanded, so this is a real misconfiguration.
-      await errSync(
+      errSync(
         `ssh-mcp: SSH_MCP_RUNTIME=oam but no usable oam (${OAM_MIN.join(".")} or newer) was found.\n` +
           notes.map((note) => `  ${note}\n`).join("") +
           remedyFor({ passedOver, overrideMissing, shim }),
@@ -825,7 +835,7 @@ async function discoverAndServe() {
     // runInProcess() imports dist/index.js, whose top level answers `--version`
     // with console.log + process.exit(0) (src/index.ts) -- and that exit
     // truncates a pending async stderr write on Windows TTYs and pipes.
-    if (notes.length > 0) await errSync(`ssh-mcp: ${notes.join("; ")}; using Node instead.\n`);
+    if (notes.length > 0) errSync(`ssh-mcp: ${notes.join("; ")}; using Node instead.\n`);
     await fallBackToNode(hostOam, "no newer oam was found").catch(fallbackFailed);
   }
 }

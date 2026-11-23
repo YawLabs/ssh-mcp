@@ -1,4 +1,15 @@
 #!/usr/bin/env node
+// INERT IN THIS REPO. Nothing calls this script: no package.json script, no
+// release.sh step, and no CI (this repo has no .github/workflows; Actions is
+// disabled). It reads the `.sha256` sidecars of a binary release, and the
+// release.yml build that would attach them does not exist here, so
+// `gh release download -p '*.sha256'` finds nothing and the script throws.
+// Its pure helpers (rubyString, renderFormula) are still tested by
+// src/tests/update-manifests.test.ts.
+// It is kept, not deleted, because bin/win32-arm64/ssh-mcp.exe exists and binary
+// releases may return; wiring it back in means restoring a binary build step and
+// calling it from release.sh. Until then, running it by hand does nothing useful.
+//
 // Regenerate the Scoop manifest (scoop-yaw/bucket/<pkg>.json) and Homebrew
 // formula (homebrew-yaw/Formula/<cmd>.rb) for a published release, filling in
 // the version + per-arch sha256s from the GitHub Release's `.sha256` sidecars.
@@ -7,8 +18,9 @@
 // slug, license, description), so this script is copy-paste across @yawlabs/*
 // servers -- only the sibling-repo dirs are flags. Mirrors the Yaw Terminal
 // release.sh pattern: the manifest repos are checked out next to this one and
-// pushed with the gh_woods SSH key -- no CI cross-repo token. The binary BUILD
-// is CI (release.yml on tag push); this manifest BUMP runs locally after.
+// pushed with the gh_woods SSH key -- no CI cross-repo token. In the fleet the
+// binary BUILD is CI (release.yml on tag push) and this manifest BUMP runs
+// locally after; see the INERT note above for this repo.
 //
 //   node scripts/update-manifests.mjs --version 0.60.6 \
 //     [--scoop-dir ~/yaw/scoop-yaw] [--homebrew-dir ~/yaw/homebrew-yaw] [--push]
@@ -16,20 +28,21 @@
 // Hashes are pulled with `gh release download v<version> -p '*.sha256'` (needs
 // gh auth). Without --push it writes the files and prints the git commands.
 
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { isMainModule } from "./is-main-module.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const repoRoot = resolve(__dirname, '..');
+const repoRoot = resolve(__dirname, "..");
 
 function arg(name, fallback) {
   const i = process.argv.indexOf(`--${name}`);
   return i !== -1 && process.argv[i + 1] ? process.argv[i + 1] : fallback;
 }
-const expand = (p) => (p.startsWith('~') ? join(homedir(), p.slice(1)) : p);
+const expand = (p) => (p.startsWith("~") ? join(homedir(), p.slice(1)) : p);
 
 // Escape a value for the inside of a Ruby double-quoted string literal. The
 // backslash goes first, or the backslashes added for the other characters get
@@ -39,12 +52,12 @@ const expand = (p) => (p.startsWith('~') ? join(homedir(), p.slice(1)) : p);
 // escape. Raw CR/LF become `\r`/`\n` so a multi-line value cannot spill out of
 // its one-line stanza.
 export function rubyString(value) {
-  return String(value ?? '')
-    .replace(/\\/g, '\\\\')
+  return String(value ?? "")
+    .replace(/\\/g, "\\\\")
     .replace(/"/g, '\\"')
-    .replace(/#(?=[{@$])/g, '\\#')
-    .replace(/\r/g, '\\r')
-    .replace(/\n/g, '\\n');
+    .replace(/#(?=[{@$])/g, "\\#")
+    .replace(/\r/g, "\\r")
+    .replace(/\n/g, "\\n");
 }
 
 // Render the Homebrew formula (CLI -> formula, NOT cask). Every value that
@@ -53,8 +66,8 @@ export function rubyString(value) {
 // refused. `assets` maps macArm64 / macX64 / linuxX64 to { url, sha256 }.
 export function renderFormula({ className, cmd, description, homepage, version, license, assets }) {
   if (!/^[A-Z][A-Za-z0-9]*$/.test(className)) throw new Error(`not a valid Homebrew class name: ${className}`);
-  const proprietary = !license || license === 'UNLICENSED';
-  const licenseLine = proprietary ? 'license :cannot_represent' : `license "${rubyString(license)}"`;
+  const proprietary = !license || license === "UNLICENSED";
+  const licenseLine = proprietary ? "license :cannot_represent" : `license "${rubyString(license)}"`;
   const urlLine = (a) => `url "${rubyString(a.url)}", using: :nounzip
       sha256 "${rubyString(a.sha256)}"`;
   return `class ${className} < Formula
@@ -91,22 +104,13 @@ end
 }
 
 // Only run the release side effects when executed as a script, so a test can
-// import the helpers without triggering `gh release download`. Real paths on
-// both sides, so the check still holds when the script is reached through a
-// junction or symlink (argv[1] keeps the link path, import.meta.url does not).
-function isEntrypoint() {
-  if (!process.argv[1]) return false;
-  try {
-    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
-  } catch {
-    return false;
-  }
-}
-if (isEntrypoint()) main();
+// import the helpers without triggering `gh release download`. The shared guard
+// realpaths both sides, so it holds through a junction or symlink too.
+if (isMainModule(process.argv[1], import.meta.url)) main();
 
 function main() {
-  const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf-8'));
-  const version = arg('version', pkg.version);
+  const pkg = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf-8"));
+  const version = arg("version", pkg.version);
   const tag = `v${version}`;
 
   // Manifest repo paths: resolved in priority order:
@@ -117,23 +121,26 @@ function main() {
   // personal defaults only exist on the original dev machine and will
   // produce a "no such file or directory" error rather than silently
   // writing to a wrong location.
-  const scoopDir = resolve(expand(arg('scoop-dir', process.env.YAW_SCOOP_DIR ?? '~/yaw/scoop-yaw')));
-  const homebrewDir = resolve(expand(arg('homebrew-dir', process.env.YAW_HOMEBREW_DIR ?? '~/yaw/homebrew-yaw')));
-  const push = process.argv.includes('--push');
+  const scoopDir = resolve(expand(arg("scoop-dir", process.env.YAW_SCOOP_DIR ?? "~/yaw/scoop-yaw")));
+  const homebrewDir = resolve(expand(arg("homebrew-dir", process.env.YAW_HOMEBREW_DIR ?? "~/yaw/homebrew-yaw")));
+  const push = process.argv.includes("--push");
 
   // --- everything below is derived from package.json (copy-paste generic) ------
-  const pkgShort = pkg.name.split('/').pop(); // scoop install name + bucket file
+  const pkgShort = pkg.name.split("/").pop(); // scoop install name + bucket file
   const cmd = Object.keys(pkg.bin ?? {})[0] ?? pkgShort; // the on-PATH command
   const repoSlug =
-    (pkg.repository?.url ?? '')
-      .replace(/^git\+/, '')
-      .replace(/^https?:\/\/github\.com\//, '')
-      .replace(/\.git$/, '') || `YawLabs/${pkgShort}`;
+    (pkg.repository?.url ?? "")
+      .replace(/^git\+/, "")
+      .replace(/^https?:\/\/github\.com\//, "")
+      .replace(/\.git$/, "") || `YawLabs/${pkgShort}`;
   const REPO = `https://github.com/${repoSlug}`;
   const homepage = pkg.homepage || REPO;
   // CamelCase the command for the Homebrew class (yaw-mcp -> YawMcp).
-  const className = cmd.split(/[-_]/).map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join('');
-  const proprietary = !pkg.license || pkg.license === 'UNLICENSED';
+  const className = cmd
+    .split(/[-_]/)
+    .map((s) => s.charAt(0).toUpperCase() + s.slice(1))
+    .join("");
+  const proprietary = !pkg.license || pkg.license === "UNLICENSED";
   const dl = (asset) => `${REPO}/releases/download/${tag}/${asset}`;
 
   // Per-arch asset names (must match stage-release-asset.mjs: <cmd>-<plat>-<arch>).
@@ -147,12 +154,12 @@ function main() {
 
   // 1. Pull every .sha256 sidecar from the release into a temp dir, parse hashes.
   const shaDir = mkdtempSync(join(tmpdir(), `${cmd}-sha-`));
-  execFileSync('gh', ['release', 'download', tag, '--repo', repoSlug, '-p', '*.sha256', '-D', shaDir], {
-    stdio: 'inherit',
+  execFileSync("gh", ["release", "download", tag, "--repo", repoSlug, "-p", "*.sha256", "-D", shaDir], {
+    stdio: "inherit",
   });
   const hashes = {};
   for (const file of readdirSync(shaDir)) {
-    const [hex, name] = readFileSync(join(shaDir, file), 'utf-8').trim().split(/\s+/);
+    const [hex, name] = readFileSync(join(shaDir, file), "utf-8").trim().split(/\s+/);
     hashes[name] = hex;
   }
   function hashFor(asset) {
@@ -166,9 +173,9 @@ function main() {
     version,
     description: pkg.description,
     homepage,
-    license: { identifier: proprietary ? 'Proprietary' : pkg.license, url: 'https://yaw.sh' },
+    license: { identifier: proprietary ? "Proprietary" : pkg.license, url: "https://yaw.sh" },
     architecture: {
-      '64bit': { url: dl(ASSETS.winX64), hash: hashFor(ASSETS.winX64), bin: [[ASSETS.winX64, cmd]] },
+      "64bit": { url: dl(ASSETS.winX64), hash: hashFor(ASSETS.winX64), bin: [[ASSETS.winX64, cmd]] },
       arm64: { url: dl(ASSETS.winArm64), hash: hashFor(ASSETS.winArm64), bin: [[ASSETS.winArm64, cmd]] },
     },
     // Belt-and-suspenders: strip any Mark-of-the-Web so SmartScreen never fires
@@ -177,8 +184,8 @@ function main() {
     checkver: { github: REPO },
     autoupdate: {
       architecture: {
-        '64bit': { url: `${REPO}/releases/download/v$version/${ASSETS.winX64}`, hash: { url: '$url.sha256' } },
-        arm64: { url: `${REPO}/releases/download/v$version/${ASSETS.winArm64}`, hash: { url: '$url.sha256' } },
+        "64bit": { url: `${REPO}/releases/download/v$version/${ASSETS.winX64}`, hash: { url: "$url.sha256" } },
+        arm64: { url: `${REPO}/releases/download/v$version/${ASSETS.winArm64}`, hash: { url: "$url.sha256" } },
       },
     },
   };
@@ -211,21 +218,26 @@ function main() {
   console.log(`wrote ${formulaPath}`);
 
   // 5. Commit + push (SSH gh_woods, like release.sh) only with --push.
-  const SSH = 'ssh -i ~/.ssh/gh_woods -o IdentitiesOnly=yes';
+  const SSH = "ssh -i ~/.ssh/gh_woods -o IdentitiesOnly=yes";
   function commitPush(dir, file, msg) {
-    const git = (...a) => execFileSync('git', ['-C', dir, ...a], { stdio: 'inherit', env: { ...process.env, GIT_SSH_COMMAND: SSH } });
-    git('pull', '--rebase', 'origin', 'main');
-    git('add', file);
-    git('commit', '-m', msg);
-    git('push', 'origin', 'main');
+    const git = (...a) =>
+      execFileSync("git", ["-C", dir, ...a], { stdio: "inherit", env: { ...process.env, GIT_SSH_COMMAND: SSH } });
+    git("pull", "--rebase", "origin", "main");
+    git("add", file);
+    git("commit", "-m", msg);
+    git("push", "origin", "main");
   }
   if (push) {
     commitPush(scoopDir, scoopRel, `${cmd} ${version}`);
     commitPush(homebrewDir, formulaRel, `${cmd} ${version}`);
-    console.log('pushed scoop-yaw + homebrew-yaw');
+    console.log("pushed scoop-yaw + homebrew-yaw");
   } else {
-    console.log('\n--push not set. Review, then:');
-    console.log(`  git -C ${scoopDir} add ${scoopRel} && git -C ${scoopDir} commit -m "${cmd} ${version}" && git -C ${scoopDir} push`);
-    console.log(`  git -C ${homebrewDir} add ${formulaRel} && git -C ${homebrewDir} commit -m "${cmd} ${version}" && git -C ${homebrewDir} push`);
+    console.log("\n--push not set. Review, then:");
+    console.log(
+      `  git -C ${scoopDir} add ${scoopRel} && git -C ${scoopDir} commit -m "${cmd} ${version}" && git -C ${scoopDir} push`,
+    );
+    console.log(
+      `  git -C ${homebrewDir} add ${formulaRel} && git -C ${homebrewDir} commit -m "${cmd} ${version}" && git -C ${homebrewDir} push`,
+    );
   }
 }

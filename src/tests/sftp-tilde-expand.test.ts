@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
-import { downloadFile, uploadFile } from "../ssh.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { downloadFile, expandTilde, uploadFile } from "../ssh.js";
 
 // Fake SFTP wrapper that captures the local path passed to fastPut / fastGet.
 function makeFakeSftp() {
@@ -44,6 +44,47 @@ describe("uploadFile tilde expansion in localPath", () => {
     const { sftp, calls } = makeFakeSftp();
     await uploadFile(makeFakeClient(sftp), "~/data/export.csv", "/remote/export.csv");
     expect(calls.fastPut[0]).toBe(join(homedir(), "data/export.csv"));
+  });
+});
+
+describe("tilde spellings that are NOT the current user's home are left alone", () => {
+  // `~alice/...` is another user's home and `~backup.key` is a relative file whose
+  // name starts with a tilde. Both used to be joined onto OUR home, producing an
+  // ENOENT for a path the caller never named.
+  it.each(["~alice/.ssh/id_ed25519", "~backup.key", "~"])("uploadFile keeps %s's meaning", async (p) => {
+    const { sftp, calls } = makeFakeSftp();
+    await uploadFile(makeFakeClient(sftp), p, "/remote/x");
+    expect(calls.fastPut[0]).toBe(p === "~" ? homedir() : p);
+  });
+
+  it("downloadFile leaves ~name untouched too", async () => {
+    const { sftp, calls } = makeFakeSftp();
+    await downloadFile(makeFakeClient(sftp), "/remote/x", "~bob/x");
+    expect(calls.fastGet[0]).toBe("~bob/x");
+  });
+});
+
+describe("expandTilde", () => {
+  const HOME = join("/", "home", "me");
+  const realPlatform = process.platform;
+  afterEach(() => {
+    Object.defineProperty(process, "platform", { value: realPlatform, configurable: true });
+  });
+
+  it("expands ~ and ~/ only", () => {
+    expect(expandTilde("~", HOME)).toBe(HOME);
+    expect(expandTilde("~/.ssh/id", HOME)).toBe(join(HOME, ".ssh/id"));
+    expect(expandTilde("~alice/.ssh/id", HOME)).toBe("~alice/.ssh/id");
+    expect(expandTilde("~backup.key", HOME)).toBe("~backup.key");
+    expect(expandTilde("/abs/~/x", HOME)).toBe("/abs/~/x");
+    expect(expandTilde("rel/path", HOME)).toBe("rel/path");
+  });
+
+  it("expands ~\\ on Windows only", () => {
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    expect(expandTilde("~\\.ssh\\id", HOME)).toBe(join(HOME, ".ssh\\id"));
+    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+    expect(expandTilde("~\\.ssh\\id", HOME)).toBe("~\\.ssh\\id");
   });
 });
 

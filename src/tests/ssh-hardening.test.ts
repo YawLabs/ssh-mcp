@@ -86,6 +86,7 @@ const {
   hostKeyAlgorithmOrder,
   hostKeyBlobType,
   knownHostsTargets,
+  MAX_PROXY_JUMP_DEPTH,
   makeDir,
   parseJumpSpec,
   readKnownHostsEntries,
@@ -265,13 +266,49 @@ describe("makeDir recursive path construction", () => {
     expect(probe.mkdir).toEqual(["./a", "./a/b"]);
   });
 
-  it("tolerates existing intermediate segments but surfaces a leaf failure", async () => {
+  it("walks through intermediates that already exist as directories and creates the leaf", async () => {
+    // SFTP's generic "Failure" for an existing dir, on the intermediates ONLY.
     const { client, probe } = fakeSftpClient({
-      mkdir: (p) => (p === "/a/b/c" ? new Error("Failure") : new Error("Failure")),
+      mkdir: (p) => (p === "/a/b/c" ? null : new Error("Failure")),
+      stat: (p) => (p === "/a" || p === "/a/b" ? statOf("dir") : new Error("No such file")),
+    });
+    await expect(makeDir(client, "/a/b/c", true)).resolves.toBeUndefined();
+    expect(probe.mkdir).toEqual(["/a", "/a/b", "/a/b/c"]);
+    expect(probe.stat).toEqual(["/a", "/a/b"]); // only the failing segments are checked
+    expect(probe.ended).toBe(1);
+  });
+
+  it("is idempotent like `mkdir -p`: an existing leaf DIRECTORY is success", async () => {
+    // Used to reject with SFTP's bare "Failure", breaking the idempotent use agents expect.
+    const { client, probe } = fakeSftpClient({ mkdir: () => new Error("Failure"), stat: () => statOf("dir") });
+    await expect(makeDir(client, "/a/b/c", true)).resolves.toBeUndefined();
+    expect(probe.mkdir).toEqual(["/a", "/a/b", "/a/b/c"]);
+  });
+
+  it("surfaces a leaf failure when the leaf exists but is NOT a directory", async () => {
+    const { client } = fakeSftpClient({
+      mkdir: (p) => (p === "/a/b/c" ? new Error("Failure") : null),
+      stat: () => statOf("file"),
     });
     await expect(makeDir(client, "/a/b/c", true)).rejects.toThrow(/Failure/);
-    // Every segment was still attempted in order; only the leaf threw.
-    expect(probe.mkdir).toEqual(["/a", "/a/b", "/a/b/c"]);
+  });
+
+  it("rethrows an intermediate segment's OWN error instead of swallowing it", async () => {
+    // A permission denial on /a used to be swallowed, so the call failed later with a
+    // misleading "No such file" on the leaf. Now it stops at /a with /a's error.
+    const { client, probe } = fakeSftpClient({
+      mkdir: (p) => (p === "/a" ? new Error("Permission denied") : new Error("No such file")),
+      stat: () => new Error("No such file"),
+    });
+    await expect(makeDir(client, "/a/b/c", true)).rejects.toThrow("Permission denied");
+    expect(probe.mkdir).toEqual(["/a"]);
+    expect(probe.ended).toBe(1);
+  });
+
+  it("non-recursive mode still errors on an existing path (plain mkdir)", async () => {
+    const { client, probe } = fakeSftpClient({ mkdir: () => new Error("Failure"), stat: () => statOf("dir") });
+    await expect(makeDir(client, "/a")).rejects.toThrow(/Failure/);
+    expect(probe.stat).toEqual([]);
   });
 
   it("non-recursive mode creates exactly the given path", async () => {
@@ -526,6 +563,10 @@ describe("a warm-pool acquire does no work the connection cannot use", () => {
   const HOST = "warm-acquire.test";
 
   it("spawns ZERO subprocesses when acquire() hits an already-pooled connection", async () => {
+    // A SUCCESSFUL `ssh -G` -- the answer the process-lifetime memo keeps. (A failed
+    // probe is deliberately not memoized; see "a failed `ssh -G` is not cached".)
+    stubs.runArgs.fn = (cmd) =>
+      cmd === "ssh" ? { stdout: sshConfigOutput({ hostname: HOST, port: "22" }), ok: true } : { stdout: "", ok: false };
     stubKnownHostsFor(HOST, [{ type: "ecdsa-sha2-nistp256", blob: keyBlob("ecdsa-sha2-nistp256", "k") }]);
     const pool = new ConnectionPool();
     try {
@@ -715,6 +756,184 @@ describe("rejection remediation commands are pasteable for an IPv6 host", () => 
   });
 });
 
+describe("a non-22 port: [host]:port entries decide, a bare-host entry can only accept", () => {
+  // OpenSSH semantics. A bare `host` line describes what answers on port 22 -- often a
+  // DIFFERENT sshd from the one on :2222 (a git server, a container) -- so it must never
+  // turn the :2222 server into a "key-mismatch". It used to: both spellings were merged
+  // into one accept/reject set, while a host absent from known_hosts was accepted.
+  const HOST = "multi-port.test";
+  const PORT = 2222;
+  const QUALIFIED = `[${HOST}]:${PORT}`;
+  const SERVER_KEY = keyBlob("ssh-ed25519", "the-2222-server");
+  const PORT22_KEY = keyBlob("ssh-ed25519", "the-port-22-server");
+
+  function knownHostsTable(table: Record<string, Array<{ type: string; blob: Buffer }>>) {
+    stubs.runArgs.fn = (cmd, args) => {
+      const entries = cmd === "ssh-keygen" ? table[args[1]] : undefined;
+      return entries ? { stdout: keygenOutput(args[1], entries), ok: true } : { stdout: "", ok: false };
+    };
+  }
+
+  function verifierFor() {
+    const resolved = resolveConfig({ host: HOST, port: PORT });
+    return { resolved, verify: resolved.connectConfig.hostVerifier as (key: Buffer) => boolean };
+  }
+
+  it("1. a matching [host]:port entry accepts, and a different same-type key there is a mismatch", () => {
+    knownHostsTable({ [QUALIFIED]: [{ type: "ssh-ed25519", blob: SERVER_KEY }] });
+    const { resolved, verify } = verifierFor();
+    expect(verify(SERVER_KEY)).toBe(true);
+    expect(verify(keyBlob("ssh-ed25519", "imposter"))).toBe(false);
+    expect(resolved.hostKeyRejection?.current?.reason).toBe("key-mismatch");
+    // The removal must name the port-qualified line: the bare spelling would delete the
+    // port-22 entry and leave the stale one (probed on OpenSSH 10.6p1).
+    expect(resolved.hostKeyRejection?.current?.message).toContain(`ssh-keygen -R "${QUALIFIED}"`);
+    expect(resolved.hostKeyRejection?.current?.message).not.toContain(`ssh-keygen -R "${HOST}"`);
+  });
+
+  it("2. a bare-host entry with a DIFFERENT key does not reject: the :2222 server is unknown", () => {
+    knownHostsTable({ [HOST]: [{ type: "ssh-ed25519", blob: PORT22_KEY }] });
+    const lenient = verifierFor();
+    expect(lenient.verify(SERVER_KEY)).toBe(true); // was: rejected as a possible MITM
+    expect(lenient.resolved.hostKeyRejection?.current).toBeNull();
+
+    vi.stubEnv("SSH_MCP_STRICT_HOSTKEYS", "1");
+    const strict = verifierFor();
+    expect(strict.verify(SERVER_KEY)).toBe(false);
+    expect(strict.resolved.hostKeyRejection?.current?.reason).toBe("unknown-host-strict");
+    expect(strict.resolved.hostKeyRejection?.current?.message).toContain(`ssh-keyscan -H -p ${PORT} "${HOST}"`);
+  });
+
+  it("3. a bare-host entry with the SAME key accepts, in strict mode too", () => {
+    knownHostsTable({ [HOST]: [{ type: "ssh-ed25519", blob: SERVER_KEY }] });
+    vi.stubEnv("SSH_MCP_STRICT_HOSTKEYS", "1");
+    const { resolved, verify } = verifierFor();
+    expect(verify(SERVER_KEY)).toBe(true);
+    expect(resolved.hostKeyRejection?.current).toBeNull();
+  });
+
+  it("4. no entry under either spelling: accepted (trust-always), rejected under strict mode", () => {
+    knownHostsTable({});
+    expect(verifierFor().verify(SERVER_KEY)).toBe(true);
+    vi.stubEnv("SSH_MCP_STRICT_HOSTKEYS", "1");
+    const strict = verifierFor();
+    expect(strict.verify(SERVER_KEY)).toBe(false);
+    expect(strict.resolved.hostKeyRejection?.current?.reason).toBe("unknown-host-strict");
+  });
+
+  it("a [host]:port entry is authoritative: a bare-host match cannot override its mismatch", () => {
+    // Strictly stronger than before, when ANY match across both spellings accepted.
+    knownHostsTable({
+      [QUALIFIED]: [{ type: "ssh-ed25519", blob: SERVER_KEY }],
+      [HOST]: [{ type: "ssh-ed25519", blob: PORT22_KEY }],
+    });
+    const { resolved, verify } = verifierFor();
+    expect(verify(PORT22_KEY)).toBe(false);
+    expect(resolved.hostKeyRejection?.current?.reason).toBe("key-mismatch");
+  });
+
+  it("still orders host-key algorithms from bare-host entries", () => {
+    knownHostsTable({ [HOST]: [{ type: "ecdsa-sha2-nistp256", blob: keyBlob("ecdsa-sha2-nistp256", "k") }] });
+    const { resolved } = verifierFor();
+    resolved.applyHostKeyAlgorithms?.();
+    const order = resolved.connectConfig.algorithms?.serverHostKey as string[] | undefined;
+    expect(order?.[0]).toBe("ecdsa-sha2-nistp256");
+  });
+});
+
+describe("remediation commands use the RESOLVED hostname and port", () => {
+  // ssh-keyscan does not read ssh_config, so `ssh-keyscan -H "prod"` cannot resolve a
+  // `Host prod` alias, and without -p it scans port 22.
+  const ALIAS = "prod";
+  const ADDR = "10.0.0.5";
+
+  function aliasOnPort(port: string, knownHosts: Record<string, Array<{ type: string; blob: Buffer }>>) {
+    stubs.runArgs.fn = (cmd, args) => {
+      if (cmd === "ssh") return { stdout: sshConfigOutput({ hostname: ADDR, port }), ok: true };
+      const entries = cmd === "ssh-keygen" ? knownHosts[args[1]] : undefined;
+      return entries ? { stdout: keygenOutput(args[1], entries), ok: true } : { stdout: "", ok: false };
+    };
+    const resolved = resolveConfig({ host: ALIAS });
+    return { resolved, verify: resolved.connectConfig.hostVerifier as (key: Buffer) => boolean };
+  }
+
+  it("keyscan names the address and port, never the alias", () => {
+    const { resolved, verify } = aliasOnPort("2222", {
+      [`[${ADDR}]:2222`]: [{ type: "ecdsa-sha2-nistp256", blob: keyBlob("ecdsa-sha2-nistp256", "k") }],
+    });
+    expect(verify(keyBlob("ssh-ed25519", "offered"))).toBe(false);
+    const message = resolved.hostKeyRejection?.current?.message ?? "";
+    expect(resolved.hostKeyRejection?.current?.reason).toBe("algorithm-not-in-known-hosts");
+    expect(message).toContain(`ssh-keyscan -H -p 2222 "${ADDR}" >> ~/.ssh/known_hosts`);
+    expect(message).not.toContain(`ssh-keyscan -H "${ALIAS}"`);
+  });
+
+  it("the strict-mode 'add it' command does the same", () => {
+    vi.stubEnv("SSH_MCP_STRICT_HOSTKEYS", "1");
+    const { resolved, verify } = aliasOnPort("22", {});
+    expect(verify(keyBlob("ssh-ed25519", "x"))).toBe(false);
+    expect(resolved.hostKeyRejection?.current?.message).toContain(`ssh-keyscan -H "${ADDR}"`);
+    expect(resolved.hostKeyRejection?.current?.message).not.toContain(`"${ALIAS}"`);
+  });
+
+  it("ssh-keygen -R names the spelling the conflicting entry was found under", () => {
+    const { resolved, verify } = aliasOnPort("2222", {
+      [`[${ADDR}]:2222`]: [{ type: "ssh-ed25519", blob: keyBlob("ssh-ed25519", "real") }],
+    });
+    expect(verify(keyBlob("ssh-ed25519", "imposter"))).toBe(false);
+    expect(resolved.hostKeyRejection?.current?.message).toContain(`ssh-keygen -R "[${ADDR}]:2222"`);
+  });
+
+  it("formatDiagnostics' keyscan suggestion follows the resolved target too", () => {
+    stubs.knownHostsCheck = { status: "warning", message: "no entry" };
+    const { resolved } = aliasOnPort("2222", {});
+    const enhanced = enhanceSshError(new Error("boom"), ALIAS, resolved) as Error;
+    expect(enhanced.message).toContain(`Add host key: ssh-keyscan -H -p 2222 "${ADDR}"`);
+  });
+});
+
+describe("`ssh -G` probing", () => {
+  it("does not memoize a FAILED probe, so a transient failure is retried", () => {
+    let calls = 0;
+    stubs.runArgs.fn = (cmd) => {
+      if (cmd !== "ssh") return { stdout: "", ok: false };
+      calls++;
+      return calls === 1
+        ? { stdout: "timed out", ok: false }
+        : { stdout: sshConfigOutput({ hostname: "real.internal", port: "2200" }), ok: true };
+    };
+    expect(resolveConfig({ host: "flaky.test" }).connectConfig.host).toBe("flaky.test");
+    const second = resolveConfig({ host: "flaky.test" }).connectConfig;
+    expect(second.host).toBe("real.internal"); // was: the failure cached until restart
+    expect(second.port).toBe(2200);
+    // ...while a SUCCESSFUL answer stays memoized for the process lifetime.
+    resolveConfig({ host: "flaky.test" });
+    expect(calls).toBe(2);
+  });
+
+  it("puts `--` before the host so it can never be parsed as an option", () => {
+    stubs.runArgs.fn = () => ({ stdout: "", ok: false });
+    resolveConfig({ host: "plain-host.test" });
+    const probe = stubs.runArgsCalls.find((c) => c.cmd === "ssh");
+    expect(probe?.args).toEqual(["-G", "--", "plain-host.test"]);
+  });
+
+  it("never spawns ssh for an option-shaped or injection-shaped host", () => {
+    for (const host of ["-oProxyCommand=evil", "-E/tmp/x", "host; rm -rf /"]) {
+      clearSshConfigCache();
+      resolveConfig({ host, password: "x" });
+    }
+    expect(stubs.runArgsCalls.filter((c) => c.cmd === "ssh")).toEqual([]);
+  });
+
+  it("still probes a bracketed or bare IPv6 literal", () => {
+    resolveConfig({ host: "[::1]", password: "x" });
+    clearSshConfigCache();
+    resolveConfig({ host: "::1", password: "x" });
+    expect(stubs.runArgsCalls.filter((c) => c.cmd === "ssh").map((c) => c.args.at(-1))).toEqual(["[::1]", "::1"]);
+  });
+});
+
 // ---------------------------------------------------------------- finding 3
 
 describe("diagnostics cover config resolution, not just the connect", () => {
@@ -792,10 +1011,11 @@ describe("a host-key rejection on the JUMP host is not swallowed", () => {
     // case, which is precisely the one ssh2 reports as an opaque "Host denied".
     stubs.runArgs.fn = (cmd, args) => {
       if (cmd === "ssh") {
-        if (args[1] === TARGET) {
+        // `ssh -G -- <host>`: the host is the LAST argument.
+        if (args.at(-1) === TARGET) {
           return { stdout: sshConfigOutput({ hostname: TARGET, user: "t", port: "22", proxyjump: BASTION }), ok: true };
         }
-        if (args[1] === BASTION) {
+        if (args.at(-1) === BASTION) {
           return { stdout: sshConfigOutput({ hostname: BASTION, user: "t", port: "22" }), ok: true };
         }
       }
@@ -1083,7 +1303,8 @@ function stubSshEnvironment(opts: {
   knownHosts?: Record<string, Array<{ type: string; blob: Buffer }>>;
 }) {
   stubs.runArgs.fn = (cmd, args) => {
-    const target = args[1];
+    // `ssh -G -- <host>` and `ssh-keygen -F <target>` both end in the name.
+    const target = args.at(-1) as string;
     if (cmd === "ssh") {
       const fields = opts.sshConfig[target];
       return fields ? { stdout: sshConfigOutput(fields), ok: true } : { stdout: "", ok: false };
@@ -1222,6 +1443,87 @@ describe("connectWithProxy parses the ProxyJump spec instead of re-resolving it 
 
 // ---------------------------------------------------------------- known_hosts markers
 
+describe("a ProxyJump cycle fails clearly instead of recursing forever", () => {
+  it("stops a two-host cycle (a -> b -> a) with a 'ProxyJump loop' error and no dial", async () => {
+    // `ssh -G` catches a self-referential ProxyJump ("jumphost loop via bastion") but
+    // NOT a mutual one, which used to end as "Maximum call stack size exceeded".
+    stubSshEnvironment({
+      sshConfig: {
+        "loop-a.test": { hostname: "loop-a.test", port: "22", proxyjump: "loop-b.test" },
+        "loop-b.test": { hostname: "loop-b.test", port: "22", proxyjump: "loop-a.test" },
+      },
+    });
+    const err = await connect({ host: "loop-a.test" }).catch((e: unknown) => e);
+    expect((err as Error).message).toContain("ProxyJump loop via loop-a.test");
+    expect((err as Error).message).not.toContain("Maximum call stack");
+    expect(stubs.dials).toEqual([]);
+  });
+
+  it("caps a chain that never repeats a host at MAX_PROXY_JUMP_DEPTH hops", async () => {
+    const sshConfig: Record<string, Record<string, string>> = {};
+    for (let i = 0; i < 20; i++) {
+      sshConfig[`hop${i}.test`] = { hostname: `hop${i}.test`, port: "22", proxyjump: `hop${i + 1}.test` };
+    }
+    stubSshEnvironment({ sshConfig });
+    const err = await connect({ host: "hop0.test" }).catch((e: unknown) => e);
+    expect((err as Error).message).toContain(`exceeds ${MAX_PROXY_JUMP_DEPTH} hops`);
+    expect(stubs.dials).toEqual([]);
+  });
+
+  it("allows exactly MAX_PROXY_JUMP_DEPTH hops and refuses one more", async () => {
+    // hop0 is the target; hop1..hopN are the N jump hosts, the last with no ProxyJump.
+    const chainOf = (hopCount: number) => {
+      const sshConfig: Record<string, Record<string, string>> = {};
+      for (let i = 0; i <= hopCount; i++) {
+        sshConfig[`edge${i}.test`] =
+          i < hopCount
+            ? { hostname: `edge${i}.test`, port: "22", proxyjump: `edge${i + 1}.test` }
+            : { hostname: `edge${i}.test`, port: "22" };
+      }
+      return sshConfig;
+    };
+    stubSshEnvironment({ sshConfig: chainOf(MAX_PROXY_JUMP_DEPTH) });
+    await connect({ host: "edge0.test" });
+    expect(stubs.dials).toHaveLength(MAX_PROXY_JUMP_DEPTH + 1); // every hop, then the target
+
+    clearSshConfigCache();
+    stubs.dials.length = 0;
+    stubSshEnvironment({ sshConfig: chainOf(MAX_PROXY_JUMP_DEPTH + 1) });
+    const err = await connect({ host: "edge0.test" }).catch((e: unknown) => e);
+    expect((err as Error).message).toContain(`exceeds ${MAX_PROXY_JUMP_DEPTH} hops`);
+    expect(stubs.dials).toEqual([]);
+  });
+
+  it("leaves an ordinary two-hop chain alone", async () => {
+    stubSshEnvironment({
+      sshConfig: {
+        "chain-target.test": { hostname: "chain-target.test", port: "22", proxyjump: "chain-jump.test" },
+        "chain-jump.test": { hostname: "chain-jump.test", port: "22" },
+      },
+    });
+    await connect({ host: "chain-target.test" });
+    expect(stubs.dials.map((d) => d.host)).toEqual(["chain-jump.test", "chain-target.test"]);
+  });
+});
+
+describe("exec when client.exec throws synchronously", () => {
+  it("rejects AND clears the timeout timer (ssh2 throws 'Not connected' on a dead socket)", async () => {
+    vi.useFakeTimers();
+    try {
+      const client: any = {
+        exec: () => {
+          throw new Error("Not connected");
+        },
+      };
+      await expect(exec(client, "uptime", 30_000)).rejects.toThrow("Not connected");
+      // Without the catch, the ref'd 30s timer stayed pending and held the event loop.
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("readKnownHostsEntries skips known_hosts marker lines", () => {
   const HOST = "corp.example.com";
   const REAL = keyBlob("ssh-ed25519", "the-real-host-key");
@@ -1261,12 +1563,27 @@ describe("readKnownHostsEntries skips known_hosts marker lines", () => {
     expect(readKnownHostsEntries(HOST).map((e) => e.type)).toEqual(["ssh-ed25519"]);
   });
 
-  it("the malformed entry decoded silently, which is why the try/catch never fired", () => {
-    // Pins the premise: parts[2] on the @cert-authority line is the literal string
-    // "ssh-ed25519", and Node accepts "-" as base64url, so this yields 8 junk bytes
-    // instead of throwing -- the junk went straight into the comparison set.
-    expect(() => Buffer.from("ssh-ed25519", "base64")).not.toThrow();
-    expect(Buffer.from("ssh-ed25519", "base64")).toHaveLength(8);
+  it("drops a line whose key blob is corrupt, so it cannot make the host 'known'", () => {
+    // Node's base64 decoder never throws: "!!!notbase64***" decodes to junk bytes.
+    // `ssh-keygen -F` echoes such a line verbatim, and keeping it made the host count
+    // as KNOWN -- then every key, the real one included, was rejected as a mismatch.
+    stubs.runArgs.fn = (cmd, args) =>
+      cmd === "ssh-keygen" && args[1] === "corrupt.test"
+        ? {
+            stdout: [
+              "corrupt.test ssh-ed25519 !!!notbase64***",
+              // A well-formed blob whose embedded type disagrees with the type column.
+              `corrupt.test ssh-ed25519 ${keyBlob("ssh-rsa", "wrong-type").toString("base64")}`,
+            ].join("\n"),
+            ok: true,
+          }
+        : { stdout: "", ok: false };
+    expect(readKnownHostsEntries("corrupt.test")).toEqual([]);
+
+    const resolved = resolveConfig({ host: "corrupt.test" });
+    const verify = resolved.connectConfig.hostVerifier as (key: Buffer) => boolean;
+    expect(verify(keyBlob("ssh-ed25519", "whatever-the-server-offers"))).toBe(true); // unknown, not "mismatch"
+    expect(resolved.hostKeyRejection?.current).toBeNull();
   });
 
   it("accepts the real host key and rejects both the CA key and the revoked key", () => {

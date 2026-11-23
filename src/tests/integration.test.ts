@@ -241,11 +241,32 @@ describe.skipIf(!canRunJump)("integration: ProxyJump through a real bastion", ()
   });
 
   it("cannot reach the target directly -- the premise of the whole test", async () => {
-    // If this ever starts passing, the target got published and every assertion
-    // below stops proving anything about the jump.
-    await expect(
-      connect({ host: "127.0.0.1", port: 2299, username: TEST_USER, privateKeyPath: TEST_KEY }),
-    ).rejects.toThrow();
+    // Two halves, because neither alone proves the target is jump-only. (1) The fixture
+    // publishes no port for `target`: publishing it on ANY host port would let a direct
+    // dial succeed, so the compose service block itself must carry no `ports:` key.
+    const compose = readFileSync(join(__dirname, "../../test/docker/docker-compose.yml"), "utf8");
+    // The service's body: every following line indented deeper than the service name.
+    const targetBlock = compose.match(/^ {2}target:\r?\n((?:(?: {3,}.*)?(?:\r?\n|$))*)/m)?.[1];
+    expect(targetBlock, "docker-compose.yml has no `target` service").toBeDefined();
+    expect(targetBlock).not.toMatch(/^\s+ports:/m);
+    // (2) Dial exactly what the jump dials -- `target:22` -- from the runner. The name
+    // resolves only inside the compose network, so this must fail at DNS (or, if a stray
+    // `target` resolves locally, at connect), not on some unrelated error such as a bad key.
+    // Match the ORIGINAL error (enhanceSshError keeps it as `cause`), not the enhanced
+    // message: the appended diagnostics probe `target` too and print their own DNS/TCP
+    // failure, so a key error would otherwise pass this check on the report's text alone.
+    const err = await connect({ host: "target", port: 22, username: TEST_USER, privateKeyPath: TEST_KEY }).then(
+      (c) => {
+        c.end();
+        return undefined;
+      },
+      (e: unknown) => e,
+    );
+    expect(err, "a direct dial to target:22 succeeded -- the target is reachable without the jump").toBeInstanceOf(
+      Error,
+    );
+    const original = ((err as Error).cause ?? err) as Error;
+    expect(original.message).toMatch(/ENOTFOUND|EAI_AGAIN|getaddrinfo|ECONNREFUSED|EHOSTUNREACH|ETIMEDOUT/);
   });
 
   it("reaches the target THROUGH the bastion and runs a command there", async () => {
@@ -260,11 +281,11 @@ describe.skipIf(!canRunJump)("integration: ProxyJump through a real bastion", ()
     const client = await connectWithProxy(resolved);
     try {
       const result = await exec(client, "hostname");
-      // The remote hostname is the container's, proving the command ran on the
-      // TARGET rather than on the bastion we tunnelled through.
+      // The compose fixture pins `hostname: target` (and `bastion`), so this equality
+      // is what proves the command ran on the TARGET rather than on the bastion we
+      // tunnelled through -- any non-empty hostname would not.
       expect(result.code).toBe(0);
-      expect(result.stdout.trim()).toBeTruthy();
-      expect(result.stdout.trim()).not.toBe("");
+      expect(result.stdout.trim()).toBe("target");
     } finally {
       client.end();
     }
@@ -272,26 +293,50 @@ describe.skipIf(!canRunJump)("integration: ProxyJump through a real bastion", ()
 
   it("closes the jump connection when the target connection closes", async () => {
     // The documented promise: jump connections close with the target. A leak here
-    // is invisible until a fan-out exhausts the bastion's MaxSessions.
-    const resolved: ResolvedConfig = {
-      connectConfig: { host: "target", port: 22, username: TEST_USER, privateKey: readFileSync(TEST_KEY) },
-      proxyJump: `${TEST_USER}@127.0.0.1:${BASTION_PORT}`,
-    };
-    const client = await connectWithProxy(resolved);
-    const closed = new Promise<void>((resolve) => client.once("close", () => resolve()));
-    client.end();
-    await closed;
-    // Re-connecting proves the bastion did not run out of channels, i.e. the
-    // previous jump client was actually torn down rather than left dangling.
-    const again = await connectWithProxy(resolved);
-    again.end();
+    // is invisible until a fan-out exhausts the bastion's MaxSessions, and one
+    // leaked client never gets there -- so count the bastion's TCP connections on
+    // port 22 directly instead. A jump adds two (our inbound hop, the bastion's
+    // forwarded dial to target:22); both must be gone once the target closes.
+    // /proc/net/tcp state 01 = ESTABLISHED, port 22 = 0x0016.
+    const countSsh22 =
+      "cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk '$4==\"01\" && ($2 ~ /:0016$/ || $3 ~ /:0016$/)' | wc -l";
+    const observer = await connect({
+      host: TEST_HOST,
+      port: BASTION_PORT,
+      username: TEST_USER,
+      privateKeyPath: TEST_KEY,
+    });
+    const established = async () => Number.parseInt((await exec(observer, countSsh22)).stdout.trim(), 10);
+    try {
+      const baseline = await established(); // includes the observer's own connection
+      const resolved: ResolvedConfig = {
+        connectConfig: { host: "target", port: 22, username: TEST_USER, privateKey: readFileSync(TEST_KEY) },
+        proxyJump: `${TEST_USER}@127.0.0.1:${BASTION_PORT}`,
+      };
+      const client = await connectWithProxy(resolved);
+      // Sanity: the measurement can see the jump at all, or the "after" check proves nothing.
+      expect(await established()).toBeGreaterThan(baseline);
+      const closed = new Promise<void>((resolve) => client.once("close", () => resolve()));
+      client.end();
+      await closed;
+      // Teardown is asynchronous on the bastion side; poll briefly for it.
+      let after = await established();
+      for (let i = 0; i < 25 && after > baseline; i++) {
+        await new Promise((r) => setTimeout(r, 200));
+        after = await established();
+      }
+      expect(after).toBe(baseline);
+    } finally {
+      observer.end();
+    }
   });
 });
 
 describe.skipIf(!INTEGRATION)("integration: ProxyJump failure", () => {
-  it("rejects and cleans up when the jump host is unreachable", async () => {
+  it("rejects when the jump host is unreachable", async () => {
     // Construct a ResolvedConfig that points at a definitely-unreachable jump host.
-    // connectWithProxy should recurse into the jump, fail, and not leak connections.
+    // connectWithProxy should recurse into the jump and fail rather than hang. Only the
+    // rejection is asserted; jump teardown is covered by the bastion-session count above.
     const resolved: ResolvedConfig = {
       connectConfig: { host: TEST_HOST, port: TEST_PORT, username: TEST_USER },
       proxyJump: "ssh-mcp-nonexistent-jump.invalid",
@@ -330,8 +375,9 @@ describe.skipIf(!INTEGRATION)("integration: SFTP error paths", () => {
   });
 });
 
-// NOTE: maxPoolSize eviction cannot be exercised end-to-end with the current Docker
-// setup (single sshd container, single port). The pool key is username@host:port, so
-// two distinct entries require two distinct endpoints. When the test fixture grows to
-// multiple containers, add: acquire N+1 entries with maxPoolSize=N, verify the oldest
-// idle entry is evicted and the new one succeeds.
+// NOTE: maxPoolSize eviction is not exercised end-to-end here yet, though the fixture
+// can now support it: the compose file publishes two endpoints (sshd on 2222, bastion
+// on 2223), and the pool key folds an auth fingerprint into user@host:port (pool.ts),
+// so two entries are reachable either via the two ports or via two credentials on one
+// endpoint. The test to add: acquire N+1 entries with maxPoolSize=N and verify the
+// oldest idle entry is evicted and the new acquire succeeds.

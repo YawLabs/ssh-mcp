@@ -194,7 +194,10 @@ describe("server: --version answers before main() attaches a transport", () => {
   });
 });
 
-describe("server: stdin EOF runs the exit backstop", () => {
+describe("server: stdin EOF runs shutdown(), then the exit backstop", () => {
+  // shutdown() (close, drain, kill), then the process.on("exit") backstop.
+  const EOF_STEPS = ["connect", "ready", "close", "drain", "kill", "drain", "kill"];
+
   it("stays up while stdin is open, then exits 0 when the host closes it", async () => {
     const layout = makeServerLayout();
     const child = spawn(process.execPath, [layout.entry], {
@@ -225,12 +228,14 @@ describe("server: stdin EOF runs the exit backstop", () => {
     child.stdin.end();
     expect(await exited).toBe(0);
 
-    // The backstop, and ONLY the backstop: pipe-close fires neither SIGINT nor
-    // SIGTERM, so shutdown() never runs and server.close() is never called.
-    // pool.drain() and killStartedAgent() happen anyway -- an ssh-agent this
-    // process spawned itself gets reaped rather than leaked once per session,
-    // silently and cumulatively, if this regresses.
-    expect(steps(layout)).toEqual(["connect", "ready", "drain", "kill"]);
+    // Pipe-close fires neither SIGINT nor SIGTERM, so src/index.ts hooks stdin
+    // 'end' / 'close' to the same shutdown() SIGTERM runs: server.close(), then
+    // drain + agent reap, then exit -- instead of lingering on ref'd pool sockets
+    // until the idle TTL. shutdown() is guarded, so 'end' followed by 'close'
+    // closes ONCE; the idempotent exit backstop then drains and reaps again.
+    // An ssh-agent this process spawned itself gets reaped rather than leaked
+    // once per session, silently and cumulatively, if this regresses.
+    expect(steps(layout)).toEqual(EOF_STEPS);
   });
 
   it("reaps the agent even when stdin was never open", () => {
@@ -238,7 +243,7 @@ describe("server: stdin EOF runs the exit backstop", () => {
     const layout = makeServerLayout();
     const r = runServer(layout);
     expect(r.status).toBe(0);
-    expect(steps(layout)).toEqual(["connect", "ready", "drain", "kill"]);
+    expect(steps(layout)).toEqual(EOF_STEPS);
   });
 });
 
@@ -412,7 +417,9 @@ function runLauncher(layout: LauncherLayout, opts: LauncherOpts = {}) {
   for (const [k, v] of Object.entries(process.env)) {
     if (typeof v !== "string") continue;
     if (
-      /^(path|oam_bin|ssh_mcp_runtime|userprofile|home|localappdata|spawn_log|fake_code|fake_signal|fake_oam_versions|fake_node_as_oam)$/i.test(
+      // oam_install_dir too: discovery searches $OAM_INSTALL_DIR FIRST, so a real
+      // oam the developer pointed it at would win a tie over the planted ones.
+      /^(path|oam_bin|oam_install_dir|ssh_mcp_runtime|userprofile|home|localappdata|spawn_log|fake_code|fake_signal|fake_oam_versions|fake_node_as_oam)$/i.test(
         k,
       )
     ) {
@@ -489,6 +496,25 @@ describe("launcher: every oam found is asked, and the newest wins", () => {
     expect(r.status, JSON.stringify(r)).toBe(0);
     expect(spawnedWith(layout).cmd).toBe(onPath);
     expect(spawnedWith(layout).cmd).not.toBe(installed);
+  });
+
+  it("keeps an OAM_INSTALL_DIR in the suite's own environment away from the launcher", () => {
+    // runLauncher builds the child env from process.env. OAM_INSTALL_DIR is
+    // searched before every other location, so one set on the developer's box
+    // pointing at a real oam at the floor won the tie and broke the cases here.
+    const layout = makeLauncherLayout();
+    const outside = plantRunnableOam(join(layout.dir, "real-install"));
+    const onPath = plantRunnableOam(join(layout.dir, "pathdir"));
+    const saved = process.env.OAM_INSTALL_DIR;
+    process.env.OAM_INSTALL_DIR = dirname(outside);
+    try {
+      const r = runLauncher(layout, { mode: "oam", pathDirs: [join(layout.dir, "pathdir")], spy: true });
+      expect(r.status, JSON.stringify(r)).toBe(0);
+      expect(spawnedWith(layout).cmd).toBe(onPath);
+    } finally {
+      if (saved === undefined) delete process.env.OAM_INSTALL_DIR;
+      else process.env.OAM_INSTALL_DIR = saved;
+    }
   });
 
   it("uses the newest usable oam, not the first usable one found", () => {

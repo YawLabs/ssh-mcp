@@ -1,7 +1,35 @@
 import type { AddressInfo } from "node:net";
 import { Server, utils } from "ssh2";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { connectWithProxy, exec, type ResolvedConfig } from "../ssh.js";
+
+// Isolate the JUMP hop from the developer's machine. connectWithProxy builds each hop via
+// resolveConfig, which runs `ssh -G` (a `Host *` ProxyJump would reroute it), consults
+// known_hosts through `ssh-keygen -F` (a bare `127.0.0.1` entry is checked for non-22
+// ports too), reads the strict-mode env, and walks the default keys under the home dir (an
+// encrypted ~/.ssh/id_ed25519 with no agent fails the hop on POSIX). So: both helpers report
+// "unavailable", the home dir is an empty temp dir, and the env is cleared per test.
+vi.mock("../diagnose.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../diagnose.js")>();
+  return { ...actual, runArgs: () => ({ stdout: "", ok: false }) };
+});
+vi.mock("node:os", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:os")>();
+  const { mkdtempSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const home = mkdtempSync(join(actual.tmpdir(), "ssh-mcp-proxyjump-home-"));
+  const homedir = () => home;
+  return { ...actual, default: { ...actual, homedir }, homedir };
+});
+
+beforeEach(() => {
+  vi.stubEnv("SSH_MCP_STRICT_HOSTKEYS", "");
+  vi.stubEnv("SSH_MCP_STRICT_HOST_KEY", "");
+  vi.stubEnv("SSH_AUTH_SOCK", "");
+});
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 // ---------------------------------------------------------------------------
 // ProxyJump against REAL SSH servers, in process.
@@ -101,8 +129,9 @@ const baseTarget = (port: number) => ({
   username: "tester",
   password: "irrelevant",
   // These servers present a freshly generated host key that is in no known_hosts,
-  // which is the documented trust-always default. Pinned explicitly so the test
-  // does not depend on the ambient SSH_MCP_STRICT_HOST_KEY of the machine.
+  // which is the documented trust-always default. This pins only the TARGET's
+  // verifier; the jump hop gets its own from resolveConfig, which is why the module
+  // mocks and env stubs at the top of this file exist.
   hostVerifier: () => true,
 });
 

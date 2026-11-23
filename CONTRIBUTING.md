@@ -38,8 +38,10 @@ npm test
 | `npm run build` | Compile TypeScript |
 | `npm run dev` | Run in development mode |
 | `npm test` | Run the test suite |
-| `npm run lint` | Check for lint errors |
-| `npm run lint:fix` | Auto-fix lint and formatting |
+| `npm run lint` | Check for lint errors (`src/`, `bin/` and `scripts/`) |
+| `npm run lint:fix` | Auto-fix lint and formatting (same directories) |
+| `npm run typecheck` | Type-check with `tsc --noEmit` (vitest does not type-check) |
+| `npm run test:integration` | Run the integration suite against the Docker fixture in `test/docker/` (requires Docker; exits with the suite's status) |
 
 ## Code Style
 

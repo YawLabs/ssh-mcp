@@ -5,17 +5,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // ---------------------------------------------------------------------------
 // Harness
 //
-// Everything under test shells out through `runArgs` (diagnose.ts) or
-// `runArgsWithEnv` (env.ts), both thin wrappers over `execFileSync`. Mocking
-// `node:child_process` -- rather than the wrappers -- keeps the REAL wrappers,
-// the REAL classification and the REAL callers in the run; only the subprocess
-// is fake.
+// Everything under test shells out through `runArgs` (diagnose.ts), a thin
+// wrapper over `execFileSync`. Mocking `node:child_process` -- rather than the
+// wrapper -- keeps the REAL wrapper, the REAL classification and the REAL callers
+// in the run; only the subprocess is fake.
 //
 // The fake records the child ENV as well as argv. That is load-bearing for the
-// probeAgent tests: `runArgs` passes NO env (the child inherits process.env) and
-// `runArgsWithEnv` passes a full copy, so `call.env === undefined` distinguishes
-// the two, and the copy is the only place probeAgent's channel selection is
-// observable at all -- it never shows up in the returned AgentResult.
+// probeAgent tests: `runArgs` without an `env` option passes NO env (the child
+// inherits process.env) and with one passes a full copy, so `call.env ===
+// undefined` distinguishes the two, and the copy is the only place probeAgent's
+// channel selection is observable at all -- it never shows up in the AgentResult.
 // ---------------------------------------------------------------------------
 
 type FakeRun = { stdout?: string; stderr?: string; fail?: boolean };
@@ -23,7 +22,7 @@ type FakeRun = { stdout?: string; stderr?: string; fail?: boolean };
 interface ExecCall {
   cmd: string;
   args: string[];
-  /** The child env, present ONLY when the caller passed one (runArgsWithEnv does; runArgs does not). */
+  /** The child env, present ONLY when the caller passed runArgs an `env` override. */
   env?: Record<string, string>;
   /** The windowsHide option as passed, so the no-console-flash setting is pinned. */
   windowsHide?: boolean;
@@ -168,6 +167,7 @@ import {
   fixKnownHosts,
   killStartedAgent,
   listSshKeysDetailed,
+  loadKey,
   testConnection,
 } from "../env.js";
 
@@ -262,15 +262,19 @@ describe("checkGitSsh classifies each provider's real transcript", () => {
       expect(r.message).toBe("Git SSH authentication to gitlab.com succeeded as jeff-yaw");
     });
 
-    it("reads Bitbucket's 'logged in as <user>' -- INCLUDING the trailing period (see bugsFound)", () => {
+    it("reads Bitbucket's 'logged in as <user>.' WITHOUT the sentence-ending period", () => {
       sshSays(BITBUCKET);
       const r = checkGitSsh("bitbucket.org");
       expect(r.status).toBe("ok");
-      // Bitbucket really does write "logged in as jeffy." and `(\S+)` runs to the
-      // next whitespace, so the sentence-ending period lands INSIDE the username.
-      // Pinned as-is: this documents today's behaviour, it is not an endorsement.
-      expect(r.authenticatedAs).toBe("jeffy.");
-      expect(r.message).toBe("Git SSH authentication to bitbucket.org succeeded as jeffy.");
+      // `(\S+)` runs to the next whitespace and so captures "jeffy."; the trailing
+      // punctuation is stripped from the name.
+      expect(r.authenticatedAs).toBe("jeffy");
+      expect(r.message).toBe("Git SSH authentication to bitbucket.org succeeded as jeffy");
+    });
+
+    it("keeps punctuation INSIDE a name, stripping only the trailing run", () => {
+      sshSays("logged in as jeff.yaw.");
+      expect(checkGitSsh("bitbucket.org").authenticatedAs).toBe("jeff.yaw");
     });
 
     it("reads a period-less 'logged in as <user>' cleanly", () => {
@@ -292,12 +296,11 @@ describe("checkGitSsh classifies each provider's real transcript", () => {
       expect(checkGitSsh("github.com").authenticatedAs).toBe("jeffy");
     });
 
-    it("lets an @-form in a banner hijack 'logged in as' (see bugsFound)", () => {
-      // The @-regex is tried BEFORE the "logged in as" one, so banner text shaped
-      // like "@word!" is mistaken for the username. Pinned to lock the extraction
-      // ORDER in place; the ordering is what this documents.
+    it("does not let an @-form in a banner hijack 'logged in as'", () => {
+      // "logged in as" is tried BEFORE the loose @-regex, so banner text shaped like
+      // "@word!" is not mistaken for the username.
       sshSays("Contact @ops-team!\nlogged in as jeffy");
-      expect(checkGitSsh("bitbucket.org").authenticatedAs).toBe("ops-team");
+      expect(checkGitSsh("bitbucket.org").authenticatedAs).toBe("jeffy");
     });
 
     it("checks the success wordings BEFORE the failure wordings", () => {
@@ -359,6 +362,31 @@ describe("checkGitSsh classifies each provider's real transcript", () => {
       expect(checkGitSsh("github.com").message).toContain("Permission denied for github.com");
     });
 
+    it("maps 'Host key verification failed' (unknown host under BatchMode, or a changed key) to the fix tool", () => {
+      // The default StrictHostKeyChecking=ask cannot prompt under BatchMode, so an
+      // unknown github.com fails exactly like a changed key.
+      sshSays("Host key verification failed.");
+      const r = checkGitSsh("github.com");
+      expect(r.status).toBe("error");
+      expect(r.message).toBe(
+        "Host key verification failed for github.com: it is either not in known_hosts (BatchMode cannot prompt to add it) or its key changed. Fix with ssh_known_hosts_fix.",
+      );
+    });
+
+    it("classifies a changed-key banner as a host-key failure even when auth then fails", () => {
+      sshSays("WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\ngit@github.com: Permission denied (publickey).");
+      expect(checkGitSsh("github.com").message).toContain("Host key verification failed for github.com");
+    });
+
+    it("maps runArgs' own kill-on-timeout to the timeout wording", () => {
+      execHandler = () => {
+        throw Object.assign(new Error("spawnSync ssh ETIMEDOUT"), { code: "ETIMEDOUT" });
+      };
+      expect(checkGitSsh("github.com").message).toBe(
+        "Connection to github.com timed out. Check your network or firewall.",
+      );
+    });
+
     it("carries an unrecognised transcript through verbatim instead of guessing", () => {
       sshSays("kex_exchange_identification: banner line contains invalid characters");
       const r = checkGitSsh("github.com");
@@ -380,12 +408,32 @@ describe("checkGitSsh classifies each provider's real transcript", () => {
   });
 
   describe("invocation", () => {
-    it("runs exactly `ssh -T -o ConnectTimeout=5 -o BatchMode=yes <user>@<host>`", () => {
+    it("runs exactly `ssh -T -o ConnectTimeout=5 -o BatchMode=yes -- <user>@<host>`", () => {
       sshSays(GITHUB);
       checkGitSsh("github.com");
       expect(calls).toHaveLength(1);
       expect(calls[0].cmd).toBe("ssh");
-      expect(calls[0].args).toEqual(["-T", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "git@github.com"]);
+      expect(calls[0].args).toEqual(["-T", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "--", "git@github.com"]);
+    });
+
+    it("rejects a user that ssh would parse as an option, BEFORE spawning ssh", () => {
+      execHandler = () => ({ stdout: "should not run" });
+      const r = checkGitSsh("github.com", "-oProxyCommand=touch /tmp/x");
+      expect(r).toEqual({ status: "error", message: 'Invalid user: "-oProxyCommand=touch /tmp/x"' });
+      expect(calls).toHaveLength(0);
+    });
+
+    it("rejects a user carrying characters outside the git-user set", () => {
+      execHandler = () => ({ stdout: "should not run" });
+      expect(checkGitSsh("github.com", "git user").status).toBe("error");
+      expect(checkGitSsh("github.com", "").status).toBe("error");
+      expect(calls).toHaveLength(0);
+    });
+
+    it("still accepts ordinary users with dots, underscores and inner hyphens", () => {
+      sshSays(GITLAB);
+      checkGitSsh("gitlab.example.test", "git_lab-user.1");
+      expect(calls[0].args.at(-1)).toBe("git_lab-user.1@gitlab.example.test");
     });
 
     it("passes a non-default user and host through to the ssh target", () => {
@@ -419,26 +467,23 @@ const OPENSSH_PRIV = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAA
 const nameOf = (p: string) => posix(p).split("/").pop() as string;
 
 /**
- * Routes the three subprocesses a ~/.ssh scan makes:
+ * Routes the two subprocesses a ~/.ssh scan makes:
  *   ssh-add   -l              -> the agent's loaded set
- *   ssh-keygen -lf <path>     -> one key's fingerprint (the correlation input)
- *   ssh-keygen -l -f <path>   -> detectKeyType's OPENSSH-banner fallback
+ *   ssh-keygen -lf <path>     -> one key's fingerprint AND its authoritative type
  * Anything unrouted fails loudly rather than silently answering.
+ *
+ * SSH_AUTH_SOCK is pinned to a fake Unix socket so the agent probe is issued on
+ * every platform: the scan asks the channel ensureAgent would pick, and with no
+ * SSH_AUTH_SOCK on a non-Windows box there is no channel to ask at all.
  */
-function scanWith(opts: {
-  agent?: FakeRun;
-  fingerprint?: (name: string) => FakeRun;
-  keygenType?: (name: string) => FakeRun;
-}): void {
+function scanWith(opts: { agent?: FakeRun; fingerprint?: (name: string) => FakeRun }): void {
+  setEnv("SSH_AUTH_SOCK", "/tmp/scan-agent.sock");
   execHandler = (cmd, args) => {
     if (cmd === "ssh-add" && args[0] === "-l") {
       return opts.agent ?? { fail: true, stderr: "Error connecting to agent: No such file or directory" };
     }
     if (cmd === "ssh-keygen" && args[0] === "-lf") {
       return opts.fingerprint?.(nameOf(args[1])) ?? { fail: true, stderr: "no fingerprint fixture" };
-    }
-    if (cmd === "ssh-keygen" && args[0] === "-l" && args[1] === "-f") {
-      return opts.keygenType?.(nameOf(args[2])) ?? { fail: true, stderr: "no type fixture" };
     }
     return { fail: true, stderr: `unexpected subprocess: ${cmd} ${args.join(" ")}` };
   };
@@ -608,29 +653,88 @@ describe("listSshKeys correlates ssh-keygen fingerprints against the ssh-add set
 });
 
 // ===========================================================================
-// GAP -- detectKeyType.
+// GAP -- key type detection (keyTypeFromFingerprint, then guessKeyType).
 //
 // Modern ssh-keygen wraps ed25519 -- the DEFAULT key type since OpenSSH 8.5 --
 // in the generic `OPENSSH PRIVATE KEY` banner, which none of the type-specific
-// PEM banners match. The `ssh-keygen -l -f` fallback is therefore the only thing
-// keeping a typical operator's key from being labelled "unknown" in ssh_key_list.
+// PEM banners match. The trailing `(TYPE)` of the one `ssh-keygen -lf` call is
+// therefore the primary answer; the .pub, PEM-banner and filename-token guesses
+// run only when ssh-keygen could not answer.
 // ===========================================================================
 
-describe("detectKeyType", () => {
-  /** Scans a ~/.ssh holding exactly `files` and returns the first key found. */
-  function firstKey(files: Record<string, string>, keygenType?: (name: string) => FakeRun) {
+describe("key type detection", () => {
+  /** ssh-keygen could not answer: the fallback guesses are all that is left. */
+  const KEYGEN_FAILS: FakeRun = { fail: true, stderr: "invalid format" };
+
+  /**
+   * Scans a ~/.ssh holding exactly `files` and returns the first key found.
+   * `fingerprint` is what `ssh-keygen -lf` answers; it defaults to FAILING so the
+   * fallback tests below exercise the guesses, not ssh-keygen's answer.
+   */
+  function firstKey(files: Record<string, string>, fingerprint: FakeRun = KEYGEN_FAILS) {
     sshDir = { kind: "files", files };
-    scanWith({
-      agent: { stdout: "The agent has no identities." },
-      fingerprint: () => ({ stdout: "256 SHA256:FPaaa jeff@box (ED25519)" }),
-      keygenType,
-    });
+    scanWith({ agent: { stdout: "The agent has no identities." }, fingerprint: () => fingerprint });
     const keys = listSshKeysDetailed().keys;
     expect(keys).toHaveLength(1);
     return keys[0];
   }
 
-  describe("the .pub sniff comes first", () => {
+  describe("ssh-keygen's own (TYPE) is the primary answer", () => {
+    it("beats a misleading filename: an ed25519 key named `universal_deploy` is not rsa", () => {
+      // The old substring test read "rsa" out of "univeRSAl" and never asked ssh-keygen.
+      expect(firstKey({ universal_deploy: OPENSSH_PRIV }, { stdout: "256 SHA256:x jeff@box (ED25519)" }).type).toBe(
+        "ed25519",
+      );
+    });
+
+    it("ranks ssh-keygen's answer above the .pub sniff and the filename", () => {
+      // The fake answers ED25519 while the filename and .pub both say rsa. (Real
+      // ssh-keygen reads the .pub itself when present; this pins the PRECEDENCE in
+      // listSshKeysDetailed, not ssh-keygen's own lookup order.)
+      expect(
+        firstKey(
+          { id_rsa: OPENSSH_PRIV, "id_rsa.pub": "ssh-rsa AAAAB3NzaC1yc2E jeff@box" },
+          { stdout: "256 SHA256:x jeff@box (ED25519)" },
+        ).type,
+      ).toBe("ed25519");
+    });
+
+    it("spawns ssh-keygen ONCE per key -- the fingerprint call also yields the type", () => {
+      firstKey({ id_default: OPENSSH_PRIV }, { stdout: "256 SHA256:FPaaa jeff@box (ED25519)" });
+      const keygenCalls = calls.filter((c) => c.cmd === "ssh-keygen");
+      expect(keygenCalls.map((c) => c.args)).toEqual([["-lf", join(homedir(), ".ssh", "id_default")]]);
+    });
+
+    it("lowercases the trailing (ED25519) that ssh-keygen prints", () => {
+      expect(firstKey({ id_default: OPENSSH_PRIV }, { stdout: "256 SHA256:FPaaa jeff@box (ED25519)" }).type).toBe(
+        "ed25519",
+      );
+    });
+
+    it("handles a hyphenated type such as (ED25519-SK)", () => {
+      expect(firstKey({ id_default: OPENSSH_PRIV }, { stdout: "256 SHA256:FPaaa jeff@box (ED25519-SK)" }).type).toBe(
+        "ed25519-sk",
+      );
+    });
+
+    it("finds the type on the LAST line when ssh-keygen prints a preamble", () => {
+      expect(
+        firstKey(
+          { id_default: OPENSSH_PRIV },
+          { stdout: "Warning: (deprecated) option ignored\n256 SHA256:FPaaa jeff@box (ED25519)" },
+        ).type,
+      ).toBe("ed25519");
+    });
+
+    it("falls back to the guesses when ssh-keygen prints no parenthesised type", () => {
+      const key = firstKey({ legacy_pem_a: "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n" }, { stdout: "2048 SHA256:x" });
+      expect(key.type).toBe("rsa");
+      // The fingerprint itself is still reported.
+      expect(key.fingerprint).toBe("SHA256:x");
+    });
+  });
+
+  describe("fallback: the .pub sniff comes first", () => {
     it("reads ed25519 out of the public half", () => {
       expect(firstKey({ mykey: OPENSSH_PRIV, "mykey.pub": "ssh-ed25519 AAAAC3NzaC1lZDI1 jeff@box" }).type).toBe(
         "ed25519",
@@ -657,43 +761,15 @@ describe("detectKeyType", () => {
       );
     });
 
-    it("never shells out when the .pub answered", () => {
-      firstKey({ mykey: OPENSSH_PRIV, "mykey.pub": "ssh-ed25519 AAAAC3NzaC1lZDI1 jeff@box" });
-      expect(calls.some((c) => c.cmd === "ssh-keygen" && c.args[0] === "-l")).toBe(false);
+    it("beats the PEM banner and the filename", () => {
+      expect(
+        firstKey({ id_rsa: "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n", "id_rsa.pub": "ssh-ed25519 AAAAC3 jeff@box" })
+          .type,
+      ).toBe("ed25519");
     });
   });
 
-  describe("filename inference when there is no .pub", () => {
-    it("infers ed25519", () => {
-      expect(firstKey({ id_ed25519: OPENSSH_PRIV }).type).toBe("ed25519");
-    });
-
-    it("infers rsa", () => {
-      expect(firstKey({ id_rsa: OPENSSH_PRIV }).type).toBe("rsa");
-    });
-
-    it("infers ecdsa -- the check order keeps 'ecdsa' from being read as 'dsa'", () => {
-      // "ecdsa".includes("dsa") is true, so a reordering that tests dsa first would
-      // label every ECDSA key "dsa".
-      expect(firstKey({ id_ecdsa: OPENSSH_PRIV }).type).toBe("ecdsa");
-    });
-
-    it("infers dsa", () => {
-      expect(firstKey({ legacy_dsa_key: OPENSSH_PRIV }).type).toBe("dsa");
-    });
-
-    it("beats the file CONTENT: an id_rsa holding an ed25519 key stays 'rsa' (see bugsFound)", () => {
-      // Filename inference runs before the content sniff, so a misnamed key is
-      // mislabelled even though ssh-keygen would have said ED25519 -- and the
-      // ssh-keygen probe is never issued at all.
-      expect(firstKey({ id_rsa: OPENSSH_PRIV }, () => ({ stdout: "256 SHA256:x jeff@box (ED25519)" })).type).toBe(
-        "rsa",
-      );
-      expect(calls.some((c) => c.cmd === "ssh-keygen" && c.args[0] === "-l")).toBe(false);
-    });
-  });
-
-  describe("PEM banners in the file content", () => {
+  describe("fallback: PEM banners in the file content", () => {
     it("maps RSA PRIVATE KEY to rsa", () => {
       expect(firstKey({ legacy_pem_a: "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n" }).type).toBe("rsa");
     });
@@ -706,50 +782,39 @@ describe("detectKeyType", () => {
       expect(firstKey({ legacy_pem_c: "-----BEGIN DSA PRIVATE KEY-----\nMIIB\n" }).type).toBe("dsa");
     });
 
-    it("leaves an unrecognised PKCS#8 banner as 'unknown' without shelling out", () => {
-      expect(firstKey({ pkcs8_blob: "-----BEGIN PRIVATE KEY-----\nMIIE\n" }).type).toBe("unknown");
-      expect(calls.some((c) => c.cmd === "ssh-keygen" && c.args[0] === "-l")).toBe(false);
+    it("beats the filename: an RSA PEM key named id_ed25519 is rsa", () => {
+      expect(firstKey({ id_ed25519: "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n" }).type).toBe("rsa");
     });
   });
 
-  describe("the OPENSSH PRIVATE KEY fallback", () => {
-    it("lowercases the trailing (ED25519) that ssh-keygen prints", () => {
-      const key = firstKey({ id_default: OPENSSH_PRIV }, () => ({
-        stdout: "256 SHA256:FPaaa jeff@box (ED25519)",
-      }));
-      expect(key.type).toBe("ed25519");
+  describe("fallback: filename tokens, last", () => {
+    it("infers ed25519", () => {
+      expect(firstKey({ id_ed25519: OPENSSH_PRIV }).type).toBe("ed25519");
     });
 
-    it("issues `ssh-keygen -l -f <path>` -- the read-only probe that needs no passphrase", () => {
-      firstKey({ id_default: OPENSSH_PRIV }, () => ({ stdout: "256 SHA256:FPaaa jeff@box (ED25519)" }));
-      const probe = calls.find((c) => c.cmd === "ssh-keygen" && c.args[0] === "-l");
-      expect(probe?.args).toEqual(["-l", "-f", join(homedir(), ".ssh", "id_default")]);
+    it("infers rsa", () => {
+      expect(firstKey({ id_rsa: OPENSSH_PRIV }).type).toBe("rsa");
     });
 
-    it("handles a hyphenated type such as (ED25519-SK)", () => {
-      expect(
-        firstKey({ id_default: OPENSSH_PRIV }, () => ({ stdout: "256 SHA256:FPaaa jeff@box (ED25519-SK)" })).type,
-      ).toBe("ed25519-sk");
+    it("infers ecdsa, not dsa", () => {
+      expect(firstKey({ id_ecdsa: OPENSSH_PRIV }).type).toBe("ecdsa");
     });
 
-    it("finds the type on the LAST line when ssh-keygen prints a preamble", () => {
-      expect(
-        firstKey({ id_default: OPENSSH_PRIV }, () => ({
-          stdout: "Warning: (deprecated) option ignored\n256 SHA256:FPaaa jeff@box (ED25519)",
-        })).type,
-      ).toBe("ed25519");
+    it("infers dsa from a whole token", () => {
+      expect(firstKey({ legacy_dsa_key: OPENSSH_PRIV }).type).toBe("dsa");
     });
 
-    it("falls back to 'unknown' when ssh-keygen fails", () => {
-      expect(firstKey({ id_default: OPENSSH_PRIV }, () => ({ fail: true, stderr: "invalid format" })).type).toBe(
-        "unknown",
-      );
+    it("does NOT read a type out of the middle of a word", () => {
+      // "universal" contains "rsa"; a substring test labelled this key rsa.
+      expect(firstKey({ universal_deploy: OPENSSH_PRIV }).type).toBe("unknown");
     });
 
-    it("falls back to 'unknown' when ssh-keygen prints no parenthesised type", () => {
-      expect(firstKey({ id_default: OPENSSH_PRIV }, () => ({ stdout: "256 SHA256:FPaaa jeff@box" })).type).toBe(
-        "unknown",
-      );
+    it("leaves an OPENSSH key with a neutral name and no ssh-keygen answer as 'unknown'", () => {
+      expect(firstKey({ id_default: OPENSSH_PRIV }).type).toBe("unknown");
+    });
+
+    it("leaves an unrecognised PKCS#8 banner as 'unknown'", () => {
+      expect(firstKey({ pkcs8_blob: "-----BEGIN PRIVATE KEY-----\nMIIE\n" }).type).toBe("unknown");
     });
   });
 });
@@ -833,6 +898,29 @@ describe("probeAgent picks the right channel for the socket it was given", () =>
     expect(Object.hasOwn(childEnv(0), "SSH_AUTH_SOCK")).toBe(false);
   });
 
+  it("passes a CUSTOM named pipe through as SSH_AUTH_SOCK instead of swapping in the default one", () => {
+    // A pageant bridge / gpg-agent / password-manager pipe. Only the default
+    // openssh-ssh-agent pipe is reached by unsetting SSH_AUTH_SOCK; deleting a custom
+    // one probed the default agent and reported ITS keys under the custom socket.
+    setPlatform("win32");
+    const custom = "\\\\.\\pipe\\pageant.jeff.sock";
+    setEnv("SSH_AUTH_SOCK", custom);
+    execHandler = () => ({ stdout: "256 SHA256:AAA jeff@box (ED25519)" });
+
+    const r = ensureAgent();
+    expect(r.socket).toBe(custom);
+    expect(childEnv(0).SSH_AUTH_SOCK).toBe(custom);
+  });
+
+  it("still unsets SSH_AUTH_SOCK when it names the default pipe in another letter case", () => {
+    setPlatform("win32");
+    setEnv("SSH_AUTH_SOCK", "\\\\.\\PIPE\\OpenSSH-SSH-Agent");
+    execHandler = () => ({ stdout: "256 SHA256:AAA jeff@box (ED25519)" });
+
+    ensureAgent();
+    expect(Object.hasOwn(childEnv(0), "SSH_AUTH_SOCK")).toBe(false);
+  });
+
   it("counts every ssh-add line as a loaded key", () => {
     setPlatform("linux");
     setEnv("SSH_AUTH_SOCK", "/tmp/real-agent.sock");
@@ -873,6 +961,63 @@ describe("probeAgent picks the right channel for the socket it was given", () =>
     // The `ssh-agent -s` spawn is skipped on win32 on purpose: it would orphan a
     // process whose socket the rest of the stack cannot reach.
     expect(calls.some((c) => c.cmd === "ssh-agent")).toBe(false);
+  });
+});
+
+describe("follow-up ssh-add calls use the channel ensureAgent validated", () => {
+  // Windows + a stale WSL / Git Bash SSH_AUTH_SOCK: ensureAgent reaches the named
+  // pipe with SSH_AUTH_SOCK deleted from the CHILD env, but process.env keeps the
+  // stale value. Windows ssh-add honours it ("Error connecting to agent"), so a
+  // follow-up ssh-add that inherits process.env talks to nothing.
+  const STALE = "/mnt/wsl/ssh-agent.sock";
+
+  beforeEach(() => {
+    setPlatform("win32");
+    setEnv("SSH_AUTH_SOCK", STALE);
+  });
+
+  /** Any ssh-add that would see the stale socket fails, as the real one does. */
+  function staleSockFails(answer: (args: string[]) => FakeRun): void {
+    execHandler = (cmd, args, env) => {
+      const sock = env ? env.SSH_AUTH_SOCK : process.env.SSH_AUTH_SOCK;
+      if (cmd === "ssh-add" && sock === STALE) {
+        return { fail: true, stderr: "Error connecting to agent: No such file or directory" };
+      }
+      return answer(args);
+    };
+  }
+
+  it("loadKey runs `ssh-add <key>` with SSH_AUTH_SOCK unset, i.e. against the named pipe", () => {
+    sshDir = { kind: "files", files: { id_ed25519: OPENSSH_PRIV } };
+    staleSockFails((args) =>
+      args[0] === "-l" ? { stdout: "The agent has no identities." } : { stdout: "Identity added" },
+    );
+
+    const r = loadKey("~/.ssh/id_ed25519");
+
+    expect(r).toEqual({ status: "ok", message: `Key loaded: ${join(homedir(), ".ssh", "id_ed25519")}` });
+    const load = calls.find((c) => c.cmd === "ssh-add" && c.args[0] !== "-l");
+    expect(load?.env).toBeDefined();
+    expect(Object.hasOwn(load?.env ?? {}, "SSH_AUTH_SOCK")).toBe(false);
+  });
+
+  it("listSshKeys marks keys loaded from the named pipe's answer, not the stale socket's", () => {
+    sshDir = { kind: "files", files: { id_ed25519: OPENSSH_PRIV } };
+    // `ssh-add -l` (via the pipe) and `ssh-keygen -lf` both report the same key.
+    staleSockFails(() => ({ stdout: "256 SHA256:LOADEDaaa jeff@box (ED25519)" }));
+
+    expect(listSshKeysDetailed().keys.map((k) => k.loadedInAgent)).toEqual([true]);
+  });
+
+  it("loadKey passes a Unix socket through unchanged when that socket is the live one", () => {
+    setPlatform("linux");
+    setEnv("SSH_AUTH_SOCK", "/tmp/live.sock");
+    sshDir = { kind: "files", files: { id_ed25519: OPENSSH_PRIV } };
+    execHandler = () => ({ stdout: "Identity added" });
+
+    loadKey("~/.ssh/id_ed25519");
+    const load = calls.find((c) => c.cmd === "ssh-add" && c.args[0] !== "-l");
+    expect(load?.env?.SSH_AUTH_SOCK).toBe("/tmp/live.sock");
   });
 });
 
@@ -1080,24 +1225,65 @@ describe("checkSshAgent -- both platform branches", () => {
       );
     });
 
-    it("checks the exit code BEFORE 'no identities', unlike the generic branch (see bugsFound)", () => {
-      // A build that reports an empty agent on a ZERO exit is reported "ok" here,
-      // with the empty-agent notice pasted in where the key list belongs. The
-      // generic branch below calls the same output a warning. Pinned to document
-      // the divergence, not to bless it.
+    it("calls a ZERO-exit 'no identities' a warning, the same as the SSH_AUTH_SOCK branch", () => {
+      // This branch used to test the exit code first and report the empty-agent
+      // notice as the key list of a healthy agent.
       execHandler = () => ({ stdout: "The agent has no identities." });
       const r = checkSshAgent();
-      expect(r.status).toBe("ok");
-      expect(r.message).toBe("Windows OpenSSH agent running with keys:\nThe agent has no identities.");
+      expect(r.status).toBe("warning");
+      expect(r.message).toBe("Windows OpenSSH agent is running but has no keys loaded. Run: ssh-add <key-path>");
     });
 
-    it("is gated on SSH_AUTH_SOCK being UNSET -- with one set, win32 takes the generic path", () => {
-      setEnv("SSH_AUTH_SOCK", "/tmp/from-git-bash.sock");
-      execHandler = () => ({ fail: true, stderr: "Could not open a connection to your authentication agent." });
+    it("probes the pipe with SSH_AUTH_SOCK deleted from the child env", () => {
+      execHandler = () => ({ stdout: "256 SHA256:AAA jeff@box (ED25519)" });
+      checkSshAgent();
+      expect(calls).toHaveLength(1);
+      expect(Object.hasOwn(childEnv(0), "SSH_AUTH_SOCK")).toBe(false);
+    });
+  });
+
+  describe("win32 with a set-but-STALE SSH_AUTH_SOCK", () => {
+    const STALE = "/tmp/from-git-bash.sock";
+
+    beforeEach(() => {
+      setPlatform("win32");
+      setEnv("SSH_AUTH_SOCK", STALE);
+    });
+
+    /** The stale socket answers nothing; the named pipe answers `pipe`. */
+    function pipeAnswers(pipe: FakeRun): void {
+      execHandler = (_cmd, _args, env) =>
+        env && !Object.hasOwn(env, "SSH_AUTH_SOCK")
+          ? pipe
+          : { fail: true, stderr: "Error connecting to agent: No such file or directory" };
+    }
+
+    it("falls through to the named pipe, as ensureAgent does, instead of blaming a working agent", () => {
+      pipeAnswers({ stdout: "256 SHA256:AAA jeff@box (ED25519)" });
+      const r = checkSshAgent();
+      // A warning, not an error: the agent is up, but connections honour the stale
+      // SSH_AUTH_SOCK first, so the variable is the thing to fix.
+      expect(r.status).toBe("warning");
+      expect(r.message).toContain("Windows OpenSSH agent is running");
+      expect(r.message).toContain(`SSH_AUTH_SOCK is set to "${STALE}"`);
+      expect(r.message).toContain("Unset SSH_AUTH_SOCK");
+      expect(r.message).not.toContain("eval");
+      expect(ensureAgent().reachable).toBe(true); // the two now agree the agent is there
+    });
+
+    it("errors with the Windows remedy, naming the stale socket, when the pipe is dead too", () => {
+      pipeAnswers({ fail: true, stderr: "Error connecting to agent: No such file or directory" });
       const r = checkSshAgent();
       expect(r.status).toBe("error");
-      expect(r.message).toContain('SSH_AUTH_SOCK is set to "/tmp/from-git-bash.sock"');
-      expect(r.message).not.toContain("Windows OpenSSH Authentication Agent");
+      expect(r.message).toContain(`SSH_AUTH_SOCK is set to "${STALE}"`);
+      expect(r.message).toContain("Start-Service ssh-agent");
+      expect(r.message).not.toContain("eval");
+    });
+
+    it("does not consult the pipe when the SSH_AUTH_SOCK agent answers", () => {
+      execHandler = () => ({ stdout: "256 SHA256:AAA jeff@box (ED25519)" });
+      expect(checkSshAgent().status).toBe("ok");
+      expect(calls).toHaveLength(1);
     });
   });
 
@@ -1140,7 +1326,13 @@ describe("probeSshConnection builds the ssh argv it claims to", () => {
     "-o",
     "BatchMode=yes",
     "-o",
-    "StrictHostKeyChecking=no",
+    "StrictHostKeyChecking=accept-new",
+    "-o",
+    "UserKnownHostsFile=/dev/null ~/.ssh/known_hosts ~/.ssh/known_hosts2",
+    "-o",
+    "GlobalKnownHostsFile=/dev/null",
+    "-o",
+    "UpdateHostKeys=no",
     "-p",
     port,
     "--",
@@ -1148,6 +1340,89 @@ describe("probeSshConnection builds the ssh argv it claims to", () => {
     "echo",
     "SSH_OK",
   ];
+
+  it("cannot write known_hosts: new keys go to the null device, changed keys are refused", () => {
+    // ssh_diagnose is annotated read-only and this server never pins a key as a
+    // side effect of connecting. StrictHostKeyChecking=no with the default files
+    // "Permanently added" an unknown host's key to ~/.ssh/known_hosts.
+    execHandler = () => ({ stdout: "SSH_OK" });
+    probeSshConnection("box.example.test", 22);
+    const opts = calls[0].args.filter((_, i, a) => a[i - 1] === "-o");
+    expect(opts).not.toContain("StrictHostKeyChecking=no");
+    expect(opts).toContain("StrictHostKeyChecking=accept-new");
+    // ssh writes an accepted key to the FIRST file of the list only.
+    const userFiles = opts.find((o) => o.startsWith("UserKnownHostsFile="))?.slice("UserKnownHostsFile=".length);
+    expect(userFiles?.split(" ")[0]).toBe("/dev/null");
+    // ...and still READS the operator's pins, so a changed key is detectable.
+    expect(userFiles?.split(" ")).toContain("~/.ssh/known_hosts");
+    expect(opts).toContain("GlobalKnownHostsFile=/dev/null");
+    expect(opts).toContain("UpdateHostKeys=no");
+    // `NUL` is a plain relative file name to Git for Windows' MSYS ssh.
+    expect(calls[0].args.join(" ")).not.toMatch(/\bNUL\b/);
+  });
+
+  it("reports a changed host key as host-key-mismatch, not Permission denied", () => {
+    // What a tolerated mismatch prints: the banner, then a failed pubkey auth.
+    execHandler = () => ({
+      fail: true,
+      stderr:
+        "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n" +
+        "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n" +
+        "Password authentication is disabled to avoid man-in-the-middle attacks.\n" +
+        "git@box.example.test: Permission denied (publickey).",
+    });
+    expect(probeSshConnection("box.example.test", 22).outcome).toBe("host-key-mismatch");
+    expect(testConnection("box.example.test").message).toMatch(/^Host key mismatch for box\.example\.test\./);
+  });
+
+  it("reports accept-new's refusal of a changed key as host-key-mismatch", () => {
+    execHandler = () => ({
+      fail: true,
+      stderr:
+        "Host key for box.example.test has changed and you have requested strict checking.\nHost key verification failed.",
+    });
+    expect(probeSshConnection("box.example.test", 22).outcome).toBe("host-key-mismatch");
+  });
+
+  it("uses StrictHostKeyChecking=yes under SSH_MCP_STRICT_HOSTKEYS, so ssh_test refuses what ssh_exec refuses", () => {
+    vi.stubEnv("SSH_MCP_STRICT_HOSTKEYS", "1");
+    try {
+      execHandler = () => ({ stdout: "SSH_OK" });
+      probeSshConnection("box.example.test", 22);
+      const opts = calls[0].args.filter((_, i, a) => a[i - 1] === "-o");
+      expect(opts).toContain("StrictHostKeyChecking=yes");
+      expect(opts).not.toContain("StrictHostKeyChecking=accept-new");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("reports strict mode's refusal of an unpinned host as host-key-unknown, not a changed key", () => {
+    execHandler = () => ({
+      fail: true,
+      stderr:
+        "No ED25519 host key is known for box.example.test and you have requested strict checking.\nHost key verification failed.",
+    });
+    expect(probeSshConnection("box.example.test", 22).outcome).toBe("host-key-unknown");
+    expect(testConnection("box.example.test").message).toMatch(
+      /is not in known_hosts and SSH_MCP_STRICT_HOSTKEYS is on/,
+    );
+    expect(checkConnectivity("box.example.test").message).toMatch(
+      /is not in known_hosts and SSH_MCP_STRICT_HOSTKEYS is on/,
+    );
+  });
+
+  it("classifies runArgs' own kill-on-timeout as timed-out, not unknown", () => {
+    // execFileSync's timeout throws code ETIMEDOUT with empty streams and the
+    // message "spawnSync ssh ETIMEDOUT", which contains no "timed out".
+    execHandler = () => {
+      throw Object.assign(new Error("spawnSync ssh ETIMEDOUT"), { code: "ETIMEDOUT", signal: "SIGTERM" });
+    };
+    const r = probeSshConnection("box.example.test", 22);
+    expect(r.outcome).toBe("timed-out");
+    expect(r.output).toBe("ssh timed out after 10s and was killed");
+    expect(checkConnectivity("box.example.test").message).toMatch(/^Connection timed out to box\.example\.test:22/);
+  });
 
   it("passes the requested port through as `-p <port>`", () => {
     execHandler = () => ({ stdout: "SSH_OK" });
@@ -1242,12 +1517,29 @@ describe("checkSshKeys on a fresh machine", () => {
     expect(checkSshKeys().message).toBe(NO_KEYS);
   });
 
-  it("finds a default-named key by EXISTENCE alone, without reading it", () => {
-    // The keyTypes loop is a pure existsSync check -- a zero-byte id_ed25519 counts.
+  it("does NOT count a default-named file by existence alone: a zero-byte id_ed25519 is no key", () => {
+    // checkSshKeys and listSshKeys share one scan now; it used to count default names
+    // on existsSync alone and report "Found" for an empty file listSshKeys skipped.
     sshDir = { kind: "files", files: { id_ed25519: "" } };
+    expect(checkSshKeys().message).toBe(NO_KEYS);
+  });
+
+  it("finds a default-named key whose content is a private key", () => {
+    sshDir = { kind: "files", files: { id_ed25519: OPENSSH_PRIV } };
     const r = checkSshKeys();
     expect(r.status).toBe("ok");
     expect(r.message).toBe("Found SSH keys: id_ed25519");
+  });
+
+  it("skips a non-regular entry and closes every descriptor it opened", () => {
+    sshDir = { kind: "files", files: { id_ed25519: OPENSSH_PRIV, fifo_key: OPENSSH_PRIV } };
+    fdState.notRegular.add("fifo_key");
+    try {
+      expect(checkSshKeys().message).toBe("Found SSH keys: id_ed25519");
+      expect(fdState.open.size).toBe(0);
+    } finally {
+      fdState.notRegular.clear();
+    }
   });
 
   it("finds a non-default key only when its CONTENT looks like a private key", () => {
@@ -1258,12 +1550,16 @@ describe("checkSshKeys on a fresh machine", () => {
   });
 
   it("lists the default keys first, then the content-detected ones", () => {
-    sshDir = { kind: "files", files: { work_key: OPENSSH_PRIV, id_rsa: "", id_ed25519: "" } };
+    sshDir = { kind: "files", files: { work_key: OPENSSH_PRIV, id_rsa: OPENSSH_PRIV, id_ed25519: OPENSSH_PRIV } };
     expect(checkSshKeys().message).toBe("Found SSH keys: id_ed25519, id_rsa, work_key");
   });
 
-  it("falls back to the default-name check when readdir fails", () => {
-    sshDir = { kind: "unreadable", error: new Error("EACCES: permission denied, scandir"), files: { id_ed25519: "" } };
+  it("falls back to opening the default names directly when readdir fails", () => {
+    sshDir = {
+      kind: "unreadable",
+      error: new Error("EACCES: permission denied, scandir"),
+      files: { id_ed25519: OPENSSH_PRIV, id_rsa: "" },
+    };
     const r = checkSshKeys();
     expect(r.status).toBe("ok");
     expect(r.message).toBe("Found SSH keys: id_ed25519");
@@ -1274,11 +1570,10 @@ describe("checkSshKeys on a fresh machine", () => {
     expect(checkSshKeys().message).toBe(NO_KEYS);
   });
 
-  it("counts a DOTFILE private key that listSshKeys deliberately skips (see bugsFound)", () => {
-    // checkSshKeys filters only *.pub and SSH_NON_KEY_FILES; listSshKeys also skips
-    // anything starting with ".". The two scanners disagree about this one file.
+  it("skips a DOTFILE private key, exactly as listSshKeys does", () => {
+    // One shared scan, one dotfile rule: the two scanners used to disagree here.
     sshDir = { kind: "files", files: { ".hidden_key": OPENSSH_PRIV } };
-    expect(checkSshKeys().message).toBe("Found SSH keys: .hidden_key");
+    expect(checkSshKeys().message).toBe(NO_KEYS);
 
     scanWith({ agent: { stdout: "The agent has no identities." } });
     expect(listSshKeysDetailed().keys).toEqual([]);
@@ -1349,13 +1644,46 @@ describe("G1 -- diagnose() assembles suggestions and the overall ladder", () => 
       known: { fail: true, stderr: "" },
       conn: { fail: true, stderr: "Permission denied (publickey)." },
     });
-    process.env.SSH_AUTH_SOCK = "/tmp/agent.sock";
+    setPlatform("linux");
+    setEnv("SSH_AUTH_SOCK", "/tmp/agent.sock");
 
     const report = diagnose("web1.test");
 
     expect(report.suggestions).toContain('Start ssh-agent: eval "$(ssh-agent -s)"');
     expect(report.suggestions).toContain('Generate a key: ssh-keygen -t ed25519 -C "your@email.com"');
     expect(report.suggestions).toContain('Add host key: ssh-keyscan -H "web1.test" >> ~/.ssh/known_hosts');
+  });
+
+  it("suggests the Windows service, not `eval $(ssh-agent -s)`, for a dead agent on win32", () => {
+    scriptMachine({ agent: { fail: true, stderr: "Error connecting to agent: No such file or directory" } });
+    setPlatform("win32");
+    setEnv("SSH_AUTH_SOCK", undefined);
+
+    const report = diagnose("web1.test");
+
+    expect(report.suggestions.join("\n")).not.toContain("eval");
+    expect(report.suggestions).toContain(
+      "Start the Windows OpenSSH agent: Get-Service ssh-agent | Set-Service -StartupType Automatic; Start-Service ssh-agent",
+    );
+  });
+
+  it("builds port-aware known_hosts suggestions on a non-default port", () => {
+    scriptMachine({ known: { fail: true, stderr: "" }, conn: { fail: true, stderr: "Host key verification failed." } });
+    setEnv("SSH_AUTH_SOCK", "/tmp/agent.sock");
+
+    const report = diagnose("web1.test", 2222);
+
+    // Scanning port 22 (or removing the bare entry) for a :2222 host fixes nothing.
+    expect(report.suggestions).toContain('Add host key: ssh-keyscan -H -p 2222 "web1.test" >> ~/.ssh/known_hosts');
+    expect(report.suggestions).toContain('Remove stale host key: ssh-keygen -R "[web1.test]:2222"');
+  });
+
+  it("states the hostname rule isValidHostname actually applies", () => {
+    const report = diagnose("host:2222");
+    expect(report.suggestions).toEqual([
+      "Provide a valid hostname: letters, digits, dots, underscores and hyphens (not leading), or a bracketed IPv6 literal like [::1]. Pass the port separately, not as host:port.",
+    ]);
+    expect(report.suggestions[0]).not.toContain("colons");
   });
 
   it("adds the Permission-denied pair by STRING-MATCHING checkConnectivity's own prose", () => {
@@ -1437,6 +1765,46 @@ describe("G3 -- checkKnownHosts' three outcomes, with the subprocess faked", () 
     expect(result.message).toContain("not in known_hosts");
   });
 
+  it("looks up `[host]:port` first on a non-default port, then the bare entry", () => {
+    sshDir = { kind: "files", files: { known_hosts: "x" } };
+    execHandler = (_cmd, args) =>
+      args[1] === "[web1.test]:2222" ? { stdout: "# Host [web1.test]:2222 found: line 1\n..." } : { stdout: "" };
+
+    const result = checkKnownHosts("web1.test", 2222);
+
+    expect(result).toEqual({ status: "ok", message: 'Host "web1.test" (port 2222) found in known_hosts' });
+    expect(calls.map((c) => c.args)).toEqual([["-F", "[web1.test]:2222"]]);
+  });
+
+  it("falls back to the bare entry on a non-default port, as the connection verifier does", () => {
+    sshDir = { kind: "files", files: { known_hosts: "x" } };
+    execHandler = (_cmd, args) =>
+      args[1] === "web1.test" ? { stdout: "# Host web1.test found: line 1" } : { stdout: "" };
+
+    expect(checkKnownHosts("web1.test", 2222).status).toBe("ok");
+    expect(calls.map((c) => c.args[1])).toEqual(["[web1.test]:2222", "web1.test"]);
+  });
+
+  it("looks up an IPv6 host by its BARE address at the default port", () => {
+    // `ssh-keygen -F '[::1]'` misses a `::1` line; `-F '::1'` hits it.
+    sshDir = { kind: "files", files: { known_hosts: "x" } };
+    execHandler = (_cmd, args) => (args[1] === "::1" ? { stdout: "# Host ::1 found: line 1" } : { stdout: "" });
+
+    expect(checkKnownHosts("[::1]").status).toBe("ok");
+    expect(calls.map((c) => c.args)).toEqual([["-F", "::1"]]);
+  });
+
+  it("describes trust-always / strict mode and a port-aware keyscan, not a prompt", () => {
+    sshDir = { kind: "files", files: { known_hosts: "x" } };
+    execHandler = () => ({ stdout: "" });
+
+    const { message } = checkKnownHosts("[::1]", 2222);
+
+    expect(message).not.toContain("prompt");
+    expect(message).toContain("SSH_MCP_STRICT_HOSTKEYS=1");
+    expect(message).toContain('ssh-keyscan -H -p 2222 "::1" >> ~/.ssh/known_hosts');
+  });
+
   it("warns when known_hosts does not exist at all, without spawning anything", () => {
     sshDir = { kind: "files", files: {} };
     execHandler = () => ({ fail: true, stderr: "must not be reached" });
@@ -1460,7 +1828,7 @@ describe("G5 -- checkSshConfig reports an absent config file", () => {
   });
 });
 
-describe("both exec wrappers hide the child's console window", () => {
+describe("runArgs hides the child's console window, with or without an env override", () => {
   // oam 0.19.1 stopped applying CREATE_NO_WINDOW to every child and Node never did,
   // so an ssh / ssh-add probe without windowsHide flashes a console on Windows.
   it("runArgs (diagnose.ts) passes windowsHide: true", () => {
@@ -1470,7 +1838,7 @@ describe("both exec wrappers hide the child's console window", () => {
     expect(calls[0].windowsHide).toBe(true);
   });
 
-  it("runArgsWithEnv (env.ts, via ensureAgent's probe) passes windowsHide: true", () => {
+  it("runArgs with an env override (ensureAgent's probe) passes windowsHide: true", () => {
     setPlatform("linux");
     setEnv("SSH_AUTH_SOCK", "/tmp/real-agent.sock");
     execHandler = () => ({ stdout: "256 SHA256:AAA jeff@box (ED25519)" });

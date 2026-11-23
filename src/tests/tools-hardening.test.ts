@@ -99,6 +99,10 @@ beforeEach(() => {
   makeDirSpy.mockClear();
   vi.stubEnv("SSH_MCP_COMMAND_WHITELIST", "");
   vi.stubEnv("SSH_MCP_COMMAND_BLACKLIST", "");
+  // The opt-out too: exported as 1 in a developer's shell it silently disables the
+  // shell-syntax / assignment refusals these tests expect, and a garbage value makes every
+  // policy-configured test throw MISCONFIGURED.
+  vi.stubEnv("SSH_MCP_COMMAND_ALLOW_SHELL_SYNTAX", "");
 });
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -606,7 +610,9 @@ describe("the suggested tolerant pattern matches shellQuote's escaped-apostrophe
   // apostrophe: shellQuote closes, escapes, and reopens (`O'Brien` -> `'O'\''Brien'`), so the
   // suggested pattern blocked exactly the calls it claimed to allow -- and the resulting
   // rejection then re-suggested the same broken pattern. The group is now
-  // `(?:'[^']*'|\\')+`, which walks the close-escape-reopen run.
+  // `'(?:[^']|'\\'')*'` -- one outer quote pair whose body also accepts the `'\''`
+  // close-escape-reopen run (see the tolerant pattern policy.ts builds; the tests below
+  // extract it from the rejection message rather than restating it).
   const APOSTROPHE_VALUE = "O'Brien";
 
   it("shellQuote really does emit the close-escape-reopen form (the premise)", () => {

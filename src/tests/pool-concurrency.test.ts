@@ -3,19 +3,37 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Mock only connectWithProxy — everything else in ssh.js (resolveConfig,
 // hostVerifier, readKnownHostsKeys, etc.) keeps its real implementation so the
-// pool's surrounding logic still exercises real code paths.
+// pool's surrounding logic still exercises real code paths. resolveConfig is a
+// pass-through spy so the ProxyJump test can stand in for two ~/.ssh/config aliases.
 vi.mock("../ssh.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../ssh.js")>();
   return {
     ...actual,
     connectWithProxy: vi.fn(),
+    resolveConfig: vi.fn(actual.resolveConfig),
+  };
+});
+
+// Keep the suite hermetic and fast: `ssh -G` is the only subprocess resolveConfig
+// spawns, and with one spawn per distinct host a 20-host test ran past its 30s
+// timeout on a loaded machine. Reporting it as unavailable takes resolveConfig's
+// documented no-ssh-client fallback, which is all the pool logic here needs.
+vi.mock("../diagnose.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../diagnose.js")>();
+  return {
+    ...actual,
+    runArgs: vi.fn((cmd: string, args: string[], opts?: Parameters<typeof actual.runArgs>[2]) =>
+      cmd === "ssh" && args[0] === "-G" ? { ok: false, stdout: "" } : actual.runArgs(cmd, args, opts),
+    ),
   };
 });
 
 import { ConnectionPool, isPoolFullError, POOL_FULL_ERROR_CODE, PoolFullError } from "../pool.js";
-import { connectWithProxy } from "../ssh.js";
+import { connectWithProxy, resolveConfig } from "../ssh.js";
 
 const mockedConnect = vi.mocked(connectWithProxy);
+const resolveSpy = vi.mocked(resolveConfig);
+const { resolveConfig: realResolveConfig } = await vi.importActual<typeof import("../ssh.js")>("../ssh.js");
 
 function makeFakeClient() {
   const client = new EventEmitter() as any;
@@ -197,6 +215,72 @@ describe("ConnectionPool — concurrent acquire dedup", () => {
     }
   });
 
+  describe("two ~/.ssh/config aliases on one HostName behind different bastions", () => {
+    // `Host prod-db / HostName 10.0.1.5 / ProxyJump bastion-prod` and the same for stage-db
+    // behind bastion-stage: overlapping RFC 1918 space, same user, port and agent. The pool key
+    // names the RESOLVED hostname, so without the route in it a stage-db call ran on prod-db.
+    const ROUTES: Record<string, string | undefined> = {
+      "prod-db": "bastion-prod",
+      "stage-db": "bastion-stage",
+      "prod-db-again": "bastion-prod",
+    };
+    beforeEach(() => {
+      resolveSpy.mockImplementation((config) => ({
+        ...realResolveConfig({ ...config, host: "10.0.1.5", username: "app" }),
+        proxyJump: ROUTES[config.host],
+      }));
+    });
+    afterEach(() => {
+      resolveSpy.mockImplementation(realResolveConfig);
+    });
+
+    it("does NOT reuse an idle connection across the two routes", async () => {
+      const pool = new ConnectionPool();
+      try {
+        const prod = await pool.acquire({ host: "prod-db" });
+        pool.release(prod); // idle, well inside the TTL
+        const stage = await pool.acquire({ host: "stage-db" });
+        expect(stage).not.toBe(prod);
+        expect(mockedConnect).toHaveBeenCalledTimes(2);
+        expect(mockedConnect.mock.calls.map(([r]) => r.proxyJump)).toEqual(["bastion-prod", "bastion-stage"]);
+        expect(pool.size).toBe(2);
+        pool.release(stage);
+      } finally {
+        pool.drain();
+      }
+    });
+
+    it("does NOT coalesce concurrent acquires over the two routes onto one dial", async () => {
+      const pool = new ConnectionPool();
+      try {
+        const [prod, stage] = await Promise.all([
+          pool.acquire({ host: "prod-db" }),
+          pool.acquire({ host: "stage-db" }),
+        ]);
+        expect(prod).not.toBe(stage);
+        expect(mockedConnect).toHaveBeenCalledTimes(2);
+        pool.release(prod);
+        pool.release(stage);
+      } finally {
+        pool.drain();
+      }
+    });
+
+    it("DOES reuse the connection for the same route reached through another alias", async () => {
+      const pool = new ConnectionPool();
+      try {
+        const a = await pool.acquire({ host: "prod-db" });
+        pool.release(a);
+        const b = await pool.acquire({ host: "prod-db-again" });
+        expect(b).toBe(a);
+        expect(mockedConnect).toHaveBeenCalledTimes(1);
+        pool.release(b);
+      } finally {
+        pool.drain();
+      }
+    });
+  });
+
   it("retries a fresh connect after a prior connection dies", async () => {
     const pool = new ConnectionPool();
     try {
@@ -240,7 +324,13 @@ describe("ConnectionPool — drain race", () => {
     // close the client instead of registering it.
     resolveConnect(fakeClient);
 
-    await expect(acquirePromise).rejects.toThrow(/drained/);
+    // Exactly this message: a drain is a shutdown, not an SSH failure, so it must not come
+    // back through enhanceSshError with an "SSH Diagnostics" block (and its subprocess spawns).
+    const err = await acquirePromise.then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    expect(err?.message).toBe("ConnectionPool was drained while connecting");
     expect(fakeClient.endCalls).toBeGreaterThanOrEqual(1);
     expect(pool.size).toBe(0);
   });
@@ -643,6 +733,37 @@ describe("ConnectionPool — maxPoolSize eviction", () => {
     } finally {
       pool.drain();
     }
+  });
+
+  // The option is validated like the env var: NaN used to give an uncapped pool (`size >= NaN`
+  // is always false) and 0 a pool that refused every acquire. Both now mean the default, which
+  // the stubbed env pins to 2 so the cap is observable in three acquires.
+  it.each([
+    { label: "NaN", value: Number.NaN },
+    { label: "0", value: 0 },
+    { label: "-3", value: -3 },
+    { label: "2.5", value: 2.5 },
+    { label: "Infinity", value: Number.POSITIVE_INFINITY },
+  ])("treats maxPoolSize: $label as the default cap", async ({ value }) => {
+    vi.stubEnv("SSH_MCP_MAX_POOL_SIZE", "2");
+    const pool = new ConnectionPool({ maxPoolSize: value });
+    try {
+      expect(pool.maxSize).toBe(2);
+      const c1 = await pool.acquire({ host: "opt-cap-1.example.com" });
+      const c2 = await pool.acquire({ host: "opt-cap-2.example.com" });
+      await expect(pool.acquire({ host: "opt-cap-3.example.com" })).rejects.toThrow(/Connection pool is full \(2 /);
+      pool.release(c1);
+      pool.release(c2);
+    } finally {
+      pool.drain();
+    }
+  });
+
+  it("keeps a valid maxPoolSize option over the env default", () => {
+    vi.stubEnv("SSH_MCP_MAX_POOL_SIZE", "2");
+    const pool = new ConnectionPool({ maxPoolSize: 50 });
+    expect(pool.maxSize).toBe(50);
+    pool.drain();
   });
 
   // defaultMaxPoolSize() reads process.env on every ConnectionPool construction, so a

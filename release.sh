@@ -3,23 +3,32 @@
 # Release Script -- Test, bump, tag, publish to npm, create GitHub release
 # =============================================================================
 # Usage:
-#   ./release.sh <new-version>    -- local mode, e.g. ./release.sh 0.9.1
-#   ./release.sh                  -- CI mode (version derived from git tag)
+#   ./release.sh <new-version>    e.g. ./release.sh 0.9.1
 #
-# Local mode: runs from your workstation, bumps + commits + tags + pushes.
-# CI mode: invoked by .github/workflows/release.yml on tag push, skips the
-# bump/commit/tag/push steps (already done) and publishes with --provenance
-# using NODE_AUTH_TOKEN from GitHub Actions secrets.
+# Runs from your workstation, which is the ONLY publisher for this repo: it
+# bumps, commits, tags, pushes, publishes to npm, creates the GitHub release and
+# publishes to the MCP Registry.
 # If interrupted, just re-run with the same version -- each step is idempotent.
 #
-# Prerequisites (local):
-#   - gh CLI authenticated
+# Prerequisites (all checked in the pre-flight below):
+#   - node, npm, gh (authenticated) and jq on PATH
 #   - npm automation token in ~/.npmrc (npmjs.com -> Access Tokens -> Generate
 #     -> Automation). Do NOT use `npm login --auth-type=web` -- it OVERWRITES
 #     that automation token with a 2FA-bound web session, and the next publish
 #     then EOTPs on a WebAuthn challenge.
-#   - clean git working tree on main, up to date with origin/main
-# Prerequisites (CI): NODE_AUTH_TOKEN env, GITHUB_TOKEN env, CI=true.
+#   - on main, not behind origin/main, and a clean working tree (a resume may
+#     leave only the bump files dirty), so what is published is what the tag
+#     points at
+#
+# FLEET-TEMPLATE CODE THAT IS INERT HERE. This script is shared across the
+# @yawlabs servers, and it keeps the branches for a CI publisher: a CI mode
+# (CI=true, version from GITHUB_REF_NAME, `npm publish --provenance`, the
+# provenance check in step 8) and a workstation-to-CI handoff that watches a
+# .github/workflows/release.yml run. This repo has no .github/workflows and
+# GitHub Actions is disabled on it, so none of those branches can run: the
+# handoff is gated on release.yml existing, and CI mode on CI=true. They are
+# left in place so the script stays in step with the fleet copy; do not set
+# CI=true here expecting a publish pipeline -- there is none.
 # =============================================================================
 
 set -euo pipefail
@@ -235,6 +244,7 @@ if [ "${SKIP_LINT:-}" = "1" ]; then
     fi
     command npm "$@"
   }
+  # Fleet-template: this repo uses npm, so the pnpm wrapper never fires here.
   pnpm() {
     if [ "$1" = "run" ] && [[ "$2" == lint* ]]; then
       warn "SKIP_LINT=1 -- noop 'pnpm run $2'"
@@ -268,6 +278,12 @@ echo -e "${CYAN}Pre-flight checks...${NC}"
 
 command -v node >/dev/null || fail "node not installed"
 command -v npm >/dev/null  || fail "npm not installed"
+# jq syncs server.json in step 2, AFTER package.json is bumped: without it the
+# script died there under set -e, leaving a bumped package.json and an empty
+# server.tmp behind. Checked here, before anything is touched.
+if [ -f server.json ]; then
+  command -v jq >/dev/null || fail "jq not installed (needed to sync server.json's version)"
+fi
 # gh is only required in local mode -- CI uses GITHUB_TOKEN with the gh action.
 if [ "$IS_CI" != "true" ]; then
   command -v gh >/dev/null || fail "gh CLI not installed"
@@ -287,6 +303,29 @@ if [ "$CURRENT_VERSION" = "$VERSION" ]; then
   info "Resuming release v${VERSION}"
 else
   info "Current version: $CURRENT_VERSION -> $VERSION"
+fi
+
+# The header's tree prerequisites, enforced. Step 3 stages ONLY the bump files,
+# so uncommitted source changes used to be built, tested and published to npm
+# while the tag pointed at a commit without them. A resume run may leave ONLY
+# the bump files dirty (the run it resumes can die between bumping and
+# committing them); any other change is refused on a resume too, or a resume
+# would publish it exactly the same way. Behind origin/main is refused either
+# way -- the step-4 push would fail, but only after this run had bumped and tagged.
+if [ "$IS_CI" != "true" ]; then
+  if [ "$CURRENT_VERSION" = "$VERSION" ]; then
+    DIRTY_TREE=$(git status --porcelain -- . ':(exclude)package.json' ':(exclude)package-lock.json' ':(exclude)CHANGELOG.md' ':(exclude)server.json')
+  else
+    DIRTY_TREE=$(git status --porcelain)
+  fi
+  if [ -n "$DIRTY_TREE" ]; then
+    echo "$DIRTY_TREE"
+    fail "Working tree is not clean -- commit or stash the changes above first, so the published package matches the tag"
+  fi
+  git fetch --quiet origin main || fail "git fetch origin main failed -- cannot check that main is up to date"
+  if ! git merge-base --is-ancestor origin/main HEAD; then
+    fail "Local main is behind origin/main -- pull first"
+  fi
 fi
 
 if [ "$IS_CI" != "true" ] && [ "$CURRENT_VERSION" != "$VERSION" ]; then
@@ -441,7 +480,8 @@ else
 fi
 
 # Step 5: Publish to npm
-# Three publish paths, picked by environment:
+# Three publish paths, picked by environment. In THIS repo only path 3 can run:
+# there is no release.yml and CI=true is never set (see the header).
 #   1. IS_CI=true                    -> WE are CI. Do the publish (NODE_AUTH_TOKEN
 #                                       is set; --provenance for sigstore).
 #   2. IS_CI=false + release.yml     -> CI will publish on the tag we just pushed.
@@ -949,7 +989,8 @@ else
 fi
 
 # Provenance attestation -- npm attaches sigstore attestations when
-# `npm publish --provenance` runs inside GitHub Actions (the CI path).
+# `npm publish --provenance` runs inside GitHub Actions (the CI path, inert in
+# this repo; see the header).
 # Missing attestation in CI means something regressed; in local mode it is expected.
 if [ "$IS_CI" = "true" ]; then
   ATTEST=$(npm view "@yawlabs/ssh-mcp@${VERSION}" dist.attestations.provenance.predicateType 2>/dev/null || echo "")

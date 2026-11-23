@@ -21,13 +21,9 @@ import { registerTools } from "../tools.js";
 // caller from a read that produced nothing. It now says so, the way ssh_find does; that is
 // asserted below rather than pinned as a defect.
 //
-// One defect remains pinned as-is because it cannot be fixed from tools.ts: ssh_stat's
-// "symlink" kind label is UNREACHABLE in production. statFile (src/ssh.ts) calls SFTP
-// lstat for the TYPE and stat for the METADATA, so isSymbolicLink is now real -- a link to a directory
-// renders "directory" and a dangling one rejects ENOENT before any formatting happens. The
-// fix is an lstat in ssh.ts (deleteFile already uses one for exactly this distinction); the
-// tests below drive statFile through a mock, so they exercise the label but cannot prove it
-// is reachable.
+// ssh_stat's handler tests drive statFile through the mock; the "real statFile" block near
+// them uses vi.importActual to run the shipped lstat/stat logic against a fake SFTP session,
+// so the symlink and dangling labels are proven reachable, not just formattable.
 
 type ToolResult = { content: { type: string; text: string }[]; isError?: boolean };
 type ToolHandler = (args: Record<string, unknown>) => Promise<ToolResult>;
@@ -473,7 +469,8 @@ describe("ssh_service_status isError is driven by `unknown`, never by the servic
 describe("ssh_stat kind label", () => {
   const cases: [label: string, flags: Partial<FileStats>, kind: string][] = [
     ["a directory", { isDirectory: true }, "directory"],
-    ["a symlink to nothing resolvable", { isSymbolicLink: true }, "symlink -> other"],
+    ["a symlink to a socket or device", { isSymbolicLink: true, targetResolved: true }, "symlink -> other"],
+    ["a dangling symlink", { isSymbolicLink: true, targetResolved: false }, "symlink -> (dangling)"],
     ["a plain file", { isFile: true }, "file"],
     ["none of the three (socket, fifo, device)", {}, "other"],
   ];
@@ -505,10 +502,19 @@ describe("ssh_stat kind label", () => {
     expect(textOf(await call("ssh_stat", { ...HOST, path: "/p" }))).not.toContain("symlink");
   });
 
+  it("a dangling symlink says its metadata is the link's own, and a resolved one does not", async () => {
+    statFileSpy.mockResolvedValue(stats({ isSymbolicLink: true, targetResolved: false, size: 11 }));
+    const dangling = textOf(await call("ssh_stat", { ...HOST, path: "/p" })).split("\n");
+    expect(dangling[0]).toBe("/p: symlink -> (dangling)");
+    expect(dangling[1]).toMatch(/target could not be resolved; the metadata below is the link's own/);
+    expect(dangling[2]).toBe("  Size: 11 bytes");
+    statFileSpy.mockResolvedValue(stats({ isSymbolicLink: true, targetResolved: true, isFile: true }));
+    expect(textOf(await call("ssh_stat", { ...HOST, path: "/p" }))).not.toContain("Note:");
+  });
+
   it("the flags themselves are never printed -- only the single derived kind word", async () => {
-    // The tool description advertises "type flags (isFile, isDirectory, isSymbolicLink)";
-    // what the handler actually emits is one kind label per path. Pinned so the description
-    // and the output can be compared against each other.
+    // The tool description names the path type ("symlink -> <target kind>"), not the raw
+    // isFile / isDirectory / isSymbolicLink flags; the handler emits one kind label per path.
     statFileSpy.mockResolvedValue(stats({ isFile: true }));
     const text = textOf(await call("ssh_stat", { ...HOST, path: "/p" }));
     expect(text).not.toContain("isFile");
@@ -519,6 +525,64 @@ describe("ssh_stat kind label", () => {
     statFileSpy.mockResolvedValue(stats({ isFile: true }));
     const text = textOf(await call("ssh_stat", { ...HOST, path: "/very/deep/path.txt" }));
     expect(text.startsWith("/very/deep/path.txt: file\n")).toBe(true);
+  });
+});
+
+describe("real statFile: which target failures fall back and which propagate", () => {
+  // statFile is mocked above, so pull the shipped one back out and run it against a fake
+  // SFTP session. ssh2 sets the numeric SFTP status on err.code.
+  const sftpError = (message: string, code?: number) => Object.assign(new Error(message), { code });
+  const linkStats = {
+    size: 11,
+    mode: 0o120777,
+    uid: 0,
+    gid: 0,
+    mtime: 100,
+    atime: 100,
+    isFile: () => false,
+    isDirectory: () => false,
+    isSymbolicLink: () => true,
+  };
+  const fileStats = { ...linkStats, size: 5, mode: 0o100644, isFile: () => true, isSymbolicLink: () => false };
+  const clientWith = (targetResult: unknown, lstatResult: unknown = linkStats) => {
+    const settle = (r: unknown, cb: (err: unknown, s?: unknown) => void) =>
+      queueMicrotask(() => (r instanceof Error ? cb(r) : cb(undefined, r)));
+    const sftp = {
+      lstat: (_p: string, cb: (err: unknown, s?: unknown) => void) => settle(lstatResult, cb),
+      stat: (_p: string, cb: (err: unknown, s?: unknown) => void) => settle(targetResult, cb),
+      end: () => {},
+    };
+    return { sftp: (cb: (err: unknown, s: unknown) => void) => cb(null, sftp) } as never;
+  };
+  const realStatFile = async () => (await vi.importActual<typeof import("../ssh.js")>("../ssh.js")).statFile;
+
+  it.each([
+    ["NO_SUCH_FILE (dangling)", 2],
+    ["FAILURE (OpenSSH's code for ELOOP)", 4],
+  ])("falls back to the link's own stats on %s and marks targetResolved false", async (_l, code) => {
+    const statFile = await realStatFile();
+    const result = await statFile(clientWith(sftpError("x", code)), "/l");
+    expect(result).toMatchObject({ isSymbolicLink: true, targetResolved: false, size: 11 });
+  });
+
+  it("rethrows PERMISSION_DENIED on the target instead of rendering it as dangling", async () => {
+    const statFile = await realStatFile();
+    await expect(statFile(clientWith(sftpError("Permission denied", 3)), "/l")).rejects.toThrow(/Permission denied/);
+  });
+
+  it("rethrows ssh2's status-less lost-channel error instead of rendering it as dangling", async () => {
+    // ssh2 fails pending SFTP requests with a bare Error (no code) when the channel closes.
+    const statFile = await realStatFile();
+    await expect(statFile(clientWith(new Error("No response from server")), "/l")).rejects.toThrow(
+      "No response from server",
+    );
+  });
+
+  it("marks a resolved symlink targetResolved true and leaves a plain file without the field", async () => {
+    const statFile = await realStatFile();
+    expect((await statFile(clientWith(fileStats), "/l")).targetResolved).toBe(true);
+    const plain = await statFile(clientWith(new Error("stat must not run"), fileStats), "/f");
+    expect("targetResolved" in plain).toBe(false);
   });
 });
 
@@ -742,6 +806,27 @@ describe("ssh_exec output order: status, then stderr, then stdout", () => {
   });
 });
 
+describe("ssh_exec does NOT set isError on a non-zero exit or a signal kill", () => {
+  // Deliberate, and the opposite of ssh_multi_exec: the command ran, and its status is the
+  // first content block. Both descriptions say so; pinned so the two cannot drift silently.
+  it.each([
+    ["a non-zero exit", { stdout: "", stderr: "boom", code: 7 }],
+    ["a signal kill", { stdout: "", stderr: "", code: -1, signal: "KILL" }],
+    ["a clean exit", { stdout: "ok", stderr: "", code: 0 }],
+  ])("omits isError for %s", async (_label, execResult) => {
+    execSpy.mockResolvedValue(execResult);
+    const result = await call("ssh_exec", { ...HOST, command: "x" });
+    expect("isError" in result).toBe(false);
+    expect(result.content[0].text).toContain(`[exit code: ${execResult.code}]`);
+  });
+
+  it("both exec descriptions state the difference", () => {
+    expect(getTool("ssh_exec").description).toMatch(/non-zero exit code or a signal kill is NOT flagged isError/);
+    expect(getTool("ssh_multi_exec").description).toMatch(/flagged isError when ANY host/);
+    expect(getTool("ssh_multi_exec").description).toMatch(/does not set isError/);
+  });
+});
+
 describe("SFTP confirmation strings", () => {
   it("ssh_write_file confirms with the UTF-8 byte count and the path", async () => {
     expect(textOf(await call("ssh_write_file", { ...HOST, path: "/tmp/a.txt", content: "hello" }))).toBe(
@@ -828,9 +913,11 @@ describe("timeout defaulting reaches the callee", () => {
   ];
 
   it.each(TIMEOUT_PARAM)("%s declares a timeout parameter: %s", (name, declared) => {
-    // The SFTP tools take no timeout at all -- they are bounded by the connection's own
-    // readyTimeout, not a per-call one. Pinned so the "defaults to 30000" claim is scoped
-    // to the tools that actually have the parameter.
+    // The SFTP tools take no timeout PARAMETER -- they are bounded by the SFTP helpers'
+    // own fixed deadline in ssh.ts (DEFAULT_SFTP_TIMEOUT_MS, transfers
+    // DEFAULT_SFTP_TRANSFER_TIMEOUT_MS), not a per-call one; readyTimeout bounds only
+    // the handshake. Pinned so the "defaults to 30000" claim is scoped to the tools that
+    // actually have the parameter.
     expect("timeout" in getTool(name).schema).toBe(declared);
   });
 });
@@ -996,6 +1083,10 @@ describe("ssh_multi_exec sets isError for the WHOLE batch", () => {
     ]);
     expect(textOf(result)).toBe(
       [
+        "[summary: 2 host(s), 1 failed]",
+        "web1.test: exit 0",
+        "web2.test: ERROR Timed out",
+        "",
         "--- web1.test ---",
         "10:00:01 up 3 days",
         "[exit code: 0]",
@@ -1005,6 +1096,34 @@ describe("ssh_multi_exec sets isError for the WHOLE batch", () => {
         "",
       ].join("\n"),
     );
+  });
+
+  it("the summary carries the signal and only the FIRST line of a multi-line error", async () => {
+    const text = textOf(
+      await runBatch([
+        { host: "a.test", stdout: "", stderr: "", code: -1, signal: "TERM" },
+        { host: "b.test", stdout: "", stderr: "", code: -1, error: "Connection refused\n\nDiagnostics:\n[FAIL] tcp" },
+      ]),
+    );
+    const summary = text.slice(0, text.indexOf("--- a.test ---"));
+    expect(summary).toBe(
+      "[summary: 2 host(s), 2 failed]\na.test: exit -1, signal TERM\nb.test: ERROR Connection refused\n\n",
+    );
+    // The full diagnostics still appear, in that host's own block.
+    expect(text).toContain("[ERROR] Connection refused\n\nDiagnostics:\n[FAIL] tcp");
+  });
+
+  it("keeps EVERY host's status inside a 100 KB proxy cap when an early host is chatty", async () => {
+    // A proxy (Yaw MCP: 100 KB) cuts the tail of the result. With status only at the end of
+    // each host's block, host 1's 500 KB of stdout pushed every later host's exit code out.
+    const results: MultiResult[] = [
+      { host: "chatty.test", stdout: "x".repeat(500_000), stderr: "", code: 0 },
+      { host: "quiet.test", stdout: "", stderr: "", code: 5 },
+      { host: "down.test", stdout: "", stderr: "", code: -1, error: "Connection refused" },
+    ];
+    const kept = textOf(await runBatch(results)).slice(0, 100_000);
+    expect(kept).toContain("quiet.test: exit 5");
+    expect(kept).toContain("down.test: ERROR Connection refused");
   });
 
   it("an errored host prints [ERROR] INSTEAD of stdout/stderr/exit-code, even when they are set", async () => {
@@ -1100,10 +1219,14 @@ describe("the zod numeric boundaries are the only guard between 'omitted' and an
 
   it("ssh_find's `maxdepth` deliberately ALLOWS 0 -- it is a real query, not a missing value", () => {
     // The contrast that makes the rule above meaningful: `-maxdepth 0` tests the named path
-    // itself, and find() guards with `!== undefined` rather than truthiness, so a bare
-    // z.number() is correct here.
+    // itself, and find() guards with `!== undefined` rather than truthiness, so the schema is
+    // z.number().int().nonnegative() -- 0 allowed, but negatives, fractions and strings refused
+    // at the boundary rather than left to find()'s own runtime check.
     const maxdepth = field("ssh_find", "maxdepth");
-    expect(maxdepth.safeParse(0).success).toBe(true);
+    for (const good of [0, 1, 50]) expect(maxdepth.safeParse(good).success).toBe(true);
     expect(maxdepth.safeParse(undefined).success).toBe(true);
+    for (const bad of [-1, 1.5, "2", null]) {
+      expect(maxdepth.safeParse(bad).success, `maxdepth should reject ${String(bad)}`).toBe(false);
+    }
   });
 });

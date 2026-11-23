@@ -1,5 +1,13 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  constants as fsConstants,
+  fstatSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -71,7 +79,14 @@ export const SSH_NON_KEY_FILES: ReadonlySet<string> = new Set([
   "environment",
 ]);
 
-// Validate hostname to prevent shell injection — only allow safe characters
+// Validate a hostname before it reaches ssh / ssh-keygen / ssh-keyscan. No shell is
+// involved anywhere (every call is execFileSync with an argv), so the concern is
+// OPTION injection -- a host read as a flag -- plus keeping odd bytes out of argv.
+// Accepted: letters, digits, dots, underscores and hyphens (not leading), or a
+// bracketed IPv6 literal. A port is never part of the host.
+export const INVALID_HOSTNAME_SUGGESTION =
+  "Provide a valid hostname: letters, digits, dots, underscores and hyphens (not leading), or a bracketed IPv6 literal like [::1]. Pass the port separately, not as host:port.";
+
 export function isValidHostname(host: string): boolean {
   if (host.length === 0 || host.length > 253) return false;
   // IPv6 in brackets: [::1], [2001:db8::1]
@@ -89,121 +104,219 @@ export function isValidHostname(host: string): boolean {
   return /^[a-zA-Z0-9._-]+$/.test(host);
 }
 
-export function runArgs(cmd: string, args: string[]): { stdout: string; ok: boolean } {
+/** Default kill timeout for every runArgs child. */
+export const RUN_ARGS_TIMEOUT_MS = 10000;
+
+export interface RunArgsOptions {
+  /**
+   * Child-env overrides merged on top of a copy of process.env. A key mapped to
+   * `undefined` is DELETED from the copy (so the child does not inherit it). Omit
+   * the option entirely and the child inherits process.env unchanged.
+   */
+  env?: Record<string, string | undefined>;
+}
+
+export function runArgs(cmd: string, args: string[], options: RunArgsOptions = {}): { stdout: string; ok: boolean } {
+  let env: Record<string, string> | undefined;
+  if (options.env) {
+    env = {};
+    for (const [k, v] of Object.entries(process.env)) {
+      if (typeof v === "string") env[k] = v;
+    }
+    for (const [k, v] of Object.entries(options.env)) {
+      if (v === undefined) delete env[k];
+      else env[k] = v;
+    }
+  }
   try {
     // windowsHide: oam 0.19.1 stopped giving every child CREATE_NO_WINDOW, and Node
     // never did, so without it each ssh / ssh-add / ssh-keygen probe can flash a console.
     const stdout = execFileSync(cmd, args, {
+      env,
       encoding: "utf8",
-      timeout: 10000,
+      timeout: RUN_ARGS_TIMEOUT_MS,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
     return { stdout: stdout.trim(), ok: true };
   } catch (e: unknown) {
     // Capture both stdout and stderr — many SSH commands (ssh -T, ssh-add) output to stderr
-    const err = e as { stdout?: Buffer; stderr?: Buffer; message?: string };
+    const err = e as { stdout?: Buffer; stderr?: Buffer; message?: string; code?: string };
     const stdout = err.stdout?.toString().trim() || "";
     const stderr = err.stderr?.toString().trim() || "";
+    // A child killed by our own timeout throws with code ETIMEDOUT, usually empty
+    // streams, and the message "spawnSync <cmd> ETIMEDOUT" -- which carries none of the
+    // markers the classifiers look for ("timed out" is not a substring of ETIMEDOUT).
+    // ssh's ConnectTimeout=5 is per address, so a host with two dead addresses or slow
+    // DNS reaches this. Say "timed out" in words so it classifies as a timeout.
+    if (err.code === "ETIMEDOUT") {
+      const note = `${cmd} timed out after ${RUN_ARGS_TIMEOUT_MS / 1000}s and was killed`;
+      return { stdout: [stdout, stderr, note].filter(Boolean).join("\n"), ok: false };
+    }
     const output = [stdout, stderr].filter(Boolean).join("\n") || err.message || "";
     return { stdout: output, ok: false };
   }
 }
 
+/** The Windows OpenSSH agent's default named pipe. */
+export const WINDOWS_AGENT_PIPE = "\\\\.\\pipe\\openssh-ssh-agent";
+
+/**
+ * The child-env override that points ssh-add at `socket`. The DEFAULT Windows pipe
+ * is reached by leaving SSH_AUTH_SOCK unset (Windows ssh-add falls back to it), and
+ * unsetting rather than omitting keeps a stale inherited value from redirecting it.
+ * Every other socket -- a Unix path, or a CUSTOM named pipe (a pageant bridge,
+ * gpg-agent, a password manager) -- is passed through as SSH_AUTH_SOCK, so the
+ * agent that answers is the one the caller asked about. Pipe names are
+ * case-insensitive on Windows.
+ */
+export function agentChildEnv(socket: string): Record<string, string | undefined> {
+  return socket.toLowerCase() === WINDOWS_AGENT_PIPE ? { SSH_AUTH_SOCK: undefined } : { SSH_AUTH_SOCK: socket };
+}
+
+/** The platform's own "start an agent" remedy. */
+export function agentStartSuggestion(): string {
+  return process.platform === "win32"
+    ? "Start the Windows OpenSSH agent: Get-Service ssh-agent | Set-Service -StartupType Automatic; Start-Service ssh-agent"
+    : 'Start ssh-agent: eval "$(ssh-agent -s)"';
+}
+
+// "no identities" is a SUCCESSFUL probe -- the agent answered, it just holds nothing.
+// Some builds report it with a non-zero exit and some with a zero one, so it is
+// tested before the exit code on every channel. (Covers "The agent has no identities.")
+const agentHasNoIdentities = (output: string): boolean => output.includes("no identities");
+
 export function checkSshAgent(): DiagnosticResult {
   const sock = process.env.SSH_AUTH_SOCK;
+  const isWindows = process.platform === "win32";
 
-  // On Windows without SSH_AUTH_SOCK, try the OpenSSH agent service directly
-  if (!sock && process.platform === "win32") {
+  if (sock) {
     const { stdout, ok } = runArgs("ssh-add", ["-l"]);
-    if (ok) {
-      return { status: "ok", message: `Windows OpenSSH agent running with keys:\n${stdout}` };
-    }
-    if (stdout.includes("no identities") || stdout.includes("The agent has no identities")) {
+    if (agentHasNoIdentities(stdout)) {
       return {
         status: "warning",
-        message: "Windows OpenSSH agent is running but has no keys loaded. Run: ssh-add <key-path>",
+        message: "ssh-agent is running but has no keys loaded. Run: ssh-add <key-path>",
       };
     }
-    // ssh-add failed and no identities message — agent is not reachable
-    return {
-      status: "error",
-      message:
-        "Windows OpenSSH Authentication Agent is not running. Start it: Get-Service ssh-agent | Set-Service -StartupType Automatic; Start-Service ssh-agent",
-    };
-  }
+    if (ok) return { status: "ok", message: `ssh-agent running with keys:\n${stdout}` };
 
-  if (!sock) {
+    // Any other ssh-add failure means the agent did not answer. Do NOT fall through to
+    // "ok" on an unrecognised phrasing: that reported a dead agent as healthy.
+    // On Windows a set-but-stale SSH_AUTH_SOCK (a leftover WSL / Git Bash path) is
+    // common while the OpenSSH service is up, so try the named pipe next -- the same
+    // fall-through ensureAgent (env.ts) makes -- instead of blaming a working agent.
+    if (!isWindows) {
+      return {
+        status: "error",
+        message: stdout.includes("Could not open a connection")
+          ? `SSH_AUTH_SOCK is set to "${sock}" but the agent is not reachable. The agent process may have died. Run: eval "$(ssh-agent -s)"`
+          : `SSH_AUTH_SOCK is set to "${sock}" but ssh-add could not query the agent: ${stdout || "no output"}. Run: eval "$(ssh-agent -s)"`,
+      };
+    }
+  } else if (!isWindows) {
     return {
       status: "error",
       message: "SSH_AUTH_SOCK is not set. ssh-agent is not running or not exported to this shell.",
     };
   }
 
-  const { stdout, ok } = runArgs("ssh-add", ["-l"]);
-
-  // "no identities" is a SUCCESSFUL probe -- the agent answered, it just holds
-  // nothing. Some builds report it with a non-zero exit, so it is checked before
-  // the failure branch below rather than being treated as unreachable.
-  if (stdout.includes("The agent has no identities") || stdout.includes("no identities")) {
+  // win32: the OpenSSH agent service's named pipe, reached with SSH_AUTH_SOCK unset.
+  const { stdout, ok } = runArgs("ssh-add", ["-l"], { env: agentChildEnv(WINDOWS_AGENT_PIPE) });
+  const reachable = ok || agentHasNoIdentities(stdout);
+  if (reachable && sock) {
+    // The pipe answers, but SSH_AUTH_SOCK still names a dead socket, and the
+    // connection path honours SSH_AUTH_SOCK first -- so connections will not reach
+    // this agent until the variable is unset. A warning, not an error: the agent is fine.
     return {
       status: "warning",
-      message: "ssh-agent is running but has no keys loaded. Run: ssh-add <key-path>",
+      message: `Windows OpenSSH agent is running, but SSH_AUTH_SOCK is set to "${sock}", where no agent answers, and connections use SSH_AUTH_SOCK first. Unset SSH_AUTH_SOCK so every tool reaches the agent through its named pipe.`,
     };
   }
-
-  // Any other ssh-add failure means the agent did not answer. Keep the classic
-  // wording for the known phrasing, but do NOT fall through to "ok" on an
-  // unrecognised one: that reported a dead agent as healthy and pasted the error
-  // text in where the key list belongs. Mirrors probeAgent's discriminator in env.ts.
-  if (!ok) {
+  if (agentHasNoIdentities(stdout)) {
     return {
-      status: "error",
-      message: stdout.includes("Could not open a connection")
-        ? `SSH_AUTH_SOCK is set to "${sock}" but the agent is not reachable. The agent process may have died. Run: eval "$(ssh-agent -s)"`
-        : `SSH_AUTH_SOCK is set to "${sock}" but ssh-add could not query the agent: ${stdout || "no output"}. Run: eval "$(ssh-agent -s)"`,
+      status: "warning",
+      message: "Windows OpenSSH agent is running but has no keys loaded. Run: ssh-add <key-path>",
     };
   }
-
-  return { status: "ok", message: `ssh-agent running with keys:\n${stdout}` };
+  if (ok) return { status: "ok", message: `Windows OpenSSH agent running with keys:\n${stdout}` };
+  return {
+    status: "error",
+    message: sock
+      ? `SSH_AUTH_SOCK is set to "${sock}" but no agent answers there, and the Windows OpenSSH Authentication Agent is not running either. Start it: Get-Service ssh-agent | Set-Service -StartupType Automatic; Start-Service ssh-agent`
+      : "Windows OpenSSH Authentication Agent is not running. Start it: Get-Service ssh-agent | Set-Service -StartupType Automatic; Start-Service ssh-agent",
+  };
 }
 
+export interface PrivateKeyCandidate {
+  name: string;
+  path: string;
+  /** The file's content, read through the same descriptor that passed the regular-file check. */
+  content: string;
+}
+
+/**
+ * Reads one ~/.ssh entry as a private-key candidate, or null when it is not one.
+ *
+ * Open once, then stat and read through the descriptor, so the content checked for a
+ * key comes from the file that passed the regular-file check -- a by-path stat
+ * followed by a by-path read can be swapped in between. O_NONBLOCK keeps the open
+ * from hanging on a FIFO and O_NOCTTY keeps a tty from becoming the controlling
+ * terminal; fstat then rejects both as not a regular file. Both flags are POSIX-only,
+ * and undefined on Windows.
+ */
+function readKeyCandidate(sshDir: string, name: string): PrivateKeyCandidate | null {
+  const filePath = join(sshDir, name);
+  let fd: number | undefined;
+  try {
+    fd = openSync(filePath, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0) | (fsConstants.O_NOCTTY ?? 0));
+    if (!fstatSync(fd).isFile()) return null;
+    const content = readFileSync(fd, "utf8");
+    return content.includes("PRIVATE KEY") ? { name, path: filePath, content } : null;
+  } catch {
+    return null; // unreadable: not a usable key
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+/**
+ * The one ~/.ssh private-key scan, shared by `checkSshKeys` below and
+ * `listSshKeysDetailed` in env.ts so the two cannot disagree about what is a key.
+ * Skips *.pub, dotfiles and SSH_NON_KEY_FILES, then keeps the regular files whose
+ * content carries a private-key marker. THROWS when readdir fails, so a caller can
+ * tell "unreadable" from "empty".
+ */
+export function scanPrivateKeyFiles(sshDir: string): PrivateKeyCandidate[] {
+  const out: PrivateKeyCandidate[] = [];
+  for (const name of readdirSync(sshDir)) {
+    if (name.endsWith(".pub") || name.startsWith(".") || SSH_NON_KEY_FILES.has(name)) continue;
+    const candidate = readKeyCandidate(sshDir, name);
+    if (candidate) out.push(candidate);
+  }
+  return out;
+}
+
+const DEFAULT_KEY_NAMES = ["id_ed25519", "id_rsa", "id_ecdsa"];
+
 export function checkSshKeys(): DiagnosticResult {
-  const home = homedir();
-  const sshDir = join(home, ".ssh");
+  const sshDir = join(homedir(), ".ssh");
 
   if (!existsSync(sshDir)) {
     return { status: "error", message: "~/.ssh directory does not exist. Run: mkdir -p ~/.ssh && chmod 700 ~/.ssh" };
   }
 
-  const keyTypes = ["id_ed25519", "id_rsa", "id_ecdsa"];
-  const found: string[] = [];
-
-  for (const key of keyTypes) {
-    const keyPath = join(sshDir, key);
-    if (existsSync(keyPath)) {
-      found.push(key);
-    }
-  }
-
-  // Check for any other private key files
+  let names: string[];
   try {
-    const allFiles = readdirSync(sshDir).filter((f) => !f.endsWith(".pub") && !SSH_NON_KEY_FILES.has(f));
-    for (const f of allFiles) {
-      if (!keyTypes.includes(f) && existsSync(join(sshDir, f))) {
-        try {
-          const content = readFileSync(join(sshDir, f), "utf8");
-          if (content.includes("PRIVATE KEY")) {
-            found.push(f);
-          }
-        } catch {
-          // Not readable, skip
-        }
-      }
-    }
+    names = scanPrivateKeyFiles(sshDir).map((c) => c.name);
   } catch {
-    // readdir failed, stick with default key check
+    // readdir failed: the default names can still be opened directly.
+    names = DEFAULT_KEY_NAMES.filter((n) => readKeyCandidate(sshDir, n) !== null);
   }
+  // Default-named keys first, in their conventional order, then the rest as found.
+  const found = [
+    ...DEFAULT_KEY_NAMES.filter((n) => names.includes(n)),
+    ...names.filter((n) => !DEFAULT_KEY_NAMES.includes(n)),
+  ];
 
   if (found.length === 0) {
     return {
@@ -215,29 +328,66 @@ export function checkSshKeys(): DiagnosticResult {
   return { status: "ok", message: `Found SSH keys: ${found.join(", ")}` };
 }
 
-export function checkKnownHosts(host: string): DiagnosticResult {
+// Same rules as `unbracketHost` / `knownHostsTargets` in ssh.ts, kept local because
+// ssh.ts imports this module (importing back would make a cycle). For a default-port
+// entry ssh-keygen stores and matches the address BARE (`-F '::1'` hits a `::1` line,
+// `-F '[::1]'` misses it); a non-default port is `[addr]:port`. The bare entry is
+// also consulted on a non-default port, exactly as readKnownHostsEntries does, since
+// the connection path's verifier accepts it there too.
+const unbracket = (host: string): string =>
+  host.length > 2 && host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+
+function knownHostsLookupTargets(host: string, port: number): string[] {
+  const bare = unbracket(host);
+  return port !== 22 ? [`[${bare}]:${port}`, bare] : [bare];
+}
+
+/** The entry spelling `ssh-keygen -R` must be given for this host and port. */
+function knownHostsEntryName(host: string, port: number): string {
+  return knownHostsLookupTargets(host, port)[0];
+}
+
+/**
+ * A runnable `ssh-keyscan` line that pins this host AND port. Callers pass the
+ * RESOLVED hostname, never an ssh_config alias: ssh-keyscan does not read
+ * ssh_config, and without `-p` it scans port 22. The host goes in bare, because
+ * ssh-keyscan and `ssh-keygen -R` share `-F`'s bracket sensitivity.
+ */
+export function keyscanCommand(host: string, port = 22): string {
+  const portFlag = port !== 22 ? ` -p ${port}` : "";
+  return `ssh-keyscan -H${portFlag} "${unbracket(host)}" >> ~/.ssh/known_hosts`;
+}
+
+// What happens to a host that is not pinned, stated the way this server actually
+// behaves: trust-always (accepted unverified, never saved), or refused in strict mode.
+// There is no interactive prompt anywhere in this server.
+const UNPINNED_BEHAVIOUR =
+  "ssh-mcp accepts an unpinned host's key unverified on every connection (it is never saved), or refuses it when SSH_MCP_STRICT_HOSTKEYS=1";
+
+export function checkKnownHosts(host: string, port = 22): DiagnosticResult {
   if (!isValidHostname(host)) {
     return { status: "error", message: `Invalid hostname: "${host}"` };
   }
 
   const knownHostsPath = join(homedir(), ".ssh", "known_hosts");
+  const quoted = port !== 22 ? `"${host}" (port ${port})` : `"${host}"`;
 
   if (!existsSync(knownHostsPath)) {
     return {
       status: "warning",
-      message: "~/.ssh/known_hosts does not exist. First connection to any host will prompt for verification.",
+      message: `~/.ssh/known_hosts does not exist, so no host is pinned: ${UNPINNED_BEHAVIOUR}.`,
     };
   }
 
-  const { stdout, ok } = runArgs("ssh-keygen", ["-F", host]);
-  if (!ok || !stdout.trim()) {
-    return {
-      status: "warning",
-      message: `Host "${host}" is not in known_hosts. First connection will prompt for host key verification. To add it: ssh-keyscan -H "${host}" >> ~/.ssh/known_hosts`,
-    };
+  for (const target of knownHostsLookupTargets(host, port)) {
+    const { stdout, ok } = runArgs("ssh-keygen", ["-F", target]);
+    if (ok && stdout.trim()) return { status: "ok", message: `Host ${quoted} found in known_hosts` };
   }
 
-  return { status: "ok", message: `Host "${host}" found in known_hosts` };
+  return {
+    status: "warning",
+    message: `Host ${quoted} is not in known_hosts. ${UNPINNED_BEHAVIOUR}. To pin it: ${keyscanCommand(host, port)}`,
+  };
 }
 
 // Why a probe outcome is a named union rather than a message string: two callers
@@ -252,6 +402,7 @@ export type SshProbeOutcome =
   | "connection-refused"
   | "timed-out"
   | "host-key-mismatch"
+  | "host-key-unknown"
   | "dns-failure"
   | "unknown";
 
@@ -263,9 +414,18 @@ export interface SshProbeResult {
   elapsedMs: number;
 }
 
-// Classifies the output of the `echo SSH_OK` probe below. Ordering is significant
-// and matches what both callers did before they were unified: auth failure, then
-// refused, then timeout, then host-key mismatch, then DNS.
+// Classifies the output of the `echo SSH_OK` probe below (and checkGitSsh's
+// failures in env.ts). Ordering is significant: success, then host-key failure,
+// then auth failure, refused, timeout, DNS.
+//
+// Host-key failure comes BEFORE "Permission denied" because OpenSSH can print both:
+// when a changed key is tolerated (StrictHostKeyChecking=no) it prints the
+// "REMOTE HOST IDENTIFICATION HAS CHANGED" banner and carries on to pubkey auth,
+// which then fails -- measured on OpenSSH_10.6p1 with a wrong key pinned for
+// github.com. Checked after "Permission denied", a changed key read as an auth
+// problem. The probe now refuses a changed key outright (accept-new), which prints
+// "Host key verification failed."; the banner test still catches any caller or
+// build that tolerates the change.
 //
 // One deliberate consolidation: `checkConnectivity` used to test for the narrower
 // "Could not resolve hostname" while `testConnection` tested for "Could not
@@ -274,26 +434,84 @@ export interface SshProbeResult {
 // the broader form degrades more gracefully if that wording ever changes.
 export function classifySshProbe(ok: boolean, output: string): SshProbeOutcome {
   if (ok && output.includes("SSH_OK")) return "ok";
+  // Strict mode's refusal of an UNPINNED host prints "No <type> host key is known for
+  // <h> and you have requested strict checking." followed by the same "Host key
+  // verification failed." line a changed key ends with, so it is told apart first.
+  // Not on "requested strict checking" alone: accept-new's refusal of a CHANGED key
+  // says "Host key for <h> has changed and you have requested strict checking."
+  if (/No \S+ host key is known for /.test(output)) return "host-key-unknown";
+  if (output.includes("REMOTE HOST IDENTIFICATION HAS CHANGED") || output.includes("Host key verification failed")) {
+    return "host-key-mismatch";
+  }
   if (output.includes("Permission denied")) return "permission-denied";
   if (output.includes("Connection refused")) return "connection-refused";
   if (output.includes("timed out")) return "timed-out";
-  if (output.includes("Host key verification failed")) return "host-key-mismatch";
   if (output.includes("Could not resolve")) return "dns-failure";
   return "unknown";
 }
 
-// Runs the shared read-only SSH reachability probe. Callers own their own wording.
+/**
+ * Strict host-key mode: reject a host with no known_hosts entry instead of trusting it.
+ *
+ * Two names, one switch. SSH_MCP_STRICT_HOSTKEYS is the documented one.
+ * SSH_MCP_STRICT_HOST_KEY is the original name and keeps working, but it is
+ * credential-shaped -- `KEY` is a whole underscore segment -- so Yaw MCP's doctor
+ * listed `SSH_MCP_STRICT_HOST_KEY=1` as a plaintext secret and suggested moving it
+ * into the vault. `HOSTKEYS` is not a credential segment, so the new name is not
+ * flagged. Either one turns strict mode on.
+ *
+ * Both are read the way Yaw MCP reads an opt-in: trimmed, case-insensitive `1` or
+ * `true`. Only the exact string "1" used to count, so `=true` silently left strict
+ * mode OFF -- the unsafe direction for a security switch.
+ */
+export function isStrictHostKeyMode(env: NodeJS.ProcessEnv = process.env): boolean {
+  const on = (v: string | undefined) => {
+    const t = (v ?? "").trim().toLowerCase();
+    return t === "1" || t === "true";
+  };
+  return on(env.SSH_MCP_STRICT_HOSTKEYS) || on(env.SSH_MCP_STRICT_HOST_KEY);
+}
+
+// The probe's known_hosts files. A LIST: ssh reads every file in it to verify a key
+// but writes a newly accepted key only to the FIRST, which is the null device -- so
+// the probe still sees the operator's pins (and so can report a changed key) while
+// being unable to add one. `/dev/null`, not `NUL`, on every platform: measured on
+// Windows, Git for Windows' OpenSSH_10.6p1 (MSYS) treats `NUL` as a relative file
+// name and created a file called NUL in its cwd holding the accepted key, while both
+// it and Windows' OpenSSH_for_Windows_9.5p2 map `/dev/null` to the null device (the
+// accepted key was discarded, the listed files unchanged). `~` is expanded by ssh
+// itself, which sidesteps a home directory containing spaces (the list is
+// whitespace-separated). These two files are OpenSSH's own default list.
+export const PROBE_USER_KNOWN_HOSTS = "/dev/null ~/.ssh/known_hosts ~/.ssh/known_hosts2";
+
+// Runs the shared SSH reachability probe. Callers own their own wording.
 //
 // Caller MUST validate `host` with isValidHostname first -- this function passes the
 // host to ssh positionally and does not re-check it.
 //
-// StrictHostKeyChecking=no on a read-only "echo SSH_OK" probe. No passwords or
-// private-key material transit -- BatchMode=yes suppresses password prompts and ssh
-// never sends private keys over the wire. But the SSH client WILL attempt pubkey auth
-// against the (possibly-MitM'd) endpoint, so the public-key fingerprints of any
-// identities loaded in the agent are observable to whatever answers on this port.
-// For real connections, hostVerifier in resolveConfig (src/ssh.ts) enforces
-// known_hosts matching and prevents this exposure.
+// The probe WRITES NOTHING. ssh_diagnose is annotated read-only, and this server
+// never persists a host key as a side effect of connecting (only ssh_known_hosts_fix
+// writes known_hosts). The old `StrictHostKeyChecking=no` with the default files did
+// persist: OpenSSH "Permanently added" an unknown host's key to ~/.ssh/known_hosts,
+// pinning whatever answered. Now:
+//   - StrictHostKeyChecking=accept-new: an unknown host is accepted, matching the
+//     connection path's trust-always behaviour (under SSH_MCP_STRICT_HOSTKEYS it is
+//     =yes instead, so ssh_test refuses an unpinned host exactly as ssh_exec does), and a CHANGED key is refused with
+//     "Host key verification failed." (=no tolerated it and went on to pubkey auth,
+//     so a changed key surfaced as Permission denied, or as ok).
+//   - the accepted key goes to /dev/null (see PROBE_USER_KNOWN_HOSTS);
+//     GlobalKnownHostsFile=/dev/null because the connection path's verifier reads
+//     only the user file; UpdateHostKeys=no stops the hostkeys-update extension from
+//     rewriting known_hosts when the server offers extra keys.
+// Measured with both ssh builds above against github.com: an empty scratch file
+// stayed empty, and a wrong pinned key failed with "Host key verification failed."
+// and left the file unchanged.
+//
+// No passwords or private-key material transit -- BatchMode=yes suppresses password
+// prompts and ssh never sends private keys over the wire. But against an unknown
+// host the client attempts pubkey auth with whatever answers on this port, so the
+// public keys of the identities it offers are observable to it. For real
+// connections, hostVerifier in resolveConfig (src/ssh.ts) applies known_hosts.
 export function probeSshConnection(host: string, port: number): SshProbeResult {
   const start = Date.now();
   const { ok, stdout } = runArgs("ssh", [
@@ -302,7 +520,13 @@ export function probeSshConnection(host: string, port: number): SshProbeResult {
     "-o",
     "BatchMode=yes",
     "-o",
-    "StrictHostKeyChecking=no",
+    `StrictHostKeyChecking=${isStrictHostKeyMode() ? "yes" : "accept-new"}`,
+    "-o",
+    `UserKnownHostsFile=${PROBE_USER_KNOWN_HOSTS}`,
+    "-o",
+    "GlobalKnownHostsFile=/dev/null",
+    "-o",
+    "UpdateHostKeys=no",
     "-p",
     String(port),
     "--",
@@ -341,7 +565,12 @@ export function checkConnectivity(host: string, port = 22): DiagnosticResult {
     case "host-key-mismatch":
       return {
         status: "error",
-        message: `Host key verification failed for ${host}. The host key changed (instance recreated?). Fix: ssh-keygen -R "${host}" && ssh-keyscan -H "${host}" >> ~/.ssh/known_hosts`,
+        message: `Host key verification failed for ${host}. The host key changed (instance recreated?). Fix: ssh-keygen -R "${knownHostsEntryName(host, port)}" && ${keyscanCommand(host, port)}`,
+      };
+    case "host-key-unknown":
+      return {
+        status: "error",
+        message: `Host ${host} (port ${port}) is not in known_hosts and SSH_MCP_STRICT_HOSTKEYS is on, so it is refused. To pin it: ${keyscanCommand(host, port)}`,
       };
     case "dns-failure":
       return {
@@ -466,14 +695,18 @@ export function diagnose(host: string, port = 22): DiagnosticReport {
     return {
       overall: "error",
       checks: [{ name: "Input Validation", status: "error", message: `Invalid hostname: "${host}"` }],
-      suggestions: ["Provide a valid hostname (alphanumeric, dots, hyphens, colons, brackets only)"],
+      suggestions: [INVALID_HOSTNAME_SUGGESTION],
     };
   }
 
   const agent = checkSshAgent();
   checks.push({ name: "SSH Agent", ...agent });
-  if (agent.status === "error") suggestions.push('Start ssh-agent: eval "$(ssh-agent -s)"');
-  if (agent.status === "warning") suggestions.push("Load your key: ssh-add ~/.ssh/id_ed25519");
+  if (agent.status === "error") suggestions.push(agentStartSuggestion());
+  // A stale SSH_AUTH_SOCK beside a live Windows agent is a warning too, and loading
+  // a key is not its fix -- the check's own message names the real one.
+  if (agent.status === "warning" && agent.message.includes("no keys loaded")) {
+    suggestions.push("Load your key: ssh-add ~/.ssh/id_ed25519");
+  }
 
   const keys = checkSshKeys();
   checks.push({ name: "SSH Keys", ...keys });
@@ -482,15 +715,15 @@ export function diagnose(host: string, port = 22): DiagnosticReport {
   const config = checkSshConfig(host);
   checks.push({ name: "SSH Config", ...config });
 
-  const known = checkKnownHosts(host);
+  const known = checkKnownHosts(host, port);
   checks.push({ name: "Known Hosts", ...known });
-  if (known.status === "warning") suggestions.push(`Add host key: ssh-keyscan -H "${host}" >> ~/.ssh/known_hosts`);
+  if (known.status === "warning") suggestions.push(`Add host key: ${keyscanCommand(host, port)}`);
 
   const conn = checkConnectivity(host, port);
   checks.push({ name: "Connectivity", ...conn });
   if (conn.status === "error" && conn.message.includes("Host key verification")) {
-    suggestions.push(`Remove stale host key: ssh-keygen -R "${host}"`);
-    suggestions.push(`Re-add host key: ssh-keyscan -H "${host}" >> ~/.ssh/known_hosts`);
+    suggestions.push(`Remove stale host key: ssh-keygen -R "${knownHostsEntryName(host, port)}"`);
+    suggestions.push(`Re-add host key: ${keyscanCommand(host, port)}`);
   }
   if (conn.status === "error" && conn.message.includes("Permission denied")) {
     suggestions.push("Check loaded keys: ssh-add -l");

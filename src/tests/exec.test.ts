@@ -1,28 +1,11 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it } from "vitest";
 import { exec } from "../ssh.js";
+import { type FakeExecScript, fakeExecClient } from "./helpers/fake-exec-client.js";
 
-// Build a fake ssh2 Client whose exec() streams a configurable number of
-// stdout/stderr bytes, then closes. This lets us exercise the output cap
-// without needing a real SSH connection.
-function fakeClient(opts: { stdoutChunks?: Buffer[]; stderrChunks?: Buffer[]; code?: number; execError?: Error }): any {
-  return {
-    exec: (_command: string, cb: (err: Error | null, stream: any) => void) => {
-      if (opts.execError) {
-        cb(opts.execError, null);
-        return;
-      }
-      const stream: any = new EventEmitter();
-      stream.stderr = new EventEmitter();
-      cb(null, stream);
-      queueMicrotask(() => {
-        for (const c of opts.stdoutChunks ?? []) stream.emit("data", c);
-        for (const c of opts.stderrChunks ?? []) stream.stderr.emit("data", c);
-        stream.emit("close", opts.code ?? 0);
-      });
-    },
-  };
-}
+// A fake ssh2 Client whose exec() streams the given stdout/stderr chunks, then closes.
+// Lets these tests exercise exec() without a real SSH connection.
+const fakeClient = (script: FakeExecScript) => fakeExecClient(script).client;
 
 describe("exec output cap", () => {
   it("passes through output under the cap unchanged", async () => {
@@ -79,11 +62,6 @@ describe("exec output cap", () => {
     expect(result.stdout.slice(1025)).toBe("[output truncated at 1024 bytes]");
   });
 
-  it("propagates exec errors", async () => {
-    const client = fakeClient({ execError: new Error("exec failed") });
-    await expect(exec(client, "cmd")).rejects.toThrow("exec failed");
-  });
-
   it("exposes stdoutTruncated when the cap is hit", async () => {
     const chunk = Buffer.alloc(2048, 0x61);
     const client = fakeClient({ stdoutChunks: [chunk], code: 0 });
@@ -109,19 +87,19 @@ describe("exec output cap", () => {
     expect(result.stdoutTruncated).toBeUndefined();
     expect(result.stderrTruncated).toBeUndefined();
   });
+});
 
+describe("exec channel errors", () => {
+  it("propagates exec errors", async () => {
+    const client = fakeClient({ execError: new Error("exec failed") });
+    await expect(exec(client, "cmd")).rejects.toThrow("exec failed");
+  });
+});
+
+describe("exec exit status", () => {
   it("captures signal name and returns code=-1 when the channel closes signal-only", async () => {
-    const client: any = {
-      exec: (_command: string, cb: (err: Error | null, stream: any) => void) => {
-        const stream: any = new EventEmitter();
-        stream.stderr = new EventEmitter();
-        cb(null, stream);
-        queueMicrotask(() => {
-          // ssh2 emits close(code, signal). Signal-only close has code=null.
-          stream.emit("close", null, "TERM");
-        });
-      },
-    };
+    // ssh2 emits close(code, signal). Signal-only close has code=null.
+    const client = fakeClient({ code: null, signal: "TERM" });
     const result = await exec(client, "killed-cmd");
     expect(result.code).toBe(-1);
     expect(result.signal).toBe("TERM");
@@ -135,7 +113,9 @@ describe("exec output cap", () => {
     expect(result.code).toBe(0);
     expect(result.signal).toBeUndefined();
   });
+});
 
+describe("exec timeout", () => {
   it("tears down the remote channel on timeout", async () => {
     let signalCalledWith: string | undefined;
     let closeCalled = false;

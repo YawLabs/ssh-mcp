@@ -151,11 +151,16 @@ const keygenMiss = (t: string): FakeRun => ({ stderr: KEYGEN_MISS_OUT(t) });
 /** The real hit: zero exit, markers on stdout. */
 const keygenHit = (t: string): FakeRun => ({ stdout: KEYGEN_HIT_OUT(t) });
 
-/** ssh-keygen -R answers via `keygen`; ssh-keyscan fails so nothing is appended. */
+/**
+ * ssh-keygen -R answers via `keygen`; ssh-keyscan returns a key. The scan has to
+ * succeed for any removal to happen at all (fixKnownHosts scans first), and the
+ * append it leads to lands on the stubbed appendFileSync.
+ */
 function keygenOnly(keygen: (target: string) => FakeRun) {
   fakeExec((cmd, args) => {
     if (cmd === "ssh-keygen" && args[0] === "-R") return keygen(args[1]);
-    return { fail: true, stderr: "getaddrinfo: Name or service not known" };
+    if (cmd === "ssh-keyscan") return { stdout: `${args.at(-1)} ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI` };
+    return { fail: true, stderr: `unexpected ${cmd}` };
   });
 }
 
@@ -257,14 +262,50 @@ describe("fixKnownHosts reports the removal that actually happened", () => {
     expect(result.actions.join("\n")).toContain("Permission denied");
   });
 
-  it("classifies the [host]:port entry independently of the bare-host entry", () => {
-    // Bare host present, [host]:port absent -- the two must not report the same thing.
-    keygenOnly((t) => (t.startsWith("[") ? keygenMiss(t) : keygenHit(t)));
+  it("on a non-default port removes ONLY [host]:port, never port 22's bare entry", () => {
+    // The scan covered :2222 only, so deleting the bare (port-22) pin would drop it
+    // with no replacement.
+    const targets: string[] = [];
+    keygenOnly((t) => {
+      targets.push(t);
+      return keygenHit(t);
+    });
 
     const result = fixKnownHosts("db.example.com", 2222);
 
-    expect(result.actions).toContain("Removed old host key for db.example.com");
-    expect(result.actions).toContain("No existing host key for [db.example.com]:2222 (nothing to remove)");
+    expect(targets).toEqual(["[db.example.com]:2222"]);
+    expect(result.actions).toContain("Removed old host key for [db.example.com]:2222");
+    expect(result.actions).not.toContain("Removed old host key for db.example.com");
+  });
+
+  it("SCANS FIRST: a failed scan leaves known_hosts untouched -- no removal, no append", () => {
+    // Removing first meant a DNS blip deleted the pin and returned an error, turning a
+    // verified host into a trust-always one.
+    const order: string[] = [];
+    fakeExec((cmd, args) => {
+      order.push(`${cmd} ${args[0]}`);
+      if (cmd === "ssh-keygen") return keygenHit(args[1]);
+      return { fail: true, stderr: "getaddrinfo: Name or service not known" };
+    });
+
+    const result = fixKnownHosts("pinned.example.com");
+
+    expect(result.status).toBe("error");
+    expect(result.message).toContain("known_hosts was left unchanged");
+    expect(result.actions).toEqual([]);
+    expect(order).toEqual(["ssh-keyscan -H"]);
+    expect(appendSpy).not.toHaveBeenCalled();
+  });
+
+  it("treats an EMPTY scan as a failure too, and removes nothing", () => {
+    const order: string[] = [];
+    fakeExec((cmd, args) => {
+      order.push(cmd);
+      return cmd === "ssh-keygen" ? keygenHit(args[1]) : { stdout: "  \n" };
+    });
+
+    expect(fixKnownHosts("pinned.example.com").status).toBe("error");
+    expect(order).toEqual(["ssh-keyscan"]);
   });
 
   // IPv6 targeting. Probed against OpenSSH_10.2p1 with a seeded known_hosts:
@@ -283,7 +324,8 @@ describe("fixKnownHosts reports the removal that actually happened", () => {
           targets.push(args[1]);
           return keygenHit(args[1]);
         }
-        return { fail: true, stderr: "getaddrinfo: Name or service not known" };
+        // The scan must succeed, or fixKnownHosts removes nothing at all.
+        return { stdout: `${args.at(-1)} ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI` };
       });
       return targets;
     }
@@ -300,10 +342,9 @@ describe("fixKnownHosts reports the removal that actually happened", () => {
       const targets = recordRemovalTargets();
       fixKnownHosts("[::1]", 2222);
 
-      expect(targets).toContain("[::1]:2222");
-      expect(targets).toContain("::1");
-      // The regression: `[${host}]:${port}` on an already-bracketed host.
-      expect(targets).not.toContain("[[::1]]:2222");
+      // The regression: `[${host}]:${port}` on an already-bracketed host. And only the
+      // :2222 entry -- the bare `::1` entry is port 22's.
+      expect(targets).toEqual(["[::1]:2222"]);
     });
 
     it("hands ssh-keyscan the bare address so its output matches the -R targets", () => {
@@ -323,8 +364,7 @@ describe("fixKnownHosts reports the removal that actually happened", () => {
       const targets = recordRemovalTargets();
       fixKnownHosts("db.example.com", 2222);
 
-      expect(targets).toContain("db.example.com");
-      expect(targets).toContain("[db.example.com]:2222");
+      expect(targets).toEqual(["[db.example.com]:2222"]);
     });
   });
 
@@ -358,6 +398,15 @@ describe("classifySshProbe", () => {
     expect(classifySshProbe(false, "Host key verification failed.")).toBe("host-key-mismatch");
     expect(classifySshProbe(false, "ssh: Could not resolve hostname h: Name or service not known")).toBe("dns-failure");
     expect(classifySshProbe(false, "something nobody has seen before")).toBe("unknown");
+  });
+
+  it("ranks a host-key failure ABOVE Permission denied, since a tolerated mismatch prints both", () => {
+    expect(classifySshProbe(false, "Host key verification failed.\nPermission denied (publickey).")).toBe(
+      "host-key-mismatch",
+    );
+    expect(
+      classifySshProbe(false, "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\nPermission denied (publickey)."),
+    ).toBe("host-key-mismatch");
   });
 
   it("does not report ok when SSH_OK is absent even on a zero exit", () => {
@@ -526,6 +575,17 @@ describe("checkSshAgent does not report an unreachable agent as healthy", () => 
   // otherwise fell through to `return { status: "ok" }` -- so any other ssh-add
   // failure was reported as a running agent, with the error text pasted in where
   // the key list belongs.
+  //
+  // Pinned to a Unix platform: on win32 a dead SSH_AUTH_SOCK falls through to the
+  // named pipe (covered in env-diagnose-coverage.test.ts).
+  const realPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  beforeEach(() => {
+    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+  });
+  afterEach(() => {
+    if (realPlatform) Object.defineProperty(process, "platform", realPlatform);
+  });
+
   it("reports an unrecognised ssh-add failure as an error, not ok", () => {
     vi.stubEnv("SSH_AUTH_SOCK", "/tmp/ssh-agent.sock");
     fakeExec(() => ({ fail: true, stderr: "error fetching identities: communication with agent failed" }));
@@ -759,8 +819,7 @@ describe("checkSshConfig host-pattern matching", () => {
 // to the wrong one is worse than saying nothing.
 //
 // Harness: the module-level `node:child_process` mock above means the REAL
-// `runArgs` (diagnose.ts) and the REAL `runArgsWithEnv` (env.ts) run -- only the
-// subprocess is fake. `ensureAgent` lives in the same module as `loadKey`, so it
+// `runArgs` (diagnose.ts) runs -- only the subprocess is fake. `ensureAgent` lives in the same module as `loadKey`, so it
 // cannot be mocked out; it is driven through that same fake subprocess instead.
 // `agentUp`/`agentDown` below decide what `ssh-add -l` answers, which is exactly
 // what `probeAgent` (and therefore `ensureAgent`) classifies on.
@@ -895,17 +954,16 @@ describe("loadKey classifies ssh-add failures into the right operator fix", () =
       expect(result.message).not.toContain("~/.ssh");
     });
 
-    it("treats a leading ~ as the CURRENT user's home even in the ~user form", () => {
-      // Documented limitation, shared with ssh.ts's local-path expansion: only a
-      // bare leading "~" is understood, so "~root/.ssh/id_rsa" resolves under the
-      // CURRENT user's home rather than root's. Pinned rather than asserted as
-      // desirable -- it decides which path the "Key not found" line names, and
-      // that path is the only thing the operator has to go on. See bugsFound.
+    it("leaves the ~user form untouched instead of grafting it onto the CURRENT user's home", () => {
+      // loadKey shares expandTilde (ssh.ts), which expands only "~" and "~/". The old
+      // inline expansion turned "~root/.ssh/id_rsa" into <home>/root/.ssh/id_rsa -- a
+      // path the operator never named -- so the "Key not found" line pointed at the
+      // wrong file. Now the path is reported exactly as given.
       agentUp({ stdout: "Identity added" });
 
       const result = loadKey("~root/.ssh/id_rsa");
 
-      expect(result.message).toBe(`Key not found: ${join(homedir(), "root", ".ssh", "id_rsa")}`);
+      expect(result.message).toBe("Key not found: ~root/.ssh/id_rsa");
     });
   });
 
