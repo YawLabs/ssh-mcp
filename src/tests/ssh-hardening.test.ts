@@ -14,6 +14,15 @@ const stubs = vi.hoisted(() => ({
   // checkSshAgent / checkSshKeys it is NOT memoized inside ssh.ts, so flipping it
   // takes effect immediately instead of waiting out a 2s TTL.
   knownHostsCheck: { status: "ok" as "ok" | "warning" | "error", message: "ok" },
+  /** Every (host, port) checkKnownHosts was asked about, in order. */
+  knownHostsCheckCalls: [] as Array<[string, number | undefined]>,
+  /**
+   * When set, decides checkKnownHosts' answer from the target it was asked about --
+   * so a lookup under the wrong spelling (alias, or port 22) gets the wrong answer.
+   */
+  knownHostsCheckFor: null as
+    | null
+    | ((host: string, port: number | undefined) => { status: "ok" | "warning" | "error"; message: string }),
   // --- fake ssh2 Client (see the vi.mock below) ---
   /** Every ConnectConfig handed to Client.connect(), in order. THE dial counter. */
   dials: [] as Array<Record<string, any>>,
@@ -71,7 +80,10 @@ vi.mock("../diagnose.js", async () => {
     checkSshAgent: () => ({ status: "ok", message: "ok" }),
     checkSshKeys: () => ({ status: "ok", message: "ok" }),
     checkSshConfig: () => ({ status: "ok", message: "ok" }),
-    checkKnownHosts: () => ({ ...stubs.knownHostsCheck }),
+    checkKnownHosts: (host: string, port?: number) => {
+      stubs.knownHostsCheckCalls.push([host, port]);
+      return stubs.knownHostsCheckFor ? stubs.knownHostsCheckFor(host, port) : { ...stubs.knownHostsCheck };
+    },
   };
 });
 
@@ -183,6 +195,8 @@ beforeEach(() => {
   stubs.runArgsCalls.length = 0;
   stubs.runArgs.fn = () => ({ stdout: "", ok: false });
   stubs.knownHostsCheck = { status: "ok", message: "ok" };
+  stubs.knownHostsCheckCalls.length = 0;
+  stubs.knownHostsCheckFor = null;
   stubs.dials.length = 0;
   stubs.dialScript.clear();
   clearSshConfigCache();
@@ -910,6 +924,32 @@ describe("remediation commands use the RESOLVED hostname and port", () => {
     const enhanced = enhanceSshError(new Error("boom"), ALIAS, resolved) as Error;
     expect(enhanced.message).toContain(`Add host key: ssh-keyscan -H -p 2222 "${ADDR}"`);
   });
+
+  it("formatDiagnostics' Known Hosts check looks up the resolved address AND port, not the alias", () => {
+    // known_hosts holds only `[10.0.0.5]:2222`. A lookup under the alias, or under the
+    // address on port 22, misses it and raises a false "no entry" + keyscan advice.
+    stubs.knownHostsCheckFor = (host, port) =>
+      host === ADDR && port === 2222 ? { status: "ok", message: "found" } : { status: "warning", message: "no entry" };
+    const { resolved } = aliasOnPort("2222", {});
+    const enhanced = enhanceSshError(new Error("boom"), ALIAS, resolved) as Error;
+    expect(stubs.knownHostsCheckCalls).toEqual([[ADDR, 2222]]);
+    expect(enhanced.message).not.toContain("Known Hosts");
+    expect(enhanced.message).not.toContain("ssh-keyscan");
+  });
+
+  it("ssh-keygen -R names BOTH spellings when the alias and the HostName each hold a stale entry", () => {
+    // verifierHosts carries the alias and the resolved HostName; a same-type entry
+    // under each means two stale lines, and removing only one leaves the host refused.
+    const { resolved, verify } = aliasOnPort("22", {
+      [ALIAS]: [{ type: "ssh-ed25519", blob: keyBlob("ssh-ed25519", "old-a") }],
+      [ADDR]: [{ type: "ssh-ed25519", blob: keyBlob("ssh-ed25519", "old-b") }],
+    });
+    expect(verify(keyBlob("ssh-ed25519", "imposter"))).toBe(false);
+    expect(resolved.hostKeyRejection?.current?.reason).toBe("key-mismatch");
+    expect(resolved.hostKeyRejection?.current?.message).toContain(
+      `removing the old entry with: ssh-keygen -R "${ALIAS}" and ssh-keygen -R "${ADDR}"`,
+    );
+  });
 });
 
 describe("`ssh -G` probing", () => {
@@ -1542,6 +1582,32 @@ describe("a ProxyJump cycle fails clearly instead of recursing forever", () => {
     });
     await connect({ host: "chain-target.test" });
     expect(stubs.dials.map((d) => d.host)).toEqual(["chain-jump.test", "chain-target.test"]);
+  });
+
+  it("allows one machine on two ports: a container sshd on :2222 reached via the box's own :22", async () => {
+    // The loop key is the RESOLVED host:port. Keyed on host alone this legitimate
+    // jump would be refused as a loop.
+    stubSshEnvironment({
+      sshConfig: {
+        box: { hostname: "box.test", port: "2222", proxyjump: "box-22" },
+        "box-22": { hostname: "box.test", port: "22" },
+      },
+    });
+    await connect({ host: "box" });
+    expect(stubs.dials.map((d) => `${d.host}:${d.port}`)).toEqual(["box.test:22", "box.test:2222"]);
+  });
+
+  it("catches a loop between two DIFFERENT aliases that resolve to one HostName:port", async () => {
+    // Keyed on the alias, `alpha` and `beta` look distinct and the pair recursed again.
+    stubSshEnvironment({
+      sshConfig: {
+        alpha: { hostname: "shared.test", port: "22", proxyjump: "beta" },
+        beta: { hostname: "shared.test", port: "22", proxyjump: "alpha" },
+      },
+    });
+    const err = await connect({ host: "alpha" }).catch((e: unknown) => e);
+    expect((err as Error).message).toContain("ProxyJump loop via beta");
+    expect(stubs.dials).toEqual([]);
   });
 });
 

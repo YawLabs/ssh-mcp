@@ -114,6 +114,8 @@ export interface RunArgsOptions {
    * the option entirely and the child inherits process.env unchanged.
    */
   env?: Record<string, string | undefined>;
+  /** Kill timeout for the child. Defaults to RUN_ARGS_TIMEOUT_MS; tests shorten it. */
+  timeoutMs?: number;
 }
 
 export function runArgs(cmd: string, args: string[], options: RunArgsOptions = {}): { stdout: string; ok: boolean } {
@@ -128,13 +130,14 @@ export function runArgs(cmd: string, args: string[], options: RunArgsOptions = {
       else env[k] = v;
     }
   }
+  const timeoutMs = options.timeoutMs ?? RUN_ARGS_TIMEOUT_MS;
   try {
     // windowsHide: oam 0.19.1 stopped giving every child CREATE_NO_WINDOW, and Node
     // never did, so without it each ssh / ssh-add / ssh-keygen probe can flash a console.
     const stdout = execFileSync(cmd, args, {
       env,
       encoding: "utf8",
-      timeout: RUN_ARGS_TIMEOUT_MS,
+      timeout: timeoutMs,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -150,7 +153,7 @@ export function runArgs(cmd: string, args: string[], options: RunArgsOptions = {
     // ssh's ConnectTimeout=5 is per address, so a host with two dead addresses or slow
     // DNS reaches this. Say "timed out" in words so it classifies as a timeout.
     if (err.code === "ETIMEDOUT") {
-      const note = `${cmd} timed out after ${RUN_ARGS_TIMEOUT_MS / 1000}s and was killed`;
+      const note = `${cmd} timed out after ${timeoutMs / 1000}s and was killed`;
       return { stdout: [stdout, stderr, note].filter(Boolean).join("\n"), ok: false };
     }
     const output = [stdout, stderr].filter(Boolean).join("\n") || err.message || "";
@@ -512,7 +515,42 @@ export function isStrictHostKeyMode(env: NodeJS.ProcessEnv = process.env): boole
 // accepted key was discarded, the listed files unchanged). `~` is expanded by ssh
 // itself, which sidesteps a home directory containing spaces (the list is
 // whitespace-separated). These two files are OpenSSH's own default list.
-export const PROBE_USER_KNOWN_HOSTS = "/dev/null ~/.ssh/known_hosts ~/.ssh/known_hosts2";
+export const PROBE_PIN_FILES: readonly string[] = ["~/.ssh/known_hosts", "~/.ssh/known_hosts2"];
+export const PROBE_USER_KNOWN_HOSTS = ["/dev/null", ...PROBE_PIN_FILES].join(" ");
+
+/**
+ * The probe's ssh argv. `pinFiles` replaces the operator's known_hosts files ONLY so a
+ * test can run the real client against scratch files; production always passes the
+ * default. Everything else -- the null-device-first list, the strict switch -- is the
+ * same code path either way.
+ */
+export function probeSshArgs(
+  host: string,
+  port: number,
+  pinFiles: readonly string[] = PROBE_PIN_FILES,
+  strict: boolean = isStrictHostKeyMode(),
+): string[] {
+  return [
+    "-o",
+    "ConnectTimeout=5",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    `StrictHostKeyChecking=${strict ? "yes" : "accept-new"}`,
+    "-o",
+    `UserKnownHostsFile=${["/dev/null", ...pinFiles].join(" ")}`,
+    "-o",
+    "GlobalKnownHostsFile=/dev/null",
+    "-o",
+    "UpdateHostKeys=no",
+    "-p",
+    String(port),
+    "--",
+    host,
+    "echo",
+    "SSH_OK",
+  ];
+}
 
 // Runs the shared SSH reachability probe. Callers own their own wording.
 //
@@ -544,26 +582,7 @@ export const PROBE_USER_KNOWN_HOSTS = "/dev/null ~/.ssh/known_hosts ~/.ssh/known
 // connections, hostVerifier in resolveConfig (src/ssh.ts) applies known_hosts.
 export function probeSshConnection(host: string, port: number): SshProbeResult {
   const start = Date.now();
-  const { ok, stdout } = runArgs("ssh", [
-    "-o",
-    "ConnectTimeout=5",
-    "-o",
-    "BatchMode=yes",
-    "-o",
-    `StrictHostKeyChecking=${isStrictHostKeyMode() ? "yes" : "accept-new"}`,
-    "-o",
-    `UserKnownHostsFile=${PROBE_USER_KNOWN_HOSTS}`,
-    "-o",
-    "GlobalKnownHostsFile=/dev/null",
-    "-o",
-    "UpdateHostKeys=no",
-    "-p",
-    String(port),
-    "--",
-    host,
-    "echo",
-    "SSH_OK",
-  ]);
+  const { ok, stdout } = runArgs("ssh", probeSshArgs(host, port));
   return { outcome: classifySshProbe(ok, stdout), output: stdout, elapsedMs: Date.now() - start };
 }
 

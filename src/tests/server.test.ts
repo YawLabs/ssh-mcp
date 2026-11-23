@@ -118,6 +118,24 @@ describe("tool annotations", () => {
       await client.close();
     }
   });
+
+  // Deliberately unmarked (see the comment above READ_ONLY_LOCAL in tools.ts): clients
+  // use destructiveHint:false / openWorldHint:false to soften or skip confirmation, and
+  // any specific hint would understate an exec tool that can run `rm -rf`. Pin the
+  // absence of the whole annotations object, not just readOnlyHint.
+  it("leaves the exec tools and the local-state-changing tools unannotated", async () => {
+    const client = await connected();
+    try {
+      const { tools } = await client.listTools();
+      for (const name of ["ssh_exec", "ssh_multi_exec", "ssh_agent_ensure", "ssh_key_load", "ssh_known_hosts_fix"]) {
+        const tool = tools.find((t) => t.name === name);
+        expect(tool, `${name} is registered`).toBeDefined();
+        expect(tool?.annotations, name).toBeUndefined();
+      }
+    } finally {
+      await client.close();
+    }
+  });
 });
 
 describe("server re-exports", () => {

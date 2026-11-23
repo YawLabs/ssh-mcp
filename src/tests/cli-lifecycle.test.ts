@@ -96,8 +96,11 @@ const STUB_POOL = [
 // enough for the EOF drain: it chains any onmessage already on the transport
 // (Protocol.connect calls the prior handler first), answers a `slow` request
 // SLOW_MS later through transport.send, drops the answer to a request the
-// client cancelled, and -- like Protocol._onclose aborting in-flight handlers
-// -- drops every answer once close() has run.
+// client cancelled -- ignoring a cancel with a falsy requestId exactly as
+// Protocol._oncancel does, so a cancel of id 0 aborts nothing -- and, like
+// Protocol._onclose aborting in-flight handlers, drops every answer once
+// close() has run. A `hang` request is recorded and never answered: the shape
+// of an ssh_exec stuck on a hung remote.
 const STUB_SERVER_MODULE = [
   'import { appendFileSync } from "node:fs";',
   "export const version = process.env.STUB_VERSION;",
@@ -111,7 +114,11 @@ const STUB_SERVER_MODULE = [
   "      transport.onmessage = (message, extra) => {",
   "        prior?.(message, extra);",
   '        if (message.method === "notifications/cancelled") {',
-  "          cancelled.add(message.params.requestId);",
+  "          if (message.params.requestId) cancelled.add(message.params.requestId);",
+  "          return;",
+  "        }",
+  '        if (message.method === "hang" && message.id !== undefined) {',
+  "          appendFileSync(process.env.MARK, 'request ' + message.id + '\\n');",
   "          return;",
   "        }",
   '        if (message.method !== "slow" || message.id === undefined) return;',
@@ -139,7 +146,15 @@ interface ServerLayout {
   mark: string;
 }
 
-function makeServerLayout(): ServerLayout {
+/** The EOF drain grace as src/index.ts spells it (5 minutes). */
+const EOF_GRACE_SRC = "const EOF_DRAIN_GRACE_MS = 5 * 60_000;";
+
+/**
+ * @param graceMs replace EOF_DRAIN_GRACE_MS in the copy, so a test can let the
+ *   grace timer fire without waiting the real five minutes. Test-only: the
+ *   shipped source keeps its constant, and only this throwaway copy changes.
+ */
+function makeServerLayout(opts: { graceMs?: number } = {}): ServerLayout {
   const dir = mkLayout("ssh-mcp-index-");
   let src = readFileSync(INDEX_SRC, "utf8");
 
@@ -151,6 +166,9 @@ function makeServerLayout(): ServerLayout {
     ['"./pool.js"', '"./pool.mjs"'],
     ['"./server.js"', '"./server.mjs"'],
   ];
+  if (opts.graceMs !== undefined) {
+    rewrites.push([EOF_GRACE_SRC, `const EOF_DRAIN_GRACE_MS = ${opts.graceMs};`]);
+  }
   for (const [from, to] of rewrites) {
     expect(src, `import ${from} not found in src/index.ts -- did it move?`).toContain(from);
     src = src.replace(from, to);
@@ -265,7 +283,7 @@ describe("server: stdin EOF runs shutdown(), then the exit backstop", () => {
   });
 
   /** Spawn the server, write `lines` to stdin and close it at once (`printf ... | ssh-mcp`). */
-  async function pipeAndClose(layout: ServerLayout, lines: object[]) {
+  async function pipeAndClose(layout: ServerLayout, lines: object[], killAfterMs = 20_000) {
     const child = spawn(process.execPath, [layout.entry], {
       env: serverEnv(layout),
       stdio: ["pipe", "pipe", "pipe"],
@@ -278,7 +296,7 @@ describe("server: stdin EOF runs shutdown(), then the exit backstop", () => {
     const started = Date.now();
     // A regression would hold the child for the whole drain grace (5 min) and
     // outlive the test; kill it well before that so a red run leaks nothing.
-    const killer = setTimeout(() => child.kill(), 20_000);
+    const killer = setTimeout(() => child.kill(), killAfterMs);
     const code = await new Promise<number | null>((res) => {
       child.on("close", (c) => res(c));
       child.stdin.end(lines.map((l) => `${JSON.stringify(l)}\n`).join(""));
@@ -328,6 +346,96 @@ describe("server: stdin EOF runs shutdown(), then the exit backstop", () => {
     expect(r.stdout).toBe("");
     expect(steps(layout)).toEqual(["connect", "ready", "request 7", ...EOF_STEPS.slice(2)]);
     expect(r.elapsed).toBeLessThan(10_000);
+  });
+
+  it("still answers request id 0 when the client sends a cancel with requestId 0", async () => {
+    // JSON-RPC clients commonly number from 0. Protocol._oncancel ignores a
+    // falsy requestId, so the SDK still answers id 0; the drain must keep
+    // waiting for it too, or shutdown() closes the server and drops the answer.
+    const layout = makeServerLayout();
+    const r = await pipeAndClose(layout, [
+      { jsonrpc: "2.0", id: 0, method: "slow" },
+      { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 0 } },
+    ]);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe(`${JSON.stringify({ jsonrpc: "2.0", id: 0, result: { ok: 0 } })}\n`);
+    expect(steps(layout)).toEqual(["connect", "ready", "request 0", "respond 0", ...EOF_STEPS.slice(2)]);
+  });
+
+  it("does not wait on client notifications or client-sent responses after EOF", async () => {
+    // Only requests get answers. `notifications/initialized` (every handshake
+    // sends it) and a client's answer to a server request (an id, no method)
+    // must not be tracked, or a plain handshake followed by EOF would hold the
+    // process for the whole drain grace.
+    const layout = makeServerLayout();
+    // A regression waits out the 5-minute grace, so pipeAndClose's 20s killer
+    // ends it (code null); the bound matches the other EOF tests' headroom.
+    const r = await pipeAndClose(layout, [
+      { jsonrpc: "2.0", method: "notifications/initialized" },
+      { jsonrpc: "2.0", id: 99, result: {} },
+    ]);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe("");
+    expect(steps(layout)).toEqual(EOF_STEPS);
+    expect(r.elapsed).toBeLessThan(10_000);
+  });
+
+  it("gives up on an unanswered request once the drain grace runs out", async () => {
+    // A hung ssh_exec after the host closes the pipe: the grace timer must
+    // clear the in-flight set and run shutdown(), or the process (and its
+    // pooled sockets and self-started agent) lives forever. The copy's grace
+    // is cut from 5 minutes to 300ms; the next line pins the real constant.
+    // The 10s killer leaves startup headroom on a loaded box while still ending
+    // a regression (which never exits on its own) well inside testTimeout.
+    expect(readFileSync(INDEX_SRC, "utf8")).toContain(EOF_GRACE_SRC);
+    const layout = makeServerLayout({ graceMs: 300 });
+    const r = await pipeAndClose(layout, [{ jsonrpc: "2.0", id: 5, method: "hang" }], 10_000);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe("");
+    expect(steps(layout)).toEqual(["connect", "ready", "request 5", ...EOF_STEPS.slice(2)]);
+    // Waited for the grace rather than shutting down at EOF.
+    expect(r.elapsed).toBeGreaterThanOrEqual(300);
+  });
+
+  it("stays up after answering a request while stdin is still open", async () => {
+    // A normal long-lived MCP session: the host keeps stdin open between
+    // calls. Answering the first request must not trigger the EOF shutdown.
+    const layout = makeServerLayout();
+    const child = spawn(process.execPath, [layout.entry], {
+      env: serverEnv(layout),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const killer = setTimeout(() => child.kill(), 15_000);
+    let done = false;
+    const exited = new Promise<number | null>((res) => {
+      child.on("close", (code) => {
+        done = true;
+        res(code);
+      });
+    });
+    let stdout = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    try {
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 3, method: "slow" })}\n`);
+      const deadline = Date.now() + 10_000;
+      while (!stdout.includes("\n") && !done && Date.now() < deadline) {
+        await new Promise((res) => setTimeout(res, 25));
+      }
+      expect(JSON.parse(stdout)).toEqual({ jsonrpc: "2.0", id: 3, result: { ok: 3 } });
+      await new Promise((res) => setTimeout(res, 250));
+      expect(done, "server exited after answering with stdin still open").toBe(false);
+      expect(steps(layout)).toEqual(["connect", "ready", "request 3", "respond 3"]);
+
+      child.stdin.end();
+      expect(await exited).toBe(0);
+      expect(steps(layout)).toEqual(["connect", "ready", "request 3", "respond 3", ...EOF_STEPS.slice(2)]);
+    } finally {
+      clearTimeout(killer);
+      if (!done) child.kill();
+    }
   });
 
   it("relies on SDK behaviour the real McpServer still has", async () => {

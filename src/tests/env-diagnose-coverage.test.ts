@@ -373,6 +373,20 @@ describe("checkGitSsh classifies each provider's real transcript", () => {
       );
     });
 
+    it("maps BatchMode's unknown-host transcript (host-key-unknown) to the same fix tool", () => {
+      // What a fresh machine actually prints: BatchMode turns the default `ask` into
+      // strict checking, so ssh names the missing key before the generic last line.
+      // classifySshProbe reads this as host-key-unknown, a separate case label.
+      sshSays(
+        "No ED25519 host key is known for github.com and you have requested strict checking.\nHost key verification failed.",
+      );
+      const r = checkGitSsh("github.com");
+      expect(r.status).toBe("error");
+      expect(r.message).toBe(
+        "Host key verification failed for github.com: it is either not in known_hosts (BatchMode cannot prompt to add it) or its key changed. Fix with ssh_known_hosts_fix.",
+      );
+    });
+
     it("classifies a changed-key banner as a host-key failure even when auth then fails", () => {
       sshSays("WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\ngit@github.com: Permission denied (publickey).");
       expect(checkGitSsh("github.com").message).toContain("Host key verification failed for github.com");
@@ -1131,6 +1145,28 @@ describe("ensureAgent spawns an agent on Unix and killStartedAgent reaps it", ()
     expect(calls.map((c) => c.cmd)).toEqual(["ssh-add", "ssh-agent"]);
   });
 
+  it("loadKey reaches the agent it just spawned through the exported SSH_AUTH_SOCK", () => {
+    // The spawned channel carries no env, so ssh-add must inherit the SSH_AUTH_SOCK
+    // startAgent wrote into process.env -- an env built any other way misses it.
+    sshDir = { kind: "files", files: { id_ed25519: OPENSSH_PRIV } };
+    const seen: (string | undefined)[] = [];
+    execHandler = (cmd, args, env) => {
+      if (cmd === "ssh-agent" && args[0] === "-s") return { stdout: AGENT_OUT };
+      const sock = env ? env.SSH_AUTH_SOCK : process.env.SSH_AUTH_SOCK;
+      seen.push(sock);
+      return cmd === "ssh-add" && sock === SOCK
+        ? { stdout: "Identity added" }
+        : { fail: true, stderr: "Could not open a connection to your authentication agent." };
+    };
+
+    const r = loadKey("~/.ssh/id_ed25519");
+
+    expect(r).toEqual({ status: "ok", message: `Key loaded: ${join(homedir(), ".ssh", "id_ed25519")}` });
+    expect(calls.map((c) => c.cmd)).toEqual(["ssh-agent", "ssh-add"]);
+    expect(calls[1].env).toBeUndefined(); // inherited, not an override
+    expect(seen).toEqual([SOCK]);
+  });
+
   it("kills exactly the pid it recorded, once", () => {
     agentSpawns({ stdout: AGENT_OUT });
     ensureAgent();
@@ -1736,6 +1772,44 @@ describe("G1 -- diagnose() assembles suggestions and the overall ladder", () => 
     expect(report.suggestions).toContain(
       "Start the Windows OpenSSH agent: Get-Service ssh-agent | Set-Service -StartupType Automatic; Start-Service ssh-agent",
     );
+  });
+
+  it("suggests loading a key when the agent answers with no identities", () => {
+    scriptMachine({ agent: { fail: true, stderr: "The agent has no identities." } });
+    setPlatform("linux");
+    setEnv("SSH_AUTH_SOCK", "/tmp/agent.sock");
+
+    const report = diagnose("web1.test");
+
+    expect(report.checks.find((c) => c.name === "SSH Agent")).toMatchObject({ status: "warning" });
+    expect(report.suggestions).toContain("Load your key: ssh-add ~/.ssh/id_ed25519");
+    expect(report.suggestions.join("\n")).not.toContain("Start ssh-agent");
+  });
+
+  it("does NOT suggest loading a key for a stale SSH_AUTH_SOCK beside a live Windows agent", () => {
+    scriptMachine({});
+    setPlatform("win32");
+    setEnv("SSH_AUTH_SOCK", "/tmp/stale.sock");
+    const machine = execHandler;
+    // ssh-add fails while the child sees the stale socket, and lists a key through
+    // the named pipe (SSH_AUTH_SOCK removed from the child env).
+    execHandler = (cmd, args, env) => {
+      if (cmd === "ssh-add") {
+        const sock = env ? env.SSH_AUTH_SOCK : process.env.SSH_AUTH_SOCK;
+        return sock
+          ? { fail: true, stderr: "Error connecting to agent: No such file or directory" }
+          : { stdout: "256 SHA256:abc user@host (ED25519)" };
+      }
+      return machine ? machine(cmd, args, env) : { fail: true, stderr: "unscripted" };
+    };
+
+    const report = diagnose("web1.test");
+
+    const agentCheck = report.checks.find((c) => c.name === "SSH Agent");
+    expect(agentCheck?.status).toBe("warning");
+    expect(agentCheck?.message).toContain("Unset SSH_AUTH_SOCK");
+    expect(report.suggestions.join("\n")).not.toContain("Load your key");
+    expect(report.suggestions.join("\n")).not.toContain("Start the Windows OpenSSH agent");
   });
 
   it("builds port-aware known_hosts suggestions on a non-default port", () => {

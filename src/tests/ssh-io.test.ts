@@ -198,6 +198,8 @@ interface SftpProbe {
   stat: string[];
   lstat: string[];
   readFile: string[];
+  /** sftp.close(handle) calls: the remote file handle released. */
+  closed: number;
   ended: number;
 }
 
@@ -239,12 +241,15 @@ function fakeSftpClient(opts: {
   lstat?: (path: string) => unknown;
   readFile?: (path: string) => Buffer | Error;
   chunk?: number;
+  /** The Nth read() call (1-based) calls back with this error instead of data. */
+  readError?: { call: number; err: Error };
 }): {
   client: any;
   probe: SftpProbe;
 } {
-  const probe: SftpProbe = { stat: [], lstat: [], readFile: [], ended: 0 };
+  const probe: SftpProbe = { stat: [], lstat: [], readFile: [], closed: 0, ended: 0 };
   const open = new Map<string, Buffer>();
+  let readCalls = 0;
   const settle = (result: unknown, cb: (err: any, value?: any) => void) => {
     queueMicrotask(() => (result instanceof Error ? cb(result) : cb(undefined, result)));
   };
@@ -270,13 +275,21 @@ function fakeSftpClient(opts: {
       settle(content instanceof Error ? content : Buffer.from(path), cb);
     },
     read: (h: Buffer, buf: Buffer, off: number, len: number, pos: number, cb: (e: any, n?: number) => void) => {
+      readCalls++;
+      if (opts.readError && readCalls === opts.readError.call) {
+        const { err } = opts.readError;
+        return void queueMicrotask(() => cb(err));
+      }
       const content = open.get(h.toString()) as Buffer;
       const n = Math.max(0, Math.min(len, opts.chunk ?? Number.POSITIVE_INFINITY, content.length - pos));
       content.copy(buf, off, pos, pos + n);
       // ssh2 reports an SFTP EOF status with NO byte count.
       queueMicrotask(() => cb(undefined, n === 0 ? undefined : n));
     },
-    close: (_h: Buffer, cb: () => void) => queueMicrotask(cb),
+    close: (_h: Buffer, cb: () => void) => {
+      probe.closed++;
+      queueMicrotask(cb);
+    },
     end: () => {
       probe.ended++;
     },
@@ -325,6 +338,19 @@ describe("readFile size guard", () => {
       readFile: () => new Error("No such file"),
     });
     await expect(readFile(client, "/gone.txt")).rejects.toThrow(/No such file/);
+    expect(probe.ended).toBe(1);
+  });
+
+  it("a mid-loop READ error rejects, closes the remote handle and ends the session", async () => {
+    // Second READ of a multi-chunk file fails (EIO, or the channel dropped).
+    const { client, probe } = fakeSftpClient({
+      stat: () => ({ size: 10 }),
+      readFile: () => Buffer.from("0123456789"),
+      chunk: 4,
+      readError: { call: 2, err: new Error("EIO") },
+    });
+    await expect(readFile(client, "/var/log/big.log")).rejects.toThrow("EIO");
+    expect(probe.closed).toBe(1);
     expect(probe.ended).toBe(1);
   });
 
@@ -386,7 +412,12 @@ describe("readFile size guard", () => {
 
 describe("readFileRange -- the paged half of ssh_read_file", () => {
   /** An sftp holding `content`, whose read() hands back at most `chunk` bytes per call. */
-  function rangeClient(content: Buffer, chunk = Number.POSITIVE_INFINITY, reportedSize = content.length) {
+  function rangeClient(
+    content: Buffer,
+    chunk = Number.POSITIVE_INFINITY,
+    reportedSize = content.length,
+    readError?: { call: number; err: Error },
+  ) {
     const probe = { reads: [] as Array<[number, number]>, opened: 0, closed: 0, ended: 0 };
     const handle = Buffer.from("h");
     const sftp = {
@@ -397,8 +428,13 @@ describe("readFileRange -- the paged half of ssh_read_file", () => {
       },
       read: (_h: Buffer, buf: Buffer, off: number, len: number, pos: number, cb: (e: any, n?: number) => void) => {
         probe.reads.push([pos, len]);
+        if (readError && probe.reads.length === readError.call) return void queueMicrotask(() => cb(readError.err));
+        // A loop that ignores EOF re-reads forever on microtasks alone, which starves
+        // vitest's own timeout; fail loudly instead of hanging the run.
+        if (probe.reads.length > 1000)
+          return void queueMicrotask(() => cb(new Error("read loop never stopped at EOF")));
         const n = Math.max(0, Math.min(len, chunk, content.length - pos));
-        content.copy(buf, off, pos, pos + n);
+        if (n > 0) content.copy(buf, off, pos, pos + n);
         // ssh2 reports an SFTP EOF status with NO byte count.
         queueMicrotask(() => cb(undefined, n === 0 ? undefined : n));
       },
@@ -455,6 +491,49 @@ describe("readFileRange -- the paged half of ssh_read_file", () => {
     expect(page).toStrictEqual({ text: "MemTotal", offset: 0, bytesRead: 8 });
     expect("size" in page).toBe(false);
     expect(probe.opened).toBe(1);
+  });
+
+  it("stops at EOF when a size-0 file is shorter than the page, with no trailing NULs", async () => {
+    // /proc/meminfo paged with a length past its real end: the size is unknown, so
+    // `want` is the full 64 and only the EOF read (no byte count) ends the loop.
+    const content = "MemTotal: 1 kB\n"; // 15 bytes
+    const { client, probe } = rangeClient(Buffer.from(content), Number.POSITIVE_INFINITY, 0);
+    const page = await readFileRange(client, "/proc/meminfo", 0, 64);
+    expect(page).toStrictEqual({ text: content, offset: 0, bytesRead: 15 });
+    expect(probe.reads).toEqual([
+      [0, 64],
+      [15, 49],
+    ]);
+    expect(probe.closed).toBe(1);
+    expect(probe.ended).toBe(1);
+  });
+
+  it("reads nothing from a size-0 file paged past its end, and still closes the handle once", async () => {
+    const { client, probe } = rangeClient(Buffer.from("MemTotal: 1 kB\n"), Number.POSITIVE_INFINITY, 0);
+    const page = await readFileRange(client, "/proc/meminfo", 100, 64);
+    expect(page).toStrictEqual({ text: "", offset: 100, bytesRead: 0 });
+    expect(probe.opened).toBe(1); // size unknown, so the file IS opened...
+    expect(probe.reads).toHaveLength(1); // ...and one EOF read ends it
+    expect(probe.closed).toBe(1);
+    expect(probe.ended).toBe(1);
+  });
+
+  it("a file that shrank after stat returns only the bytes still there", async () => {
+    // stat said 10 bytes; by the read only 6 remain.
+    const { client, probe } = rangeClient(Buffer.from("abcdef"), Number.POSITIVE_INFINITY, 10);
+    const page = await readFileRange(client, "/var/log/rotated.log", 2, 8);
+    expect(page).toStrictEqual({ text: "cdef", offset: 2, bytesRead: 4, size: 10 });
+    expect(probe.closed).toBe(1);
+  });
+
+  it("a mid-loop READ error rejects, closes the handle and ends the session", async () => {
+    // A mid-transfer EIO or a dropped channel on a large log: the remote handle and the
+    // SFTP channel must not leak on the pooled connection.
+    const { client, probe } = rangeClient(Buffer.from("abcdefghij"), 3, 10, { call: 2, err: new Error("EIO") });
+    await expect(readFileRange(client, "/var/log/big.log", 0, 10)).rejects.toThrow("EIO");
+    expect(probe.reads).toHaveLength(2);
+    expect(probe.closed).toBe(1);
+    expect(probe.ended).toBe(1);
   });
 
   it("rejects a length above the per-read cap before touching the remote", async () => {
@@ -1215,6 +1294,48 @@ describe("whole-file transfers time out on INACTIVITY, not on total duration", (
         expect.objectContaining({ message: expect.stringMatching(/timed out after 1000ms with no transfer progress/) }),
       );
       expect(probe.ended).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    ["a late failure", new Error("No response from server")],
+    ["a late success", undefined],
+  ])("ignores a progress step and %s that arrive after the idle timeout", async (_n, lateErr) => {
+    // Ending the session on timeout makes ssh2 fail the in-flight fastPut LATE, and a
+    // step already queued can still fire. Neither may re-arm the idle timer or settle
+    // the call a second time.
+    vi.useFakeTimers();
+    try {
+      let step: (() => void) | undefined;
+      let done: ((e?: Error) => void) | undefined;
+      const probe = { ended: 0 };
+      const sftp = {
+        fastPut: (_l: string, _r: string, opts: { step?: () => void }, cb: (e?: Error) => void) => {
+          step = opts.step;
+          done = cb;
+        },
+        end: () => {
+          probe.ended++;
+        },
+      };
+      const client = { sftp: (cb: (e: any, s: any) => void) => cb(null, sftp) } as any;
+      const settled = vi.fn();
+      const pending = uploadFile(client, "/l", "/r", 1000).then(() => settled("ok"), settled);
+      await vi.advanceTimersByTimeAsync(1000);
+      await pending;
+      expect(settled).toHaveBeenCalledTimes(1);
+      expect(settled).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringMatching(/timed out/) }));
+      expect(vi.getTimerCount()).toBe(0);
+
+      step?.(); // a late progress callback
+      expect(vi.getTimerCount()).toBe(0); // must not re-arm the idle timer
+      done?.(lateErr); // the transfer's own late completion
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(settled).toHaveBeenCalledTimes(1);
+      expect(probe.ended).toBe(1);
+      expect(vi.getTimerCount()).toBe(0);
     } finally {
       vi.useRealTimers();
     }

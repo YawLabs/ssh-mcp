@@ -1,6 +1,6 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1718,5 +1718,58 @@ describe("src/server.ts: readPackageVersion never throws", () => {
     } finally {
       errSpy.mockRestore();
     }
+  });
+
+  it.each([
+    ["corrupt.json", "{not json"],
+    ["empty-version.json", JSON.stringify({ version: "" })],
+    ["numeric-version.json", JSON.stringify({ version: 1 })],
+  ])("reports UNKNOWN_VERSION with one stderr line naming %s", (name, body) => {
+    // A truncated package.json from a partial install, or a version that is empty or not a
+    // string: none of these may reach MCP clients as the server version.
+    const dir = mkdtempSync(join(tmpdir(), "ssh-mcp-pkg-"));
+    dirs.push(dir);
+    const file = join(dir, name);
+    writeFileSync(file, body);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(readPackageVersion(file)).toBe(UNKNOWN_VERSION);
+      expect(errSpy).toHaveBeenCalledTimes(1);
+      expect(String(errSpy.mock.calls[0][0])).toContain(file);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it("a built dist/index.js with no package.json beside it still answers --version", async () => {
+    // server.ts reads ../package.json at IMPORT time, before src/index.ts answers --version. A
+    // throw there (an inline JSON.parse(readFileSync(...)), say) would crash `ssh-mcp --version`
+    // -- the Homebrew `test do` -- with a stack trace. Bundle the real entry the way tsup does
+    // (dependencies external) into a dir with no package.json and run it. The dir sits under
+    // the repo's node_modules so the external imports still resolve; ../package.json from its
+    // dist/ is the dir itself, which has none.
+    const { build } = await import("esbuild");
+    const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+    const cacheDir = join(repoRoot, "node_modules", ".cache");
+    mkdirSync(cacheDir, { recursive: true });
+    const dir = mkdtempSync(join(cacheDir, "ssh-mcp-nopkg-"));
+    dirs.push(dir);
+    const outfile = join(dir, "dist", "index.js");
+    await build({
+      entryPoints: [join(repoRoot, "src", "index.ts")],
+      outfile,
+      bundle: true,
+      format: "esm",
+      platform: "node",
+      target: "node18",
+      packages: "external",
+      logLevel: "silent",
+    });
+    const r = spawnSync(process.execPath, [outfile, "--version"], { encoding: "utf8", timeout: 15_000 });
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stdout).toBe(`${UNKNOWN_VERSION}\n`);
+    const errLines = r.stderr.split("\n").filter(Boolean);
+    expect(errLines).toHaveLength(1);
+    expect(errLines[0]).toContain(join(dir, "package.json"));
   });
 });

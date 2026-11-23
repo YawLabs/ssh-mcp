@@ -485,6 +485,23 @@ describe("serviceStatus — parsing edge cases", () => {
     expect(status.since).toBe("Wed 2025-06-04 08:12:03 UTC");
   });
 
+  it("leaves `since` unset when the Active line has no terminating `;` (never reads into the next line)", async () => {
+    // systemd can print `since X` with no `; ago` suffix. The `since` group is bounded to the
+    // Active line, so it must not run across the newline to the next line's first `;`.
+    const cap = capturingClient({
+      stdout: [
+        "* nginx.service - A high performance web server",
+        "     Active: active (running) since Mon 2025-01-01 12:00:00 UTC",
+        "   Main PID: 42; extra",
+      ].join("\n"),
+      code: 0,
+    });
+    const status = await serviceStatus(cap.client, "nginx");
+    expect(status.status).toBe("active (running)");
+    expect(status.since).toBeUndefined();
+    expect(status.pid).toBe(42);
+  });
+
   it("derives `active` and `status` from the same exit-code fallback when no Active line parses", async () => {
     // Exit 0 with no `Active:` line (a non-systemd shim, a cut-off output, a format change)
     // used to report status "active" beside active:false. `systemctl status` exits 0 only

@@ -153,6 +153,24 @@ function poseNodeAsOam(text: string): string {
 /** What oam itself prints for `--version`, at the floor. */
 const OAM_AT_FLOOR = "oam 0.21.1\n";
 
+/**
+ * Preload: the launcher's FIRST spawn() targets a path that does not exist, so a
+ * chosen oam that passed its --version probe then fails to start (the binary
+ * deleted or replaced in between). Any later spawn -- a Node handoff -- is real.
+ */
+const FAIL_FIRST_SPAWN = [
+  'import childProcess from "node:child_process";',
+  'import { syncBuiltinESMExports } from "node:module";',
+  "const realSpawn = childProcess.spawn;",
+  "let failed = false;",
+  "childProcess.spawn = function (cmd, args, opts) {",
+  "  if (failed) return realSpawn.call(this, cmd, args, opts);",
+  "  failed = true;",
+  '  return realSpawn.call(this, cmd + ".does-not-exist", args, opts);',
+  "};",
+  "syncBuiltinESMExports();",
+].join("\n");
+
 function run(layout: string, opts: RunOpts = {}) {
   // Build the child env from scratch. A spread of process.env would carry the
   // real PATH (which has a working oam on a developer box) and, on Windows,
@@ -834,18 +852,6 @@ describe("launcher: an oam host below the floor never serves", () => {
       // the launcher mid-fallback and nothing served. The preload makes the
       // FIRST spawn target a path that does not exist; the Node fallback, the
       // second spawn, runs for real.
-      const failFirstSpawn = [
-        'import childProcess from "node:child_process";',
-        'import { syncBuiltinESMExports } from "node:module";',
-        "const realSpawn = childProcess.spawn;",
-        "let failed = false;",
-        "childProcess.spawn = function (cmd, args, opts) {",
-        "  if (failed) return realSpawn.call(this, cmd, args, opts);",
-        "  failed = true;",
-        '  return realSpawn.call(this, cmd + ".does-not-exist", args, opts);',
-        "};",
-        "syncBuiltinESMExports();",
-      ].join("\n");
       const layout = makeLayout();
       const r = run(layout, {
         mode: "auto",
@@ -853,7 +859,7 @@ describe("launcher: an oam host below the floor never serves", () => {
         oamBin: process.execPath,
         oamBinAnswers: OAM_AT_FLOOR,
         pathDirs: [nodeDir(layout)],
-        preload: failFirstSpawn,
+        preload: FAIL_FIRST_SPAWN,
       });
       expect(r.status, JSON.stringify(r)).toBe(0);
       expect(r.stderr).toMatch(/^ssh-mcp: failed to launch oam at .*; using Node instead\.$/m);
@@ -866,6 +872,81 @@ describe("launcher: an oam host below the floor never serves", () => {
       const payload = stubPayload(r.stdout);
       expect(payload.pid, "the Node fallback must still serve, in a child").not.toBe(r.pid);
       expect(payload.oam).toBeNull();
+    },
+    TIMEOUT_MS,
+  );
+});
+
+describe("launcher: a chosen runtime that fails to spawn", () => {
+  const TIMEOUT_MS = 45_000;
+
+  it(
+    "exits 1 under SSH_MCP_RUNTIME=oam rather than serving on Node",
+    () => {
+      // Node host, so `auto` would serve in-process from here. oam mode is a hard
+      // requirement: an oam that passed the probe but would not start is fatal.
+      const r = run(makeLayout(), {
+        mode: "oam",
+        oamBin: process.execPath,
+        oamBinAnswers: OAM_AT_FLOOR,
+        preload: FAIL_FIRST_SPAWN,
+      });
+      expect(r.status, JSON.stringify(r)).toBe(1);
+      expect(r.stderr).toMatch(/^ssh-mcp: failed to launch oam at .*\)$/m);
+      expect(r.stderr).not.toMatch(/using Node instead/);
+      expect(r.stdout, "nothing may be served").not.toContain(MARKER);
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "serves in-process on a Node host under auto",
+    () => {
+      const r = run(makeLayout(), {
+        mode: "auto",
+        oamBin: process.execPath,
+        oamBinAnswers: OAM_AT_FLOOR,
+        preload: FAIL_FIRST_SPAWN,
+      });
+      expect(r.status, JSON.stringify(r)).toBe(0);
+      expect(r.stderr).toMatch(/^ssh-mcp: failed to launch oam at .*; using Node instead\.$/m);
+      expect(stubPayload(r.stdout).pid, "the fallback serves in the launcher's own process").toBe(r.pid);
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "reports a broken install from that fallback with its own diagnostic, not a stack trace",
+    () => {
+      // The fallback's import() rejects, so the async onLaunchFailed handler
+      // rejects; launchChild must hand that to fallbackFailed.
+      const layout = makeLayout();
+      rmSync(join(layout, "dist", "index.js"));
+      const r = run(layout, {
+        mode: "auto",
+        oamBin: process.execPath,
+        oamBinAnswers: OAM_AT_FLOOR,
+        preload: FAIL_FIRST_SPAWN,
+      });
+      expect(r.status, JSON.stringify(r)).toBe(1);
+      expect(r.stderr).toMatch(/^ssh-mcp: could not load the server \(.*\)$/m);
+      expect(r.stderr).not.toMatch(/^\s+at /m);
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "names a `node` on PATH that cannot be executed and exits 1",
+    () => {
+      // findNodeOnPath only checks existence, so a DIRECTORY named node(.exe)
+      // is picked and then fails to spawn.
+      const layout = makeLayout();
+      const bogus = mkdtempSync(join(layout, "bogusnode-"));
+      mkdirSync(join(bogus, isWin ? "node.exe" : "node"));
+      const r = run(layout, { mode: "node", hostOam: "0.21.1", pathDirs: [bogus] });
+      expect(r.status, JSON.stringify(r)).toBe(1);
+      expect(r.stderr).toMatch(/^ssh-mcp: failed to launch Node at .*bogusnode-[^\\/]*[\\/]node(\.exe)? \(.*\)$/m);
+      expect(r.stdout).not.toContain(MARKER);
     },
     TIMEOUT_MS,
   );
@@ -1208,6 +1289,50 @@ describe("launcher: errSync()", () => {
     const result = errSync("ssh-mcp: note\n");
     expect(result).toBeUndefined();
     expect(writes.join("")).toBe("ssh-mcp: note\n");
+  });
+
+  function loadErrSync(writeSync: (fd: number, buf: Buffer, off: number, len: number) => number) {
+    return new Function("writeSync", `${extract([/function errSync\(message\) \{[\s\S]*?\n\}/])}\nreturn errSync;`)(
+      writeSync,
+    ) as (message: string) => unknown;
+  }
+
+  it("resumes after a short write instead of rewriting or dropping bytes", () => {
+    const writes: string[] = [];
+    const errSync = loadErrSync((_fd, buf, off, len) => {
+      const n = Math.min(3, len);
+      writes.push(buf.subarray(off, off + n).toString());
+      return n;
+    });
+    errSync("ssh-mcp: a longer diagnostic\n");
+    expect(writes.join("")).toBe("ssh-mcp: a longer diagnostic\n");
+    expect(writes.length).toBeGreaterThan(1);
+  });
+
+  it("retries after EAGAIN until the write goes through", () => {
+    const writes: string[] = [];
+    let eagains = 0;
+    const errSync = loadErrSync((_fd, buf, off, len) => {
+      if (eagains < 2) {
+        eagains++;
+        throw Object.assign(new Error("EAGAIN: resource temporarily unavailable"), { code: "EAGAIN" });
+      }
+      writes.push(buf.subarray(off, off + len).toString());
+      return len;
+    });
+    errSync("ssh-mcp: note\n");
+    expect(eagains).toBe(2);
+    expect(writes.join("")).toBe("ssh-mcp: note\n");
+  });
+
+  it("gives up quietly on any other write error", () => {
+    let calls = 0;
+    const errSync = loadErrSync(() => {
+      calls++;
+      throw Object.assign(new Error("EPIPE: broken pipe"), { code: "EPIPE" });
+    });
+    expect(() => errSync("ssh-mcp: note\n")).not.toThrow();
+    expect(calls, "no retry on a non-EAGAIN error").toBe(1);
   });
 
   it("is a plain function in the shipped source", () => {
